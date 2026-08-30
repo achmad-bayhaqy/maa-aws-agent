@@ -13,17 +13,18 @@ import { Sheet, SheetContent, SheetHeader, SheetTitle } from '@/components/ui/sh
 import { useToast } from '@/hooks/use-toast';
 import {
   CONFIG, deleteSession, getModels, getStatus, getSessions, getTrace, loadLastSession,
-  revokeToken, saveLastSession, sendChat, sessionIdFromPath, signOutAll,
-  stripClarifyBlock, type Attachment, type AutoRoute, type ChatMessage,
+  presignChatUpload, revokeToken, saveLastSession, sendChat, sessionIdFromPath, signOutAll,
+  stripClarifyBlock, translateText, type Attachment, type AutoRoute, type ChatMessage,
   type ChatMode, type ChatStatus, type MeInfo, type MaaModel, type SessionRow,
-  type Tokens, type TraceEvent,
+  type Tokens, type TodoItem, type TraceEvent,
 } from '@/lib/maa';
 import { Logo, LogoWordmark } from './logo';
 import { SidebarContent } from './sidebar';
-import { Composer } from './composer';
+import { Composer, type PendingUpload } from './composer';
 import { MessageList } from './message-list';
 import { TracePanel } from './trace-panel';
 import { ConfirmModal } from './confirm-modal';
+import { TodoPanel } from './todo-panel';
 import { AdminDrawer, DocsDrawer, KbDrawer } from './drawers';
 import { ThemeDialog, ThemeSwitcher } from './theme-switcher';
 import { initTheme, type MaaTheme } from './theme';
@@ -93,6 +94,8 @@ export function ChatApp({
   const [processing, setProcessing] = useState(false);
   const [errorTop, setErrorTop] = useState<string | null>(null);
   const [lastAction, setLastAction] = useState<LastAction>(null);
+  const [uploads, setUploads] = useState<PendingUpload[]>([]);
+  const [todos, setTodos] = useState<TodoItem[] | null>(null);
 
   // ---- UI ----
   const [sidebarOpen, setSidebarOpen] = useState(false); // sheet mobile
@@ -183,6 +186,7 @@ export function ChatApp({
           if (run !== runIdRef.current) return;
           pollFailRef.current = 0;
           setStatus(normalizeStatus(st));
+          setTodos(st.todos ?? null);
           setErrorTop(null);
           if (st.status !== 'processing') {
             finish();
@@ -220,6 +224,7 @@ export function ChatApp({
         if (run !== runIdRef.current) return;
         const norm = normalizeStatus(st);
         setStatus(norm);
+        setTodos(norm.todos ?? null);
         setActiveId(sid);
         setTrace([]);
         lastTraceTsRef.current = 0;
@@ -252,12 +257,76 @@ export function ChatApp({
     setActiveId(null);
     setStatus(null);
     setTrace([]);
+    setTodos(null);
     setProcessing(false);
     setErrorTop(null);
     lastTraceTsRef.current = 0;
     window.history.pushState({}, '', '/');
     setSidebarOpen(false);
   }, [clearTimers]);
+
+  // ---------- upload lampiran (multi-file, presigned S3) ----------
+
+  const removeUpload = useCallback((key: string) => {
+    setUploads((prev) => prev.filter((u) => u.key !== key));
+  }, []);
+
+  const handleFiles = useCallback(
+    (files: File[]) => {
+      files.slice(0, 8).forEach((file) => {
+        const tempId = `tmp-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+        const contentType = file.type || 'application/octet-stream';
+        setUploads((prev) => [
+          ...prev,
+          { key: tempId, name: file.name, size: file.size, contentType, progress: 3 },
+        ]);
+        void (async () => {
+          try {
+            const { uploadUrl, key } = await presignChatUpload(token, file.name, contentType, file.size);
+            // PUT langsung ke S3 dengan progress via XHR
+            await new Promise<void>((resolve, reject) => {
+              const xhr = new XMLHttpRequest();
+              xhr.open('PUT', uploadUrl);
+              xhr.setRequestHeader('Content-Type', contentType);
+              xhr.upload.onprogress = (e) => {
+                if (e.lengthComputable) {
+                  const pct = Math.round((e.loaded / e.total) * 100);
+                  setUploads((prev) =>
+                    prev.map((u) => (u.key === tempId ? { ...u, progress: Math.max(pct, 5) } : u))
+                  );
+                }
+              };
+              xhr.onload = () => (xhr.status >= 200 && xhr.status < 300 ? resolve() : reject(new Error(`S3 ${xhr.status}`)));
+              xhr.onerror = () => reject(new Error('jaringan gagal'));
+              xhr.send(file);
+            });
+            setUploads((prev) =>
+              prev.map((u) => (u.key === tempId ? { ...u, key, progress: 100 } : u))
+            );
+          } catch (e) {
+            setUploads((prev) =>
+              prev.map((u) => (u.key === tempId ? { ...u, error: (e as Error).message } : u))
+            );
+            notify(`Upload "${file.name}" gagal: ${(e as Error).message}`);
+          }
+        })();
+      });
+    },
+    [notify, token]
+  );
+
+  // ---------- translate EN -> ID ----------
+
+  const handleTranslate = useCallback(
+    async (text: string): Promise<string> => {
+      const r = await translateText(token, text, activeId || undefined);
+      if (r.status !== 'ok' || !r.translation) {
+        throw new Error(r.message || 'translate gagal');
+      }
+      return r.translation;
+    },
+    [activeId, token]
+  );
 
   // ---------- kirim / edit ----------
 
@@ -268,6 +337,15 @@ export function ChatApp({
       setErrorTop(null);
       setLastAction(editFrom === undefined ? { kind: 'send', text } : { kind: 'edit', text, editFrom });
 
+      // lampiran yang siap (progress 100, tanpa error)
+      const readyUploads = editFrom === undefined ? uploads.filter((u) => u.progress >= 100 && !u.error) : [];
+      const atts = readyUploads.map((u) => ({
+        key: u.key,
+        name: u.name,
+        contentType: u.contentType,
+        size: u.size,
+      }));
+
       const run = ++runIdRef.current;
       setProcessing(true);
       stickRef.current = true;
@@ -277,9 +355,14 @@ export function ChatApp({
           // sesi baru — tampilkan pesan user secara optimistis
           setStatus({
             sessionId: '', status: 'processing',
-            messages: [{ role: 'user', text, ts: Date.now() }],
+            messages: [
+              {
+                role: 'user', text, ts: Date.now(),
+                atts: atts.map((a) => ({ name: a.name, kind: 'upload', size: a.size })),
+              },
+            ],
           });
-          const r = await sendChat(token, { message: text, mode, modelId });
+          const r = await sendChat(token, { message: text, mode, modelId, attachments: atts });
           if (run !== runIdRef.current) return;
           setActiveId(r.sessionId);
           window.history.pushState({ sid: r.sessionId }, '', `/c/${r.sessionId}`);
@@ -289,18 +372,21 @@ export function ChatApp({
           const sid = activeId;
           await sendChat(token, {
             message: text, mode, modelId, sessionId: sid,
+            ...(atts.length ? { attachments: atts } : {}),
             ...(editFrom !== undefined ? { editFrom } : {}),
           });
           if (run !== runIdRef.current) return;
           startPolling(run, sid);
         }
+        setUploads((prev) => prev.filter((u) => !readyUploads.some((r_) => r_.key === u.key)));
+        setTodos((prev) => (editFrom === undefined ? [] : prev)); // rencana baru mulai kosong
       } catch (e) {
         if (run !== runIdRef.current) return;
         setProcessing(false);
         setErrorTop(`Gagal mengirim: ${(e as Error).message}`);
       }
     },
-    [activeId, manualModel, me?.userId, mode, notify, processing, startPolling, token]
+    [activeId, manualModel, me?.userId, mode, notify, processing, startPolling, token, uploads]
   );
 
   // ---------- regenerasi jawaban terakhir ----------
@@ -677,13 +763,16 @@ export function ChatApp({
                   )}
                 </div>
               ) : (
-                <MessageList
-                  messages={messages}
-                  processing={processing}
-                  onResendEdit={(idx, text) => void doSend(text, idx)}
-                  notify={notify}
-                  onRegenerate={activeId ? () => void doRegenerate() : undefined}
-                  clarifySlot={
+                <>
+                  {(todos?.length || (processing && todos?.length)) ? <TodoPanel todos={todos} /> : null}
+                  <MessageList
+                    messages={messages}
+                    processing={processing}
+                    onResendEdit={(idx, text) => void doSend(text, idx)}
+                    notify={notify}
+                    onRegenerate={activeId ? () => void doRegenerate() : undefined}
+                    onTranslate={handleTranslate}
+                    clarifySlot={
                     clarify && !processing ? (
                       <div className="animate-msg-in mt-1 w-full max-w-[min(680px,85%)] rounded-[10px] border border-[var(--accent)] bg-[var(--accent-soft)] p-3.5">
                         <p className="mb-2.5 text-[13px] font-semibold leading-relaxed text-[var(--ink)]">
@@ -705,9 +794,10 @@ export function ChatApp({
                       </div>
                     ) : undefined
                   }
-                  attachments={attachments}
-                  autoRoute={autoRoute}
-                />
+                    attachments={attachments}
+                    autoRoute={autoRoute}
+                  />
+                </>
               )}
             </div>
           </div>
@@ -723,6 +813,9 @@ export function ChatApp({
                 models={models}
                 autoDefaults={autoDefaults}
                 onSend={(t) => void doSend(t)}
+                onFiles={handleFiles}
+                uploads={uploads}
+                onRemoveUpload={removeUpload}
                 disabled={loadingSession}
                 busy={processing}
                 hint={
@@ -774,7 +867,13 @@ export function ChatApp({
       </Sheet>
 
       <KbDrawer open={kbOpen} onOpenChange={setKbOpen} token={token} notify={notify} />
-      <DocsDrawer open={docsOpen} onOpenChange={setDocsOpen} />
+      <DocsDrawer
+        open={docsOpen}
+        onOpenChange={setDocsOpen}
+        token={token}
+        isSuperadmin={me?.role === 'superadmin'}
+        notify={notify}
+      />
       <AdminDrawer open={adminOpen} onOpenChange={setAdminOpen} token={token} notify={notify} />
       <ThemeDialog theme={theme} onChange={setTheme} open={themeOpen} onOpenChange={setThemeOpen} />
 

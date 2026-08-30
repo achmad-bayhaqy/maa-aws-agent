@@ -9,6 +9,7 @@
 
 - [Ringkasan](#-ringkasan)
 - [Akses Demo](#-akses-demo)
+- [Yang Baru di v3.4](#-yang-baru-di-v34)
 - [Fitur Utama (v3)](#-fitur-utama-v3)
 - [Arsitektur](#-arsitektur)
 - [Struktur Repositori](#-struktur-repositori)
@@ -16,6 +17,26 @@
 - [Kontrak API](#-kontrak-api)
 - [Keamanan](#-keamanan)
 - [Biaya](#-biaya)
+
+
+## 🚀 Yang Baru di v3.4
+
+| Fitur | Detail |
+|---|---|
+| **Todo list live** | Tugas multi-langkah tampil sebagai checklist real-time di atas chat (tool `task_plan`), lengkap progress bar. |
+| **Multi-agent / subagent** | Agent utama mendelegasikan ke agent spesialis (researcher/analyst/architect/coder/reviewer/ops) via `subagent_run`; aktivitas terlihat di Live Trace. |
+| **Mode LONG** | Long-running task: hingga 24 iterasi tool, token 16k, eksekusi bertahap dengan todo list. |
+| **Mode FULLSTACK** | Agent membangun SPA lengkap (HTML+CSS+JS inline) lalu deploy ke preview URL live (`deploy_web_app`). |
+| **Mode PRESENTATION** | Deck slide interaktif bertema merah-hitam dibuat otomatis (`generate_presentation`) dan tampil di chat. |
+| **Upload file** | Multi-file hingga **200 MB/file** via presigned S3 langsung dari browser (progress per file). CSV/JSON/teks/kode diekstrak ke konteks, gambar dilihat model, PDF diekstrak teksnya (pypdf). |
+| **Translate EN→ID** | Tombol EN→ID pada setiap jawaban — terjemahan natural via nova-micro. |
+| **Dokumentasi editable** | Markdown editor + preview live; hanya superadmin dapat menyimpan (tersimpan KMS-encrypted di S3). |
+| **Manage Users advanced** | Kartu statistik, pencarian, wizard undangan 2 langkah (email Cognito / password instan), resend undangan, password instan per user. |
+| **Login modern** | Split-screen branding, show password, remember me, dan penanganan challenge `NEW_PASSWORD_REQUIRED` (user undangan bisa set password baru + lanjut MFA). |
+| **Fix Guardrail false-positive** | MISCONDUCT output strength → NONE: pertanyaan seperti “kamu bisa apa” tidak lagi diblokir. |
+| **Fix “Loop berhenti”** | Final-synthesis fallback memaksa ringkasan jawaban setelah loop tool selesai / guardrail menahan output. |
+
+Deploy satu perintah: `python3 aws/deploy_v34.py` (guardrail → runtime → edge/API GW → seed docs → Amplify).
 
 ## 🎯 Ringkasan
 

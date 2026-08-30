@@ -1,18 +1,35 @@
 'use client';
 
 import { useEffect, useRef, useState } from 'react';
-import { ArrowUp, Brain, Gauge, Loader2, Route, SlidersHorizontal } from 'lucide-react';
+import {
+  ArrowUp, Brain, Clapperboard, Code2, Eye, EyeOff, Gauge, Loader2, Paperclip,
+  Route, SlidersHorizontal, Timer, X,
+} from 'lucide-react';
 import type { ChatMode, MaaModel } from '@/lib/maa';
+import { fmtBytes } from '@/lib/maa';
 import { ModelPicker } from './model-picker';
 
 const MODES: { id: ChatMode; label: string; icon: React.ReactNode; hint: string }[] = [
   { id: 'AUTO', label: 'AUTO', icon: <Route className="h-3.5 w-3.5" />, hint: 'Model dipilih otomatis sesuai kompleksitas' },
   { id: 'FAST', label: 'FAST', icon: <Gauge className="h-3.5 w-3.5" />, hint: 'Balasan cepat & hemat' },
   { id: 'DEEP', label: 'DEEP', icon: <Brain className="h-3.5 w-3.5" />, hint: 'Reasoning untuk soal kompleks' },
+  { id: 'LONG', label: 'LONG', icon: <Timer className="h-3.5 w-3.5" />, hint: 'Tugas besar multi-langkah + todo list live' },
+  { id: 'FULLSTACK', label: 'FULLSTACK', icon: <Code2 className="h-3.5 w-3.5" />, hint: 'Bangun aplikasi web lengkap + preview URL' },
+  { id: 'PRESENTATION', label: 'PRESENT', icon: <Clapperboard className="h-3.5 w-3.5" />, hint: 'Susun slide deck profesional otomatis' },
   { id: 'MANUAL', label: 'MANUAL', icon: <SlidersHorizontal className="h-3.5 w-3.5" />, hint: 'Anda pilih modelnya sendiri' },
 ];
 
 const MAX_H = 5 * 24 + 16; // ±5 baris
+const MAX_FILE_MB = 200;
+
+export type PendingUpload = {
+  key: string;
+  name: string;
+  size: number;
+  contentType: string;
+  progress: number; // 0..100
+  error?: string;
+};
 
 export function Composer({
   mode,
@@ -22,6 +39,9 @@ export function Composer({
   models,
   autoDefaults,
   onSend,
+  onFiles,
+  uploads,
+  onRemoveUpload,
   disabled,
   busy,
   hint,
@@ -34,13 +54,18 @@ export function Composer({
   models: MaaModel[];
   autoDefaults?: { fast: string; deep: string };
   onSend: (text: string) => void;
+  onFiles?: (files: File[]) => void;
+  uploads?: PendingUpload[];
+  onRemoveUpload?: (key: string) => void;
   disabled?: boolean;
   busy?: boolean;
   hint?: string | null;
   placeholder?: string;
 }) {
   const [text, setText] = useState('');
+  const [showHints, setShowHints] = useState(false);
   const taRef = useRef<HTMLTextAreaElement>(null);
+  const fileRef = useRef<HTMLInputElement>(null);
 
   // auto-grow
   useEffect(() => {
@@ -50,13 +75,29 @@ export function Composer({
     el.style.height = `${Math.min(el.scrollHeight, MAX_H)}px`;
   }, [text]);
 
-  const canSend = !!text.trim() && !disabled && !busy;
+  const uploadsReady = (uploads || []).filter((u) => !u.error && u.progress >= 100);
+  const uploadingNow = (uploads || []).some((u) => u.progress < 100 && !u.error);
+  const canSend = !!text.trim() && !disabled && !busy && !uploadingNow;
 
   const submit = () => {
     if (!canSend) return;
     onSend(text.trim());
     setText('');
     requestAnimationFrame(() => taRef.current?.focus());
+  };
+
+  const pickFiles = () => fileRef.current?.click();
+
+  const handleFiles = (list: FileList | null) => {
+    if (!list || !onFiles) return;
+    const files = Array.from(list);
+    const bad = files.filter((f) => f.size > MAX_FILE_MB * 1024 * 1024);
+    if (bad.length) {
+      alert(`File terlalu besar (maks ${MAX_FILE_MB} MB): ${bad.map((b) => b.name).join(', ')}`);
+    }
+    const ok = files.filter((f) => f.size <= MAX_FILE_MB * 1024 * 1024);
+    if (ok.length) onFiles(ok);
+    if (fileRef.current) fileRef.current.value = '';
   };
 
   const activeMode = MODES.find((m) => m.id === mode)!;
@@ -106,12 +147,76 @@ export function Composer({
         )}
       </div>
 
+      {/* chips lampiran yang sedang diunggah / siap kirim */}
+      {!!uploads?.length && (
+        <div className="mb-2 flex flex-wrap gap-1.5">
+          {uploads.map((u) => (
+            <span
+              key={u.key}
+              className={`flex max-w-[240px] items-center gap-1.5 rounded-full border px-2.5 py-1 text-[11px] ${
+                u.error
+                  ? 'border-[var(--danger)] bg-[var(--danger)]/5 text-[var(--danger)]'
+                  : 'border-[var(--line)] bg-[var(--surface)] text-[var(--ink)]'
+              }`}
+              title={u.error || u.name}
+            >
+              {u.progress < 100 ? (
+                <Loader2 className="h-3 w-3 shrink-0 animate-spin" />
+              ) : (
+                <Paperclip className="h-3 w-3 shrink-0" />
+              )}
+              <span className="truncate">{u.name}</span>
+              <span className="shrink-0 font-mono text-[9.5px] text-[var(--muted-fg)]">
+                {u.error ? 'gagal' : u.progress < 100 ? `${u.progress}%` : fmtBytes(u.size)}
+              </span>
+              <button
+                type="button"
+                aria-label={`Batalkan ${u.name}`}
+                onClick={() => onRemoveUpload?.(u.key)}
+                className="rounded-full p-0.5 hover:bg-[var(--muted-bg)]"
+              >
+                <X className="h-3 w-3" />
+              </button>
+            </span>
+          ))}
+        </div>
+      )}
+
       {/* input besar bergaris */}
       <div
+        onDragOver={(e) => {
+          if (onFiles) e.preventDefault();
+        }}
+        onDrop={(e) => {
+          if (!onFiles) return;
+          e.preventDefault();
+          handleFiles(e.dataTransfer.files);
+        }}
         className={`maa-panel flex items-end gap-2 p-2 transition-shadow focus-within:shadow-[0_0_0_1px_var(--accent)] ${
           disabled ? 'opacity-70' : ''
         }`}
       >
+        {onFiles && (
+          <>
+            <input
+              ref={fileRef}
+              type="file"
+              multiple
+              className="hidden"
+              onChange={(e) => handleFiles(e.target.files)}
+            />
+            <button
+              type="button"
+              onClick={pickFiles}
+              disabled={disabled}
+              aria-label="Lampirkan file"
+              title="Lampirkan file (banyak file, maks 200 MB/file) — atau tarik-lepas di sini"
+              className="mb-0.5 flex h-9 w-9 shrink-0 items-center justify-center rounded-lg border border-[var(--line-soft)] bg-[var(--bg)] text-[var(--muted-fg)] transition-colors hover:border-[var(--accent)] hover:text-[var(--accent)] disabled:opacity-50"
+            >
+              <Paperclip className="h-4 w-4" />
+            </button>
+          </>
+        )}
         <textarea
           ref={taRef}
           rows={1}
@@ -135,16 +240,50 @@ export function Composer({
           aria-label="Kirim pesan"
           className="maa-btn-primary mb-0.5 flex h-9 w-9 shrink-0 items-center justify-center"
         >
-          {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <ArrowUp className="h-4.5 w-4.5" />}
+          {busy || uploadingNow ? <Loader2 className="h-4 w-4 animate-spin" /> : <ArrowUp className="h-4.5 w-4.5" />}
         </button>
       </div>
 
       <div className="mt-1.5 flex flex-wrap items-center justify-between gap-x-3 gap-y-1 px-1">
-        <p className="text-[10.5px] text-[var(--muted-fg)]">{hintLine}</p>
+        <p className="flex items-center gap-1.5 text-[10.5px] text-[var(--muted-fg)]">
+          {hintLine}
+          <button
+            type="button"
+            onClick={() => setShowHints((v) => !v)}
+            className="inline-flex items-center gap-0.5 rounded px-1 hover:text-[var(--ink)]"
+            aria-expanded={showHints}
+          >
+            {showHints ? <EyeOff className="h-3 w-3" /> : <Eye className="h-3 w-3" />}
+            contoh
+          </button>
+        </p>
         <p className="hidden text-[10.5px] text-[var(--muted-fg)] sm:block">
           <kbd className="font-mono">Enter</kbd> kirim · <kbd className="font-mono">Shift+Enter</kbd> baris baru
         </p>
       </div>
+      {showHints && (
+        <div className="mt-1.5 flex flex-wrap gap-1.5 px-1">
+          {[
+            'Kamu bisa apa?',
+            'Analisis CSV ini lalu buat chart',
+            'Buatkan dashboard monitoring (FULLSTACK)',
+            'Buat deck presentasi biaya AWS (PRESENT)',
+            'Riset harga terbaru EC2 lalu rekomendasikan (LONG)',
+          ].map((s) => (
+            <button
+              key={s}
+              type="button"
+              onClick={() => {
+                setText(s);
+                taRef.current?.focus();
+              }}
+              className="rounded-full border border-[var(--line-soft)] bg-[var(--surface)] px-2.5 py-1 text-[10.5px] text-[var(--muted-fg)] transition-colors hover:border-[var(--accent)] hover:text-[var(--ink)]"
+            >
+              {s}
+            </button>
+          ))}
+        </div>
+      )}
     </div>
   );
 }

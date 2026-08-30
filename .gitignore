@@ -74,3 +74,4 @@ download/MAA-PANDUAN.md
 # ===== Non-project templates (bukan bagian produk MAA) =====
 /examples/
 /skills/
+__pycache__/

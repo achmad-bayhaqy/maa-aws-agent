@@ -1,9 +1,12 @@
 'use client';
 
 import { useMemo, useState } from 'react';
-import { Check, ChevronLeft, ChevronRight, Copy, Image as ImageIcon, Pencil, RefreshCcw, X } from 'lucide-react';
-import type { Attachment, AutoRoute, ChatMessage } from '@/lib/maa';
-import { fmtClock } from '@/lib/maa';
+import {
+  Check, ChevronDown, ChevronLeft, ChevronRight, Clapperboard, Copy, FileText,
+  Globe, Image as ImageIcon, Languages, Loader2, Paperclip, Pencil, RefreshCcw, X,
+} from 'lucide-react';
+import type { Attachment, AutoRoute, ChatMessage, MessageAtt } from '@/lib/maa';
+import { fmtBytes, fmtClock } from '@/lib/maa';
 import { Markdown } from './markdown';
 
 function useCopy(notify: (msg: string) => void) {
@@ -85,6 +88,7 @@ function UserBubble({
           <div className="rounded-[10px] border border-[var(--line)] bg-[var(--accent-soft)] px-3.5 py-2.5 text-[14px] leading-relaxed break-words whitespace-pre-wrap text-[var(--ink)] shadow-[var(--shadow-soft)]">
             {msg.text}
           </div>
+          <UserAttChips atts={msg.atts} />
           <div className="flex items-center gap-1 pr-0.5 text-[10px] text-[var(--muted-fg)]">
             {msg.edited && <span className="rounded-full bg-[var(--muted-bg)] px-1.5 py-px font-medium">diedit</span>}
             <span className="font-mono">{fmtClock(msg.ts)}</span>
@@ -115,20 +119,119 @@ function UserBubble({
   );
 }
 
-/* ------------- bubble asisten (versioning + copy + meta chip) ------------- */
+/* --------------------------- lampiran pesan user --------------------------- */
+
+function UserAttChips({ atts }: { atts?: MessageAtt[] }) {
+  if (!atts?.length) return null;
+  return (
+    <div className="mt-1 flex flex-wrap justify-end gap-1">
+      {atts.map((a, i) => (
+        <span
+          key={i}
+          className="flex max-w-[200px] items-center gap-1 rounded-full border border-[var(--line-soft)] bg-[var(--surface)] px-2 py-0.5 text-[10px] text-[var(--muted-fg)]"
+          title={a.name}
+        >
+          <Paperclip className="h-2.5 w-2.5 shrink-0" />
+          <span className="truncate">{a.name}</span>
+          {!!a.size && <span className="shrink-0 font-mono">{fmtBytes(a.size)}</span>}
+        </span>
+      ))}
+    </div>
+  );
+}
+
+/* ------------------------ artefak agent (deck/webapp) ------------------------ */
+
+function ArtifactCards({ atts }: { atts?: MessageAtt[] }) {
+  const arts = (atts || []).filter((a) => a.kind === 'deck' || a.kind === 'webapp');
+  if (!arts.length) return null;
+  return (
+    <div className="mt-2 flex flex-wrap gap-2">
+      {arts.map((a, i) =>
+        a.kind === 'deck' ? (
+          <a
+            key={i}
+            href={a.url}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="group flex items-center gap-3 rounded-[10px] border border-[var(--line)] bg-gradient-to-br from-[#0B0B0E] to-[#1A1A20] px-3.5 py-2.5 text-white transition-transform hover:scale-[1.01]"
+            title="Buka slide deck (fullscreen)"
+          >
+            <span className="flex h-9 w-9 items-center justify-center rounded-lg" style={{ background: '#DC2626' }}>
+              <Clapperboard className="h-4.5 w-4.5" />
+            </span>
+            <span>
+              <span className="block text-[12.5px] font-bold">{a.name || 'Slide Deck'}</span>
+              <span className="block text-[10px] text-zinc-400">
+                {a.slides ?? '•'} slide · interaktif · klik untuk buka
+              </span>
+            </span>
+          </a>
+        ) : (
+          <a
+            key={i}
+            href={a.url}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="group flex items-center gap-3 rounded-[10px] border border-[var(--line)] bg-[var(--surface)] px-3.5 py-2.5 transition-transform hover:scale-[1.01]"
+            title="Buka preview aplikasi"
+          >
+            <span
+              className="flex h-9 w-9 items-center justify-center rounded-lg border border-[var(--line)] bg-[var(--bg)]"
+              style={{ color: 'var(--accent)' }}
+            >
+              <Globe className="h-4.5 w-4.5" />
+            </span>
+            <span>
+              <span className="block text-[12.5px] font-bold text-[var(--ink)]">{a.name || 'Web App'}</span>
+              <span className="block text-[10px] text-[var(--muted-fg)]">
+                preview live · {a.files ?? 1} file · klik untuk buka
+              </span>
+            </span>
+          </a>
+        )
+      )}
+    </div>
+  );
+}
+
+/* ------------- bubble asisten (versioning + copy + translate + meta) ------------- */
 
 function AssistantBubble({
   msg,
   isLast,
   notify,
   routeChip,
+  onTranslate,
 }: {
   msg: ChatMessage;
   isLast: boolean;
   notify: (msg: string) => void;
   routeChip?: React.ReactNode;
+  onTranslate?: (text: string) => Promise<string>;
 }) {
   const copy = useCopy(notify);
+  const [translating, setTranslating] = useState(false);
+  const [translated, setTranslated] = useState<string | null>(null);
+  const [transOpen, setTransOpen] = useState(true);
+  const [transErr, setTransErr] = useState(false);
+
+  const doTranslate = async () => {
+    if (translated || translating || !onTranslate) return;
+    setTranslating(true);
+    setTransErr(false);
+    try {
+      const tr = await onTranslate(msg.text.slice(0, 12000));
+      setTranslated(tr);
+      setTransOpen(true);
+    } catch {
+      setTransErr(true);
+      notify('Terjemahan gagal - coba lagi');
+    } finally {
+      setTranslating(false);
+    }
+  };
+
 
   // Kandidat versi: versions[] (lama) + teks aktif (terbaru). Dedupe bila
   // server sudah memasukkan teks aktif sebagai elemen terakhir versions.
@@ -152,7 +255,39 @@ function AssistantBubble({
       <div className="flex w-full max-w-[min(680px,85%)] flex-col items-start gap-1">
         <div className="w-full rounded-[10px] border border-[var(--line-soft)] bg-[var(--surface)] px-3.5 py-2.5 shadow-[var(--shadow-soft)]">
           <Markdown text={active.text} />
+          {/* hasil terjemahan EN -> ID */}
+          {translated && transOpen && (
+            <div className="mt-3 rounded-lg border border-[var(--line-soft)] bg-[var(--bg)] p-3">
+              <div className="mb-1.5 flex items-center justify-between gap-2">
+                <span className="flex items-center gap-1 text-[10px] font-semibold uppercase tracking-wider text-[var(--muted-fg)]">
+                  <Languages className="h-3 w-3" style={{ color: 'var(--accent)' }} />
+                  Terjemahan Bahasa Indonesia
+                </span>
+                <button
+                  type="button"
+                  aria-label="Tutup terjemahan"
+                  onClick={() => setTransOpen(false)}
+                  className="rounded p-0.5 text-[var(--muted-fg)] hover:bg-[var(--muted-bg)] hover:text-[var(--ink)]"
+                >
+                  <X className="h-3 w-3" />
+                </button>
+              </div>
+              <div className="text-[13.5px] leading-relaxed text-[var(--ink)]">
+                <Markdown text={translated} />
+              </div>
+            </div>
+          )}
+          {translated && !transOpen && (
+            <button
+              type="button"
+              onClick={() => setTransOpen(true)}
+              className="mt-2 flex items-center gap-1 text-[10.5px] text-[var(--muted-fg)] hover:text-[var(--ink)]"
+            >
+              <ChevronDown className="h-3 w-3" /> Tampilkan terjemahan
+            </button>
+          )}
         </div>
+        <ArtifactCards atts={msg.atts} />
         <div className="flex flex-wrap items-center gap-1.5 pl-0.5 text-[10px] text-[var(--muted-fg)]">
           <span className="font-mono">{fmtClock(active.ts)}</span>
           {many && (
@@ -194,6 +329,24 @@ function AssistantBubble({
           >
             <Copy className="h-3 w-3" />
           </button>
+          {onTranslate && (
+            <button
+              type="button"
+              onClick={() => void doTranslate()}
+              disabled={translating}
+              aria-label="Terjemahkan ke Bahasa Indonesia"
+              title="Terjemahkan EN → ID"
+              className="flex items-center gap-0.5 rounded p-1 hover:bg-[var(--muted-bg)] hover:text-[var(--ink)] disabled:opacity-50"
+            >
+              {translating ? (
+                <Loader2 className="h-3 w-3 animate-spin" />
+              ) : (
+                <Languages className="h-3 w-3" />
+              )}
+              <span className="text-[9.5px] font-medium">EN→ID</span>
+            </button>
+          )}
+          {transErr && <span className="text-[9.5px] text-[var(--danger)]">translate gagal</span>}
         </div>
         {isLast && routeChip}
       </div>
@@ -265,6 +418,7 @@ export function MessageList({
   autoRoute,
   showSkeleton,
   onRegenerate,
+  onTranslate,
 }: {
   messages: ChatMessage[];
   processing: boolean;
@@ -275,6 +429,7 @@ export function MessageList({
   autoRoute?: AutoRoute | null;
   showSkeleton?: boolean;
   onRegenerate?: () => void;
+  onTranslate?: (text: string) => Promise<string>;
 }) {
   const lastAssistant = useMemo(() => {
     for (let i = messages.length - 1; i >= 0; i--) if (messages[i].role === 'assistant') return i;
@@ -307,6 +462,7 @@ export function MessageList({
             isLast={i === lastAssistant}
             notify={notify}
             routeChip={i === lastAssistant ? routeChip : undefined}
+            onTranslate={onTranslate}
           />
         )
       )}

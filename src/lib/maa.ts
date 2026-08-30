@@ -30,7 +30,8 @@ async function cognito(op: string, payload: Record<string, unknown>): Promise<Re
 export type LoginResult =
   | { kind: "tokens"; tokens: Tokens }
   | { kind: "mfa_setup"; session: string; username: string }
-  | { kind: "mfa_challenge"; session: string; username: string };
+  | { kind: "mfa_challenge"; session: string; username: string }
+  | { kind: "new_password"; session: string; username: string };
 
 export async function login(username: string, password: string): Promise<LoginResult> {
   const r = await cognito("InitiateAuth", {
@@ -39,11 +40,34 @@ export async function login(username: string, password: string): Promise<LoginRe
     ClientId: CONFIG.clientId,
   });
   if (r.AuthenticationResult) return { kind: "tokens", tokens: r.AuthenticationResult };
+  if (r.ChallengeName === "NEW_PASSWORD_REQUIRED")
+    return { kind: "new_password", session: r.Session, username };
   if (r.ChallengeName === "MFA_SETUP")
     return { kind: "mfa_setup", session: r.Session, username };
   if (r.ChallengeName === "SOFTWARE_TOKEN_MFA")
     return { kind: "mfa_challenge", session: r.Session, username };
   throw new Error(`Challenge tak dikenal: ${r.ChallengeName}`);
+}
+
+/** Challenge NEW_PASSWORD_REQUIRED: user undangan menyetel password baru.
+ *  Respons bisa langsung tokens ATAU lanjut ke MFA_SETUP / SOFTWARE_TOKEN_MFA. */
+export async function respondNewPasswordRequired(
+  session: string,
+  username: string,
+  newPassword: string
+): Promise<LoginResult & { tokens?: Tokens }> {
+  const r = await cognito("RespondToAuthChallenge", {
+    ChallengeName: "NEW_PASSWORD_REQUIRED",
+    ClientId: CONFIG.clientId,
+    Session: session,
+    ChallengeResponses: { USERNAME: username, NEW_PASSWORD: newPassword },
+  });
+  if (r.AuthenticationResult) return { kind: "tokens", tokens: r.AuthenticationResult };
+  if (r.ChallengeName === "MFA_SETUP")
+    return { kind: "mfa_setup", session: r.Session, username };
+  if (r.ChallengeName === "SOFTWARE_TOKEN_MFA")
+    return { kind: "mfa_challenge", session: r.Session, username };
+  throw new Error(`Setelah set password, challenge tak dikenal: ${r.ChallengeName}`);
 }
 
 export async function associateSoftwareToken(session: string): Promise<string> {
@@ -109,9 +133,29 @@ async function apiFetch<T>(method: string, path: string, token: string, body?: u
 
 // ----- tipe inti -----
 
-export type ChatMode = "AUTO" | "FAST" | "DEEP" | "MANUAL";
+export type ChatMode =
+  | "AUTO"
+  | "FAST"
+  | "DEEP"
+  | "MANUAL"
+  | "LONG"
+  | "FULLSTACK"
+  | "PRESENTATION";
 
 export type MessageVersion = { text: string; ts: number; model?: string };
+
+export type TodoItem = { content: string; status: "pending" | "in_progress" | "completed" | string };
+
+/** Lampiran pada pesan (upload user atau artefak agent). */
+export type MessageAtt = {
+  name?: string;
+  key?: string;
+  size?: number;
+  kind?: string; // upload | image | pdf | text | file | deck | webapp
+  url?: string;
+  slides?: number;
+  files?: number;
+};
 
 export type ChatMessage = {
   role: "user" | "assistant" | string;
@@ -120,6 +164,7 @@ export type ChatMessage = {
   model?: string;
   edited?: boolean;
   versions?: MessageVersion[];
+  atts?: MessageAtt[];
 };
 
 export type PendingConfirm = {
@@ -144,6 +189,7 @@ export type ChatStatus = {
   messages: ChatMessage[];
   pendingConfirmation?: PendingConfirm | null;
   clarify?: Clarify | null;
+  todos?: TodoItem[] | null;
   attachments?: Attachment[] | null;
   err?: string;
 };
@@ -198,6 +244,7 @@ export type SendChatBody = {
   modelId?: string;
   sessionId?: string;
   editFrom?: number;
+  attachments?: { key: string; name: string; contentType: string; size: number }[];
   /** true = jalankan ulang dari pesan user terakhir (jawaban lama jadi versi) */
   regenerate?: boolean;
 };
@@ -244,6 +291,33 @@ export const deleteKbDoc = (token: string, key: string) =>
 export const syncKb = (token: string) =>
   apiFetch<{ jobId: string; status: string }>("POST", "/kb/sync", token);
 
+// ----- upload lampiran chat (v3.4) -----
+
+export const presignChatUpload = (
+  token: string,
+  name: string,
+  contentType: string,
+  size: number
+) => apiFetch<{ uploadUrl: string; key: string }>("POST", "/uploads/presign", token, { name, contentType, size });
+
+// ----- translate EN -> ID (v3.4) -----
+
+export const translateText = (token: string, text: string, sessionId?: string) =>
+  apiFetch<{ status: string; translation?: string; message?: string }>(
+    "POST", "/translate", token, { text, sessionId }
+  );
+
+// ----- dokumentasi editable (v3.4) -----
+
+export const listSiteDocs = (token: string) =>
+  apiFetch<{ docs: { key: string; name: string; size: number; updated: string }[] }>("GET", "/docs/list", token);
+
+export const getDocContent = (token: string, key: string) =>
+  apiFetch<{ key: string; content: string; updated?: string }>("GET", "/docs/content", token, undefined, { key });
+
+export const saveDocContent = (token: string, key: string, content: string) =>
+  apiFetch<{ saved: boolean }>("POST", "/docs/content", token, { key, content });
+
 // ----- profil & admin -----
 
 export const getMe = (token: string) => apiFetch<MeInfo>("GET", "/me", token);
@@ -257,6 +331,12 @@ export const adminInviteUser = (token: string, email: string, role: "user" | "su
 export const adminSetUserStatus = (token: string, username: string, enabled: boolean) =>
   apiFetch<{ updated: boolean }>("POST", "/admin/users/status", token, { username, enabled });
 
+export const adminSetPassword = (token: string, username: string, password: string) =>
+  apiFetch<{ updated: boolean; note?: string }>("POST", "/admin/users/set-password", token, { username, password });
+
+export const adminResendInvite = (token: string, username: string) =>
+  apiFetch<{ resent: boolean }>("POST", "/admin/users/resend-invite", token, { username });
+
 export const adminDeleteUser = (token: string, username: string) =>
   apiFetch<{ deleted: boolean }>("DELETE", "/admin/users", token, undefined, { username });
 
@@ -264,23 +344,47 @@ export const signOutAll = (token: string) => apiFetch<{ signedOut: boolean }>("P
 
 // ---------------- storage ----------------
 const KEY = "maa.session";
+const REMEMBER_KEY = "maa.remember";
 
-export function saveSession(username: string, tokens: Tokens) {
-  sessionStorage.setItem(KEY, JSON.stringify({ username, tokens, savedAt: Date.now() }));
+export function saveSession(username: string, tokens: Tokens, remember = false) {
+  const payload = JSON.stringify({ username, tokens, savedAt: Date.now() });
+  sessionStorage.setItem(KEY, payload);
+  try {
+    if (remember) localStorage.setItem(REMEMBER_KEY, payload);
+    else localStorage.removeItem(REMEMBER_KEY);
+  } catch {
+    /* abaikan */
+  }
 }
 export function loadSession(): { username: string; tokens: Tokens } | null {
-  try {
-    const raw = sessionStorage.getItem(KEY);
-    if (!raw) return null;
-    const s = JSON.parse(raw);
-    if (!s?.tokens?.IdToken) return null;
-    return s;
-  } catch {
-    return null;
+  const parse = (raw: string | null) => {
+    try {
+      if (!raw) return null;
+      const s = JSON.parse(raw);
+      if (!s?.tokens?.IdToken) return null;
+      return s as { username: string; tokens: Tokens };
+    } catch {
+      return null;
+    }
+  };
+  const s = parse(sessionStorage.getItem(KEY)) || parse(localStorage.getItem(REMEMBER_KEY));
+  if (s && sessionStorage.getItem(KEY) === null) {
+    // hidupkan ulang tab: salin dari remember-me ke sessionStorage
+    try {
+      sessionStorage.setItem(KEY, localStorage.getItem(REMEMBER_KEY) || "");
+    } catch {
+      /* abaikan */
+    }
   }
+  return s;
 }
 export function clearSession() {
   sessionStorage.removeItem(KEY);
+  try {
+    localStorage.removeItem(REMEMBER_KEY);
+  } catch {
+    /* abaikan */
+  }
 }
 
 /** Sesi terakhir per user (URL routing fallback saat login). */
@@ -373,6 +477,13 @@ export const TRACE_META: Record<string, { label: string; tint: string; dot: stri
   memory_recall:    { label: "Pengambilan Memori",       tint: "text-indigo-700 dark:text-indigo-400", dot: "bg-indigo-500" },
   clarify:          { label: "Minta Klarifikasi",        tint: "text-amber-700 dark:text-amber-400",  dot: "bg-amber-500" },
   iac:              { label: "Infrastructure as Code",   tint: "text-lime-700 dark:text-lime-400",    dot: "bg-lime-500" },
+  task_plan:        { label: "Rencana Tugas (Todo)",     tint: "text-sky-700 dark:text-sky-400",      dot: "bg-sky-500" },
+  subagent:         { label: "Multi-Agent Subagent",     tint: "text-fuchsia-700 dark:text-fuchsia-400", dot: "bg-fuchsia-500" },
+  deck:             { label: "Slide Deck Dibuat",        tint: "text-violet-700 dark:text-violet-400", dot: "bg-violet-500" },
+  webapp:           { label: "Web App Ter-deploy",       tint: "text-lime-700 dark:text-lime-400",    dot: "bg-lime-500" },
+  upload:           { label: "Lampiran Diproses",        tint: "text-zinc-700 dark:text-zinc-400",    dot: "bg-zinc-500" },
+  guardrail:        { label: "Guardrail Keamanan",       tint: "text-orange-700 dark:text-orange-400", dot: "bg-orange-500" },
+  translate:        { label: "Terjemahan EN→ID",         tint: "text-cyan-700 dark:text-cyan-400",    dot: "bg-cyan-500" },
   confirm_required: { label: "Menunggu Konfirmasi Ganda", tint: "text-orange-700 dark:text-orange-400", dot: "bg-orange-500" },
   confirm_executed: { label: "Konfirmasi Dieksekusi",    tint: "text-emerald-700 dark:text-emerald-400", dot: "bg-emerald-500" },
   self_heal:        { label: "Self-Healing",             tint: "text-lime-700 dark:text-lime-400",    dot: "bg-lime-500" },

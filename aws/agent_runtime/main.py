@@ -135,6 +135,8 @@ def _msg_ddb(m):
         inner["model"] = {"S": m["model"]}
     if m.get("edited"):
         inner["edited"] = {"BOOL": True}
+    if m.get("atts"):
+        inner["atts"] = {"S": json.dumps(m["atts"], ensure_ascii=False)[:20000]}
     if m.get("versions"):
         inner["versions"] = {"L": [{"M": {"text": {"S": v["text"][:12000]},
                                           "ts": {"N": str(v.get("ts", now_ms()))},
@@ -149,6 +151,11 @@ def _ddb_msg(m):
         out["model"] = m["M"]["model"]["S"]
     if m["M"].get("edited", {}).get("BOOL"):
         out["edited"] = True
+    if "atts" in m["M"]:
+        try:
+            out["atts"] = json.loads(m["M"]["atts"]["S"])
+        except Exception:
+            pass
     if "versions" in m["M"]:
         out["versions"] = [{"text": v["M"]["text"]["S"], "ts": int(v["M"]["ts"]["N"]),
                             "model": v["M"].get("model", {}).get("S", "")} for v in m["M"]["versions"]["L"]]
@@ -400,10 +407,53 @@ TOOLS = [
         {"resource_type": {"type": "string", "enum": ["ec2", "s3", "dynamodb", "rds", "cloudformation"]},
          "identifier": {"type": "string"}},
         ["resource_type", "identifier"]),
+    # ------------- v3.4: agentic collaboration -------------
+    _ts("task_plan",
+        "Kelola daftar tugas (todo list) yang terlihat live di UI pengguna. WAJIB dipanggil di awal untuk tugas multi-langkah (>=2 langkah): susun rencana dulu, lalu panggil ulang setiap kali status langkah berubah. Status: pending (belum), in_progress (sedang dikerjakan), completed (selesai).",
+        {"todos": {"type": "array", "items": {"type": "object",
+                 "properties": {"content": {"type": "string"},
+                                "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]}},
+                 "required": ["content", "status"]}}},
+        ["todos"]),
+    _ts("subagent_run",
+        "Delegasikan sub-tugas ke agent spesialis (multi-agent). Role: researcher (riset web), analyst (analisis data/angka), architect (desain solusi/IaC), coder (tulis & uji kode via code interpreter), reviewer (kritik & perbaiki), ops (cek resource AWS). Kembalikan laporan lengkap subagent. Boleh panggil beberapa kali utk peran berbeda.",
+        {"role": {"type": "string", "enum": ["researcher", "analyst", "architect", "coder", "reviewer", "ops"]},
+         "task": {"type": "string"},
+         "context": {"type": "string"}},
+        ["role", "task"]),
+    _ts("generate_presentation",
+        "Buat slide deck profesional (HTML interaktif, tema merah-hitam MAA) dari array slide. Setiap slide: title + bullets (2-6 poin singkat) + opsional notes. Deck otomatis tampil di chat pengguna. Gunakan untuk permintaan presentasi/report eksekutif.",
+        {"title": {"type": "string"},
+         "subtitle": {"type": "string"},
+         "slides": {"type": "array", "items": {"type": "object",
+                    "properties": {"title": {"type": "string"},
+                                   "bullets": {"type": "array", "items": {"type": "string"}},
+                                   "notes": {"type": "string"}},
+                    "required": ["title"]}}},
+        ["title", "slides"]),
+    _ts("deploy_web_app",
+        "Deploy aplikasi web front-end (SPA self-contained) buatanmu ke preview URL live yang bisa langsung dibuka pengguna. Wajib satu index.html lengkap (inline CSS/JS). Opsional file tambahan (css/js/json). Gunakan untuk permintaan 'buatkan aplikasi/web/dashboard/landing page'.",
+        {"app_name": {"type": "string"},
+         "index_html": {"type": "string"},
+         "files": {"type": "array", "items": {"type": "object",
+                   "properties": {"path": {"type": "string"}, "content": {"type": "string"}},
+                   "required": ["path", "content"]}}},
+        ["app_name", "index_html"]),
 ]
 
 DESTRUCTIVE_TYPES = {"ec2", "s3", "dynamodb", "rds", "cloudformation"}
 GATEWAY_TOOLS = {"web_search", "web_fetch"}
+SUBAGENT_TOOLS = {"web_search", "web_fetch", "kb_search", "code_interpreter",
+                  "aws_list_resources", "aws_get_metrics", "aws_cost_analysis",
+                  "aws_logs_inspect", "generate_image"}
+SUBAGENT_ROLES = {
+    "researcher": "Kamu agent researcher: riset internet via web_search/web_fetch, rangkum temuan dengan sumber URL.",
+    "analyst": "Kamu agent analyst: olah data & angka, pakai code_interpreter untuk hitung/chart, sajikan insight kuantitatif.",
+    "architect": "Kamu agent architect: rancang solusi/arsitektur AWS, susun komponen, trade-off, dan estimasi biaya.",
+    "coder": "Kamu agent coder: tulis & UJI kode via code_interpreter sebelum melapor. Sertakan cuplikan kode final.",
+    "reviewer": "Kamu agent reviewer: kritik draft/hasil kerja, temukan risiko/kesalahan, beri saran perbaikan konkret.",
+    "ops": "Kamu agent ops: inspeksi resource AWS via aws_list_resources/aws_get_metrics/aws_logs_inspect, laporkan fakta ID nyata.",
+}
 
 
 def short_type(t):
@@ -422,6 +472,79 @@ def _tags(resource_type, name, extra=None):
 def _presign(bucket, key, ttl=86400):
     return get_client("s3").generate_presigned_url(
         "get_object", Params={"Bucket": bucket, "Key": key}, ExpiresIn=ttl)
+
+
+def _todos_save(sid, todos):
+    """Persist todo list ke record sesi agar live tampil di UI (poling status)."""
+    if not sid:
+        return
+    _LAST_TODOS[sid] = todos
+    try:
+        get_client("dynamodb").update_item(
+            TableName=SESSIONS_TABLE, Key={"sessionId": {"S": sid}},
+            UpdateExpression="SET todos = :t, updatedAt = :u",
+            ExpressionAttributeValues={":t": {"S": json.dumps(todos, ensure_ascii=False)[:30000]},
+                                       ":u": {"N": str(now_ms())}})
+    except Exception:
+        pass
+
+
+_LAST_TODOS = {}
+
+
+# ---------------------------------------------------------------- deck template
+DECK_TMPL = """<!DOCTYPE html><html lang=\"id\"><head><meta charset=\"utf-8\">
+<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>__TITLE__</title>
+<style>
+:root{--red:#DC2626;--ink:#111114;--paper:#FAFAFA;--line:#E4E4E7}
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:Inter,'Segoe UI',system-ui,sans-serif;background:#0B0B0E;color:#FAFAFA;overflow:hidden}
+.deck{position:relative;width:100vw;height:100vh}
+.slide{position:absolute;inset:0;display:none;flex-direction:column;justify-content:center;padding:7vh 9vw;background:radial-gradient(1200px 600px at 85% -10%,#1A1A20 0%,#0B0B0E 60%)}
+.slide.active{display:flex}
+.slide::before{content:'';position:absolute;left:9vw;top:0;width:56px;height:5px;background:var(--red);border-radius:0 0 4px 4px}
+.kick{color:var(--red);font-size:clamp(11px,1.2vw,14px);font-weight:700;letter-spacing:.28em;text-transform:uppercase;margin-bottom:1.6vh}
+h1{font-size:clamp(34px,6vw,84px);line-height:1.04;font-weight:800;letter-spacing:-.02em}
+h2{font-size:clamp(26px,3.6vw,52px);line-height:1.1;font-weight:800;letter-spacing:-.01em;margin-bottom:4vh}
+.sub{color:#A1A1AA;font-size:clamp(15px,1.8vw,24px);margin-top:2.4vh;max-width:60ch}
+ul{list-style:none;display:flex;flex-direction:column;gap:2.6vh;max-width:66ch}
+li{font-size:clamp(15px,1.9vw,25px);line-height:1.45;color:#E4E4E7;padding-left:1.6em;position:relative}
+li::before{content:'';position:absolute;left:0;top:.62em;width:.55em;height:.55em;background:var(--red);border-radius:2px;transform:rotate(45deg)}
+.notes{position:absolute;left:9vw;right:9vw;bottom:10vh;color:#71717A;font-size:clamp(11px,1.1vw,14px);font-style:italic}
+.hud{position:fixed;left:0;right:0;bottom:0;display:flex;align-items:center;gap:14px;padding:12px 9vw;background:linear-gradient(transparent,rgba(0,0,0,.55));z-index:9}
+.count{font-variant-numeric:tabular-nums;color:#A1A1AA;font-size:12px;letter-spacing:.12em}
+.bar{flex:1;height:3px;background:#27272A;border-radius:99px;overflow:hidden}.fill{height:100%;background:var(--red);width:0;transition:width .35s ease}
+.btn{background:#18181B;border:1px solid #3F3F46;color:#FAFAFA;border-radius:8px;padding:6px 13px;font-size:12.5px;cursor:pointer}
+.btn:hover{border-color:var(--red);color:#fff}
+.brand{position:fixed;top:16px;right:9vw;font-size:11px;letter-spacing:.3em;color:#52525B;text-transform:uppercase;z-index:9}
+@media print{body{overflow:visible}.slide{display:flex;position:relative;height:100vh;page-break-after:always}.hud{display:none}}
+</style></head><body>
+<div class=\"brand\">MAA AWS AGENT</div>
+<div class=\"deck\" id=\"deck\"></div>
+<div class=\"hud\"><span class=\"count\" id=\"count\"></span><span class=\"bar\"><span class=\"fill\" id=\"fill\"></span></span>
+<button class=\"btn\" onclick=\"go(cur-1)\">&#8592;</button><button class=\"btn\" onclick=\"go(cur+1)\">&#8594;</button>
+<button class=\"btn\" onclick=\"document.documentElement.requestFullscreen&&document.documentElement.requestFullscreen()\">Fullscreen</button></div>
+<script>
+const DATA=__DATA__;
+const deck=document.getElementById('deck');
+DATA.forEach((s,i)=>{const el=document.createElement('section');el.className='slide'+(i===0?' active':'');
+el.innerHTML=`<div class=\"kick\">${i===0?'':i+' / '+(DATA.length-1)}</div>${i===0?`<h1>${esc(s.title)}</h1>${s.notes?`<p class=\"sub\">${esc(s.notes)}</p>`:''}`:`<h2>${esc(s.title)}</h2><ul>${(s.bullets||[]).map(b=>`<li>${esc(b)}</li>`).join('')}</ul>${s.notes?`<div class=\"notes\">${esc(s.notes)}</div>`:''}`};
+deck.appendChild(el)});
+function esc(x){const d=document.createElement('div');d.textContent=x||'';return d.innerHTML}
+let cur=0;const els=[...document.querySelectorAll('.slide')];
+function go(n){if(n<0||n>=els.length)return;els[cur].classList.remove('active');cur=n;els[cur].classList.add('active');
+document.getElementById('count').textContent=(cur+1)+' / '+els.length;
+document.getElementById('fill').style.width=((cur+1)/els.length*100)+'%'}
+addEventListener('keydown',e=>{if(['ArrowRight','PageDown',' '].includes(e.key))go(cur+1);if(['ArrowLeft','PageUp'].includes(e.key))go(cur-1)});
+addEventListener('click',e=>{if(e.target.closest('.hud'))return;go(cur+1)});go(0);
+</script></body></html>"""
+
+
+def _deck_html(title, subtitle, slides):
+    data = [{"title": title, "notes": subtitle}] + \
+        [{"title": s["title"], "bullets": s["bullets"], "notes": s["notes"]} for s in slides]
+    js = json.dumps(data, ensure_ascii=False).replace("</", "<\\/")
+    return DECK_TMPL.replace("__TITLE__", title).replace("__DATA__", js)
 
 
 # ---------------------------------------------------------------- tool executor
@@ -584,6 +707,132 @@ def exec_tool(name, args, sid=None, attachments=None):
             attachments.append({"type": "image", "url": url, "name": key.split("/")[-1]})
         return {"status": "ok", "image": url, "prompt": prompt[:200],
                 "note": "Sertakan gambar ini di jawaban dengan markdown ![gambar](" + url + ")"}
+
+    # ---- v3.4: task plan (todo list live di UI) ----
+    if name == "task_plan":
+        todos = []
+        for t in (args.get("todos") or [])[:20]:
+            c = str(t.get("content", "")).strip()
+            s = t.get("status", "pending")
+            if c and s in ("pending", "in_progress", "completed"):
+                todos.append({"content": c[:200], "status": s})
+        if not todos:
+            return {"status": "error", "message": "todos kosong"}
+        _todos_save(sid, todos)
+        done = sum(1 for t in todos if t["status"] == "completed")
+        put_trace(sid or "-", "task_plan", f"Rencana diperbarui: {done}/{len(todos)} selesai")
+        return {"status": "ok", "todos": todos,
+                "note": f"Todo list tampil di UI ({done}/{len(todos)} selesai). Perbarui status tiap kali langkah berubah."}
+
+    # ---- v3.4: multi-agent subagent ----
+    if name == "subagent_run":
+        role = args.get("role", "researcher")
+        if role not in SUBAGENT_ROLES:
+            role = "researcher"
+        task = str(args.get("task", ""))[:2000]
+        ctx = str(args.get("context", ""))[:3000]
+        if not task.strip():
+            return {"status": "error", "message": "task kosong"}
+        t0 = time.time()
+        put_trace(sid or "-", "subagent", f"Spawn subagent [{role}]: {task[:160]}")
+        tools_sub = [t for t in TOOLS if t["toolSpec"]["name"] in SUBAGENT_TOOLS]
+        msgs = [{"role": "user", "content": [{"text":
+                 (f"[KONTEKS DARI AGENT UTAMA]\n{ctx}\n\n" if ctx else "") +
+                 f"[TUGAS]\n{task}\n\nKerjakan tugas di atas secara mandiri. Laporan final WAJIB lengkap, faktual, siap dipakai agent utama."}]}]
+        report = ""
+        try:
+            for _i in range(5):
+                sub_model = DEEP_MODEL if role in ("architect", "coder") else FAST_MODEL
+                kw = dict(modelId=sub_model, messages=msgs,
+                          system=[{"text": SUBAGENT_ROLES[role] + " Jawab dalam bahasa pengguna. Maks 350 kata."}],
+                          inferenceConfig={"maxTokens": 2500, "temperature": 0.3, "topP": 0.9},
+                          toolConfig={"tools": tools_sub})
+                try:
+                    r = get_client("bedrock-runtime").converse(**kw)
+                except Exception:
+                    kw.pop("toolConfig", None)
+                    r = get_client("bedrock-runtime").converse(**kw)
+                out = r["output"]["message"]
+                msgs.append(out)
+                if r["stopReason"] == "tool_use":
+                    trs = []
+                    for c in out["content"]:
+                        if "toolUse" not in c:
+                            continue
+                        tu = c["toolUse"]
+                        if tu["name"] == "aws_delete_resource":
+                            trs.append({"toolResult": {"toolUseId": tu["toolUseId"], "status": "error",
+                                        "content": [{"text": "subagent tidak memiliki wewenang destruktif"}]}})
+                            continue
+                        try:
+                            res = exec_tool(tu["name"], tu.get("input", {}) or {}, sid=sid, attachments=None)
+                            put_trace(sid or "-", "subagent",
+                                      f"[{role}] {tu['name']} -> {json.dumps(res, ensure_ascii=False)[:240]}")
+                            trs.append({"toolResult": {"toolUseId": tu["toolUseId"], "status": "success",
+                                        "content": [{"json": res}]}})
+                        except Exception as te:
+                            trs.append({"toolResult": {"toolUseId": tu["toolUseId"], "status": "error",
+                                        "content": [{"text": str(te)[:300]}]}})
+                    msgs.append({"role": "user", "content": trs})
+                    continue
+                report = "".join(c.get("text", "") for c in out["content"] if "text" in c).strip()
+                break
+        except Exception as e:
+            report = f"subagent error: {str(e)[:200]}"
+        dt = time.time() - t0
+        put_trace(sid or "-", "subagent", f"[{role}] selesai ({dt:.1f}s, {len(report)} char)")
+        return {"status": "ok", "role": role, "report": (report or "(subagent tanpa laporan)")[:6000],
+                "note": "Sintesis poin penting laporan subagent ini ke jawabanmu."}
+
+    # ---- v3.4: presentation deck (artifact) ----
+    if name == "generate_presentation":
+        title = str(args.get("title", "Presentasi")).strip()[:120]
+        subtitle = str(args.get("subtitle", "")).strip()[:200]
+        slides = []
+        for s in (args.get("slides") or [])[:30]:
+            t = str(s.get("title", "")).strip()
+            if not t:
+                continue
+            bullets = [str(b)[:220] for b in (s.get("bullets") or [])[:8] if str(b).strip()]
+            slides.append({"title": t, "bullets": bullets, "notes": str(s.get("notes", ""))[:500]})
+        if not slides:
+            return {"status": "error", "message": "slides kosong"}
+        html = _deck_html(title, subtitle, slides)
+        key = f"decks/{uuid.uuid4().hex[:10]}-{re.sub(r'[^a-z0-9-]', '-', title.lower())[:40]}.html"
+        get_client("s3").put_object(Bucket=ART_BUCKET, Key=key, Body=html.encode(),
+                      ServerSideEncryption="aws:kms", ContentType="text/html")
+        url = _presign(ART_BUCKET, key, ttl=7 * 86400)
+        if attachments is not None:
+            attachments.append({"type": "deck", "url": url, "name": title, "slides": len(slides)})
+        put_trace(sid or "-", "deck", f"Deck '{title}' ({len(slides)} slide) siap: {url[:120]}")
+        return {"status": "ok", "url": url, "slides": len(slides), "title": title,
+                "note": "Deck tampil otomatis di chat pengguna. Sebutkan judul deck dalam jawaban."}
+
+    # ---- v3.4: full-stack web app preview (artifact) ----
+    if name == "deploy_web_app":
+        app_name = re.sub(r"[^A-Za-z0-9-_ ]", "", str(args.get("app_name", "app"))).strip() or "app"
+        index_html = args.get("index_html", "")
+        if len(index_html) < 50:
+            return {"status": "error", "message": "index_html terlalu pendek"}
+        folder = f"apps/{uuid.uuid4().hex[:10]}"
+        extra = []
+        for f in (args.get("files") or [])[:10]:
+            p = str(f.get("path", "")).strip().lstrip("/")
+            if not p or ".." in p:
+                continue
+            get_client("s3").put_object(Bucket=ART_BUCKET, Key=f"{folder}/{p}",
+                          Body=str(f.get("content", ""))[:400000].encode(),
+                          ServerSideEncryption="aws:kms")
+            extra.append(p)
+        get_client("s3").put_object(Bucket=ART_BUCKET, Key=f"{folder}/index.html",
+                      Body=index_html[:900000].encode(),
+                      ServerSideEncryption="aws:kms", ContentType="text/html")
+        url = _presign(ART_BUCKET, f"{folder}/index.html", ttl=7 * 86400)
+        if attachments is not None:
+            attachments.append({"type": "webapp", "url": url, "name": app_name, "files": 1 + len(extra)})
+        put_trace(sid or "-", "webapp", f"App '{app_name}' live: {url[:120]}")
+        return {"status": "ok", "url": url, "app": app_name, "files": ["index.html"] + extra,
+                "note": "Preview app tampil otomatis di chat pengguna; jelaskan fitur yang kamu bangun."}
 
     # ---- AWS ops (STSCOPE: sesi single-use) ----
     sess = assume_execution()
@@ -900,10 +1149,34 @@ PROTOKOL KLARIFIKASI (WAJIB — structured clarification)
 [[CLARIFY]]{"question":"<satu pertanyaan klarifikasi>","options":["<opsi 1>","<opsi 2>","<opsi 3>"]}
 - 2-4 opsi singkat dan spesifik. Bila nanti pengguna memilih, lanjutkan eksekusi.
 
+KOLABORASI MULTI-AGENT (WAJIB untuk pekerjaan berat)
+- Untuk tugas besar (riset menyeluruh, analisis multi-dimensi, build aplikasi, review menyeluruh): delegasikan via subagent_run ke 2-4 peran yang relevan (researcher/analyst/architect/coder/reviewer/ops), lalu SINTESIS laporan mereka menjadi jawaban final Anda.
+- Subagent bekerja mandiri; Anda tetap bertanggung jawab atas jawaban akhir.
+
+RENCANA TUGAS (todo list live di UI)
+- Untuk pekerjaan multi-langkah: PANGGIL task_plan PERTAMA (sebelum tool lain) berisi langkah-langkah, lalu perbarui statusnya (in_progress/completed) tiap kali langkah berubah.
+- Rencana tampil live di panel todo pengguna — jaga agar tetap akurat.
+
+LAMPIRAN FILE
+- Pengguna dapat mengunggah file; konteksnya dikirim dalam blok [LAMPIRAN: nama] di pesan, dan gambar terlihat langsung oleh Anda.
+- Analisis lampiran (CSV/JSON/teks) pakai code_interpreter bila perhitungan diperlukan.
+
+ARTEFAK (deck & aplikasi web)
+- Permintaan presentasi/report eksekutif -> generate_presentation (deck interaktif otomatis tampil di chat).
+- Permintaan aplikasi web/dashboard/landing page -> bangun SPA self-contained (HTML+CSS+JS inline, data dummy realistis bila perlu) lalu deploy_web_app; jelaskan fiturnya di jawaban.
+
 FORMAT RESPONS
 - Maksimal ~250 kata untuk status singkat; bullet + angka nyata dari tool.
 - Setelah aksi berhasil, sertakan ID resource yang relevan.
 - Sertakan gambar dengan markdown ![alt](url) bila generate_image/code_interpreter menghasilkan gambar."""
+
+
+# addendum prompt per mode khusus (v3.4)
+MODE_PROMPTS = {
+    "LONG": "\n\nMODE LONG-RUNNING TASK: Pengguna memberi pekerjaan besar/berdurasi panjang. Bekerja sistematis: task_plan dulu, eksekusi bertahap dengan tool, self-healing bila gagal, perbarui todo setiap kemajuan, lalu laporkan hasil akhir lengkap + langkah lanjutan.",
+    "FULLSTACK": "\n\nMODE FULL-STACK: Pengguna ingin aplikasi dibangun. Rancang arsitektur singkat, tulis aplikasi web lengkap (SPA self-contained: HTML+CSS+JS inline, desain modern, responsif, data realistis), uji logika via code_interpreter bila perlu, lalu deploy_web_app. Sertakan URL preview dan daftar fitur di jawaban.",
+    "PRESENTATION": "\n\nMODE PRESENTATION: Pengguna ingin materi presentasi. Susun deck 5-12 slide dengan struktur naratif (konteks -> isi -> data -> rekomendasi), bullet ringkas per slide, lalu panggil generate_presentation. Deck tampil otomatis di chat; ringkas isi deck di jawaban.",
+}
 
 
 # ---------------------------------------------------------------- routing
@@ -933,6 +1206,12 @@ def route_model(mode, model_id):
     if mode == "DEEP":
         return DEEP_MODEL, {"maxTokens": 9000, "temperature": 0.3, "topP": 0.9}, \
             {"reasoning_effort": "high"}, False
+    if mode == "LONG":
+        return DEEP_MODEL, {"maxTokens": 16000, "temperature": 0.3, "topP": 0.9}, \
+            {"reasoning_effort": "high"}, False
+    if mode in ("FULLSTACK", "PRESENTATION"):
+        return DEEP_MODEL, {"maxTokens": 12000, "temperature": 0.35, "topP": 0.9}, \
+            {"reasoning_effort": "high"}, False
     if mode == "MANUAL":
         mid = model_id or FAST_MODEL
         meta = model_meta(mid) or {}
@@ -942,8 +1221,13 @@ def route_model(mode, model_id):
     return FAST_MODEL, {"maxTokens": 900, "temperature": 0.2, "topP": 0.9}, None, True
 
 
-def call_converse(model_id, messages, inference, extra, use_cache, with_tools=True):
-    system = [{"text": SYSTEM_PROMPT}]
+LOOP_LIMITS = {"AUTO": 8, "FAST": 5, "DEEP": 10, "MANUAL": 8,
+               "LONG": 24, "FULLSTACK": 16, "PRESENTATION": 16}
+
+
+def call_converse(model_id, messages, inference, extra, use_cache, with_tools=True, with_guardrail=True, mode=None):
+    system_text = SYSTEM_PROMPT + MODE_PROMPTS.get(mode or "", "")
+    system = [{"text": system_text}]
     if use_cache:
         system.append({"cachePoint": {"type": "default"}})
     kwargs = dict(modelId=model_id, messages=messages, system=system, inferenceConfig=inference)
@@ -951,7 +1235,7 @@ def call_converse(model_id, messages, inference, extra, use_cache, with_tools=Tr
         kwargs["additionalModelRequestFields"] = extra
     if with_tools:
         kwargs["toolConfig"] = {"tools": TOOLS}
-    if GUARDRAIL_ID:
+    if GUARDRAIL_ID and with_guardrail:
         kwargs["guardrailConfig"] = {"guardrailIdentifier": GUARDRAIL_ID,
                                      "guardrailVersion": GUARDRAIL_VERSION}
     return get_client("bedrock-runtime").converse(**kwargs)
@@ -976,6 +1260,70 @@ def _extract_clarify(text):
 
 
 
+def _pdf_text(body):
+    """Ekstraksi teks PDF best-effort via pypdf (opsional di runtime)."""
+    try:
+        from pypdf import PdfReader  # type: ignore
+        r = PdfReader(io.BytesIO(body))
+        pages = []
+        for p in r.pages[:20]:
+            pages.append((p.extract_text() or "")[:3000])
+        return "\n".join(pages)[:30000]
+    except Exception:
+        return ""
+
+
+# ---------------------------------------------------------------- chat loop
+CLARIFY_RE2 = re.compile(r"\[\[CLARIFY\]\]")  # marker only (ekstraksi asli di bawah)
+
+
+def _load_attachments(items):
+    """Unduh lampiran dari ART bucket -> (teks konteks, blok gambar Converse, meta UI)."""
+    texts, blocks, meta = [], [], []
+    s3 = get_client("s3")
+    budget = ATT_TOTAL_BUDGET
+    for it in items[:8]:
+        key = str(it.get("key", ""))
+        name = str(it.get("name", key.split("/")[-1] or "file"))
+        if not key.startswith("uploads/") or ".." in key:
+            continue
+        try:
+            obj = s3.get_object(Bucket=ART_BUCKET, Key=key)
+            body = obj["Body"].read()
+            ext = key.rsplit(".", 1)[-1].lower() if "." in key else ""
+            fmt = IMG_FMT.get(ext)
+            if fmt and len(body) <= 3_800_000:
+                blocks.append({"image": {"format": fmt, "source": {"bytes": body}}})
+                meta.append({"name": name, "key": key, "size": len(body), "kind": "image",
+                             "url": _presign(ART_BUCKET, key)})
+                continue
+            if ext == "pdf":
+                txt = _pdf_text(body)
+                if txt:
+                    take = txt[:min(ATT_MAX_PER_FILE, max(budget, 0))]
+                    texts.append(f"[LAMPIRAN PDF: {name}]\n{take}")
+                    budget -= len(take)
+                else:
+                    texts.append(f"[LAMPIRAN PDF: {name}] - (teks tidak dapat diekstrak; minta versi teks/CSV bila diperlukan)")
+                meta.append({"name": name, "key": key, "size": len(body), "kind": "pdf"})
+                continue
+            try:
+                txt = body.decode("utf-8", "ignore")
+            except Exception:
+                txt = ""
+            if txt and budget > 0 and (ext in TEXT_EXTS or (obj.get("ContentType", "") or "").startswith("text/")):
+                take = txt[:min(ATT_MAX_PER_FILE, max(budget, 0))]
+                texts.append(f"[LAMPIRAN: {name} ({ext or 'txt'})]\n{take}")
+                budget -= len(take)
+            elif txt:
+                texts.append(f"[LAMPIRAN: {name}] - (file terlalu besar utk konteks; tersimpan di S3: {key})")
+            meta.append({"name": name, "key": key, "size": len(body),
+                         "kind": "text" if ext in TEXT_EXTS else "file"})
+        except Exception as e:
+            texts.append(f"[LAMPIRAN: {name}] - (gagal dibaca: {str(e)[:120]})")
+    return texts, blocks, meta
+
+
 # ---------------------------------------------------------------- chat loop
 def handle_chat(payload):
     sid = payload["sessionId"]
@@ -983,18 +1331,28 @@ def handle_chat(payload):
     username = payload.get("username", "user")
     message = payload["message"].strip()
     mode = payload.get("mode", "AUTO")
-    if mode not in ("AUTO", "FAST", "DEEP", "MANUAL"):
+    if mode not in ("AUTO", "FAST", "DEEP", "MANUAL", "LONG", "FULLSTACK", "PRESENTATION"):
         mode = "AUTO"
     model_id = payload.get("modelId")
     edit_from = payload.get("editFrom")
-
-    attachments = []
+    raw_attachments = payload.get("attachments") or []
     rec = session_get(sid)
     prev_msgs = []
     if rec and "messages" in rec:
         for m in rec["messages"]["L"]:
             prev_msgs.append(_ddb_msg(m))
     title = rec.get("title", {}).get("S") if rec else None
+
+    # ---------------- attachments (v3.4) ----------------
+    attachments = []          # artifacts utk UI (deck/webapp/gambar)
+    upload_meta = []          # metadata lampiran utk UI pesan user
+    att_blocks = []           # content blocks gambar utk Converse
+    att_texts = []            # konteks teks file
+    if raw_attachments:
+        att_texts, att_blocks, upload_meta = _load_attachments(raw_attachments)
+        put_trace(sid, "upload", f"{len(raw_attachments)} lampiran diproses "
+                  f"({sum(1 for b in att_blocks if 'image' in b)} gambar, "
+                  f"{len(att_texts)} teks diekstrak)")
 
     edited_flag = False
     versions_payload = None
@@ -1047,6 +1405,17 @@ def handle_chat(payload):
         if m["role"] in ("user", "assistant"):
             conv.append({"role": m["role"], "content": [{"text": m["text"]}]})
 
+    # sisipkan lampiran ke pesan user TERAKHIR (teks file + blok gambar)
+    if conv and conv[-1]["role"] == "user":
+        base_text = conv[-1]["content"][0]["text"]
+        merged = base_text
+        if att_texts:
+            merged = base_text + "\n\n" + "\n\n".join(att_texts)
+        blocks = [{"text": merged}]
+        if att_blocks:
+            blocks.extend(att_blocks)
+        conv[-1]["content"] = blocks
+
     auto_route = None
     if mode == "AUTO":
         model, reason = route_auto(message, len(messages_db))
@@ -1068,18 +1437,20 @@ def handle_chat(payload):
     final_text = ""
     last_err_tool = None
     tools_disabled = False
+    guardrail_hit = False
     try:
-        for iteration in range(8):
+        max_iter = LOOP_LIMITS.get(mode, 8)
+        for iteration in range(max_iter):
             with_tools = not tools_disabled
             try:
-                resp = call_converse(model, conv, inf, extra, cache, with_tools=with_tools)
+                resp = call_converse(model, conv, inf, extra, cache, with_tools=with_tools, mode=mode)
             except Exception as e:
                 emsg = str(e)
                 if with_tools and ("toolConfig" in emsg or "tool" in emsg.lower()
                                    or "ValidationException" in type(e).__name__):
                     put_trace(sid, "error", f"Model tak mendukung tools: {emsg[:200]} - retry teks-only", model=model)
                     tools_disabled = True
-                    resp = call_converse(model, conv, inf, extra, cache, with_tools=False)
+                    resp = call_converse(model, conv, inf, extra, cache, with_tools=False, mode=mode)
                 else:
                     raise
             stop = resp["stopReason"]
@@ -1091,6 +1462,14 @@ def handle_chat(payload):
                 for c in out["content"] if "reasoningContent" in c)
             if reasoning:
                 put_trace(sid, "thinking", f"[extended reasoning {len(reasoning)} chars] {reasoning[:900]}...", model=model)
+
+            if stop == "guardrail_intervened":
+                guardrail_hit = True
+                put_trace(sid, "guardrail", "Guardrail menahan respons - coba sintesis ulang tanpa guardrail", model=model)
+                final_text = "".join(c.get("text", "") for c in out["content"] if "text" in c).strip()
+                if final_text:
+                    break
+                continue  # beri kesempatan iterasi berikut (mode/prompt sama)
 
             if stop == "tool_use":
                 tool_results = []
@@ -1172,7 +1551,33 @@ def handle_chat(payload):
             break
 
         if not final_text:
-            final_text = "(Loop berhenti tanpa jawaban final - coba perjelas perintah.)"
+            # ---- FINAL SYNTHESIS (v3.4): loop habis / guardrail -> paksa jawaban final ----
+            put_trace(sid, "thinking", "Loop selesai tanpa teks final - paksa sintesis jawaban", model=model)
+            try:
+                conv.append({"role": "user", "content": [{"text":
+                    "Waktunya berhenti bekerja. RINGKAS sekarang seluruh hasil tool di atas menjadi jawaban final yang lengkap dan bermakna untuk pengguna. JANGAN memanggil tool lagi."}]})
+                syn_inf = dict(inf)
+                syn_inf["maxTokens"] = min(int(syn_inf.get("maxTokens", 4000) or 4000), 6000)
+                syn = None
+                try:
+                    syn = call_converse(model, conv, syn_inf, extra, False,
+                                        with_tools=False, with_guardrail=True, mode=mode)
+                except Exception:
+                    if GUARDRAIL_ID:
+                        syn = call_converse(model, conv, syn_inf, extra, False,
+                                            with_tools=False, with_guardrail=False, mode=mode)
+                if syn and syn.get("output", {}).get("message"):
+                    sout = syn["output"]["message"]
+                    final_text = "".join(c.get("text", "") for c in sout["content"] if "text" in c).strip()
+            except Exception as se:
+                put_trace(sid, "error", f"synthesis gagal: {str(se)[:200]}", model=model)
+            if not final_text:
+                if guardrail_hit:
+                    final_text = ("Respons ditahan oleh Guardrail keamanan. Coba rumuskan permintaan secara berbeda; "
+                                  "bila Anda yakin ini salah tangkap, laporkan ke superadmin untuk penyetelan kebijakan.")
+                else:
+                    final_text = ("Sistem menyelesaikan tool namun belum menghasilkan ringkasan final. "
+                                  "Silakan kirim ulang perintah atau perjelas permintaan.")
     except Exception as e:
         final_text = f"Terjadi kesalahan internal: {str(e)[:300]}"
         put_trace(sid, "error", f"fatal: {str(e)[:500]}", model=model)
@@ -1199,10 +1604,17 @@ def handle_chat(payload):
         messages_db = messages_db + [_asst(final_text, versions_payload)]
     else:
         messages_db = messages_db + [_asst(final_text, None)]
+    if upload_meta and messages_db:
+        for i in range(len(messages_db) - 1, -1, -1):
+            if messages_db[i]["role"] == "user":
+                messages_db[i]["atts"] = upload_meta
+                break
     session_put(sid, user_id, username, "done", messages_db, mode=mode, model_id=used_model,
                 title=title or message,
                 extra={"createdAt": rec["createdAt"]["S"] if rec else str(now_ms()),
                        "autoRoute": auto_route})
+    if _LAST_TODOS.get(sid):
+        _todos_save(sid, _LAST_TODOS[sid])  # session_put menimpa item -> simpan ulang todos
 
     # tulis event ke AgentCore Memory (ekstraksi asinkron)
     memory_write(user_id, sid, message, final_text)
@@ -1215,7 +1627,35 @@ def handle_chat(payload):
         out["clarify"] = clarify
     if attachments:
         out["attachments"] = attachments
+    if upload_meta:
+        out["uploads"] = upload_meta
     return out
+
+
+# ---------------------------------------------------------------- translate (EN -> ID)
+def handle_translate(payload):
+    """Terjemahkan teks ke Bahasa Indonesia (single call, model FAST, tanpa tool)."""
+    text = str(payload.get("text", "")).strip()
+    if not text:
+        return {"status": "error", "message": "teks kosong"}
+    if len(text) > 12000:
+        text = text[:12000]
+    sid = payload.get("sessionId", "-")
+    try:
+        r = get_client("bedrock-runtime").converse(
+            modelId=FAST_MODEL,
+            system=[{"text": "Anda penerjemah profesional. Terjemahkan teks berikut ke Bahasa Indonesia "
+                             "yang natural dan mudah dibaca. Pertahankan format markdown, istilah teknis "
+                             "yang umum (mis. 'instance', 'deploy'), dan angka. Keluarkan HANYA hasil terjemahan."}],
+            messages=[{"role": "user", "content": [{"text": text}]}],
+            inferenceConfig={"maxTokens": 8000, "temperature": 0.2, "topP": 0.9})
+        out = r["output"]["message"]
+        tr = "".join(c.get("text", "") for c in out["content"] if "text" in c).strip()
+        put_trace(sid, "translate", f"translate EN->ID OK ({len(tr)} char)")
+        return {"status": "ok", "translation": tr or text}
+    except Exception as e:
+        put_trace(sid, "error", f"translate gagal: {str(e)[:200]}")
+        return {"status": "error", "message": str(e)[:300]}
 
 
 # ---------------------------------------------------------------- confirm
@@ -1280,6 +1720,8 @@ def invoke(payload, context=None):
     ptype = payload.get("type", "chat")
     if ptype == "confirm":
         return handle_confirm(payload)
+    if ptype == "translate":
+        return handle_translate(payload)
     return handle_chat(payload)
 
 

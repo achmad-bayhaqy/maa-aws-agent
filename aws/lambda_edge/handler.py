@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""MAA AWS Agent - Edge Lambda v3 (thin SigV4 proxy to AgentCore Runtime).
-v3: /me + superadmin user CRUD (undangan email via Cognito default sender),
-Live Trace dari CloudWatch Logs (pengganti DynamoDB traces), mode AUTO,
-edit pesan (editFrom) + versioning, katalog 88 model + autoDefaults."""
+"""MAA AWS Agent - Edge Lambda v3.4 (thin SigV4 proxy ke AgentCore Runtime).
+v3.4: upload lampiran chat (multi-file, besar), translate EN->ID, dokumentasi
+editable (superadmin, markdown), admin set-password/resend-invite, todos,
+mode LONG/FULLSTACK/PRESENTATION, mode AUTO/FAST/DEEP/MANUAL, edit+versions."""
 import json
 import os
 import time
@@ -119,8 +119,16 @@ def handler(event, context):
             if len(message) > 6000:
                 return resp(400, {"error": "message terlalu panjang (max 6000)"})
             mode = body.get("mode", "AUTO")
-            if mode not in ("AUTO", "FAST", "DEEP", "MANUAL"):
+            if mode not in ("AUTO", "FAST", "DEEP", "MANUAL", "LONG", "FULLSTACK", "PRESENTATION"):
                 mode = "AUTO"
+            # lampiran chat (v3.4): key harus di bawah uploads/{userId}/
+            atts = []
+            for a in (body.get("attachments") or [])[:8]:
+                k = str(a.get("key", ""))
+                if k.startswith(f"uploads/{cl['userId']}/") and ".." not in k:
+                    atts.append({"key": k, "name": str(a.get("name", ""))[:120],
+                                 "contentType": str(a.get("contentType", ""))[:80],
+                                 "size": int(a.get("size", 0) or 0)})
             edit_from = body.get("editFrom")
             existing_sid = body.get("sessionId")
             if existing_sid:
@@ -152,12 +160,15 @@ def handler(event, context):
                     payload = {"type": "chat", "sessionId": sid, "userId": cl["userId"],
                                "username": cl["username"], "message": message,
                                "mode": mode, "modelId": body.get("modelId"),
-                               "editFrom": int(edit_from)}
+                               "editFrom": int(edit_from), "attachments": atts}
                 else:
                     # PESAN LANJUTAN di sesi yang sama: tambahkan pesan user
                     # ke record (runtime dedupe sehingga tidak dobel)
                     msgs = rec.get("messages", [])
-                    msgs.append({"role": "user", "text": message, "ts": now_ms()})
+                    um = {"role": "user", "text": message, "ts": now_ms()}
+                    if atts:
+                        um["atts"] = [{"name": a["name"], "kind": "upload", "size": a["size"]} for a in atts]
+                    msgs.append(um)
                     sessions_tbl.update_item(Key={"sessionId": sid},
                         UpdateExpression="SET #s = :st, #mo = :mo, #m = :m, updatedAt = :u",
                         ExpressionAttributeNames={"#s": "status", "#mo": "mode", "#m": "messages"},
@@ -165,21 +176,24 @@ def handler(event, context):
                                                    ":m": msgs, ":u": str(now_ms())})
                     payload = {"type": "chat", "sessionId": sid, "userId": cl["userId"],
                                "username": cl["username"], "message": message,
-                               "mode": mode, "modelId": body.get("modelId")}
+                               "mode": mode, "modelId": body.get("modelId"), "attachments": atts}
             else:
                 sid = f"chat-{uuid.uuid4().hex}"
+                um = {"role": "user", "text": message, "ts": now_ms()}
+                if atts:
+                    um["atts"] = [{"name": a["name"], "kind": "upload", "size": a["size"]} for a in atts]
                 sessions_tbl.put_item(Item={
                     "sessionId": sid, "userId": cl["userId"], "username": cl["username"],
                     "status": "processing", "mode": mode,
                     "modelId": body.get("modelId", "") or "",
                     "title": message[:80],
-                    "messages": [{"role": "user", "text": message, "ts": now_ms()}],
+                    "messages": [um],
                     "createdAt": str(now_ms()), "updatedAt": str(now_ms()),
                     "expiresAt": now_ms() // 1000 + 30 * 86400,
                 })
                 payload = {"type": "chat", "sessionId": sid, "userId": cl["userId"],
                            "username": cl["username"], "message": message,
-                           "mode": mode, "modelId": body.get("modelId")}
+                           "mode": mode, "modelId": body.get("modelId"), "attachments": atts}
             lam.invoke(FunctionName=context.function_name,
                        InvocationType="Event",
                        Payload=json.dumps({"_async": "chat", "runtimePayload": payload,
@@ -227,6 +241,12 @@ def handler(event, context):
                         else rec["autoRoute"]
             except Exception:
                 pass
+            todos = None
+            try:
+                if rec.get("todos"):
+                    todos = json.loads(rec["todos"]) if isinstance(rec["todos"], str) else rec["todos"]
+            except Exception:
+                pass
             clarify = None
             try:
                 for m in reversed(rec.get("messages", [])):
@@ -242,6 +262,7 @@ def handler(event, context):
                               "mode": rec.get("mode"), "modelId": rec.get("modelId"),
                               "autoRoute": auto_route,
                               "clarify": clarify,
+                              "todos": todos,
                               "title": rec.get("title"),
                               "messages": rec.get("messages", []),
                               "pendingConfirmation": pending})
@@ -341,6 +362,72 @@ def handler(event, context):
             return resp(200, {"jobId": job["ingestionJob"]["ingestionJobId"],
                               "status": job["ingestionJob"]["status"]})
 
+        # ---------------- uploads lampiran chat (v3.4) ----------------
+        if path == "/uploads/presign" and method == "POST":
+            body = json.loads(event.get("body") or "{}")
+            name = (body.get("name") or "file").strip()
+            ctype = body.get("contentType", "application/octet-stream")
+            size = int(body.get("size", 0) or 0)
+            if ".." in name or name.startswith("/") or "\\" in name:
+                return resp(400, {"error": "nama file tidak valid"})
+            if len(name) > 160:
+                return resp(400, {"error": "nama file terlalu panjang"})
+            if size > 200 * 1024 * 1024:
+                return resp(400, {"error": "ukuran maksimal 200 MB per file"})
+            key = f"uploads/{cl['userId']}/{uuid.uuid4().hex[:10]}-{name}"
+            url = s3.generate_presigned_url(
+                "put_object", Params={
+                    "Bucket": ART_BUCKET, "Key": key, "ContentType": ctype,
+                    "ServerSideEncryption": "aws:kms", "SSEKMSKeyId": KMS_KEY_ID},
+                ExpiresIn=900)
+            return resp(200, {"uploadUrl": url, "key": key})
+
+        # ---------------- translate EN -> ID (v3.4) ----------------
+        if path == "/translate" and method == "POST":
+            body = json.loads(event.get("body") or "{}")
+            text = str(body.get("text", "")).strip()
+            if not text:
+                return resp(400, {"error": "teks kosong"})
+            if len(text) > 12000:
+                return resp(400, {"error": "teks terlalu panjang (max 12000)"})
+            out = invoke_runtime({"type": "translate", "text": text,
+                                  "sessionId": body.get("sessionId", "-")})
+            return resp(200, out)
+
+        # ---------------- dokumentasi editable (v3.4, superadmin) ----------------
+        DOCS_PREFIX = "site/docs/"
+        if path == "/docs/content" and method == "GET":
+            key = qs.get("key", "")
+            if not key.startswith(DOCS_PREFIX) or ".." in key:
+                return resp(400, {"error": "key tidak valid"})
+            try:
+                obj = s3.get_object(Bucket=ART_BUCKET, Key=key)
+                return resp(200, {"key": key, "content": obj["Body"].read().decode("utf-8", "ignore"),
+                                  "updated": str(obj.get("LastModified", ""))})
+            except Exception:
+                return resp(404, {"error": "dokumen tidak ditemukan"})
+
+        if path == "/docs/content" and method == "POST":
+            if not is_superadmin(cl):
+                return resp(403, {"error": "khusus superadmin"})
+            body = json.loads(event.get("body") or "{}")
+            key = body.get("key", "")
+            content = body.get("content", "")
+            if not key.startswith(DOCS_PREFIX) or ".." in key or not key.endswith(".md"):
+                return resp(400, {"error": "key harus .md di bawah site/docs/"})
+            if len(content) > 200_000:
+                return resp(400, {"error": "konten terlalu besar (max 200k char)"})
+            s3.put_object(Bucket=ART_BUCKET, Key=key, Body=content.encode(),
+                          ServerSideEncryption="aws:kms", SSEKMSKeyId=KMS_KEY_ID,
+                          ContentType="text/markdown; charset=utf-8")
+            return resp(200, {"saved": True, "key": key})
+
+        if path == "/docs/list" and method == "GET":
+            r = s3.list_objects_v2(Bucket=ART_BUCKET, Prefix=DOCS_PREFIX, MaxKeys=50)
+            docs = [{"key": o["Key"], "name": o["Key"].split("/")[-1], "size": o["Size"],
+                     "updated": str(o["LastModified"])} for o in r.get("Contents", [])]
+            return resp(200, {"docs": docs})
+
         # ---------------- superadmin ----------------
         if path == "/admin/users" and method == "GET":
             if not is_superadmin(cl):
@@ -405,6 +492,33 @@ def handler(event, context):
                 cog.admin_disable_user(UserPoolId=USER_POOL_ID, Username=username)
             return resp(200, {"updated": True, "username": username, "enabled": enabled})
 
+        if path == "/admin/users/set-password" and method == "POST":
+            if not is_superadmin(cl):
+                return resp(403, {"error": "khusus superadmin"})
+            body = json.loads(event.get("body") or "{}")
+            username = body.get("username", "")
+            password = body.get("password", "")
+            if len(password) < 12:
+                return resp(400, {"error": "password minimal 12 karakter"})
+            cog.admin_set_user_password(UserPoolId=USER_POOL_ID, Username=username,
+                                        Password=password, Permanent=True)
+            return resp(200, {"updated": True, "username": username,
+                              "note": "Password permanen diset. User bisa langsung login (lanjut MFA TOTP)."})
+
+        if path == "/admin/users/resend-invite" and method == "POST":
+            if not is_superadmin(cl):
+                return resp(403, {"error": "khusus superadmin"})
+            body = json.loads(event.get("body") or "{}")
+            username = body.get("username", "")
+            try:
+                cog.admin_create_user(
+                    UserPoolId=USER_POOL_ID, Username=username,
+                    MessageAction="RESEND",
+                    DesiredDeliveryMediums=["EMAIL"])
+                return resp(200, {"resent": True, "username": username})
+            except Exception as e:
+                return resp(400, {"error": f"resend gagal: {str(e)[:200]}"})
+
         if path == "/admin/users" and method == "DELETE":
             if not is_superadmin(cl):
                 return resp(403, {"error": "khusus superadmin"})
@@ -436,8 +550,14 @@ def async_handler(event, context):
                 has_reply = bool(msgs) and msgs[-1].get("role") == "assistant"
                 new_status = "done" if (out.get("status") == "done" or has_reply) else "error"
                 if not has_reply and out.get("response"):
-                    msgs = msgs + [{"role": "assistant", "text": out["response"], "ts": now_ms(),
-                                    "model": out.get("model", "")}]
+                    am = {"role": "assistant", "text": out["response"], "ts": now_ms(),
+                          "model": out.get("model", "")}
+                    arts = out.get("attachments") or []
+                    if arts:
+                        am["atts"] = arts
+                    msgs = msgs + [am]
+                elif has_reply and (out.get("attachments") or []) and "atts" not in msgs[-1]:
+                    msgs[-1]["atts"] = out["attachments"]
                 sessions_tbl.update_item(
                     Key={"sessionId": sid},
                     UpdateExpression="SET #s = :st, #m = :m, updatedAt = :u, modelId = :mo",
