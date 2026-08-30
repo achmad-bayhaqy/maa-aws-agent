@@ -113,7 +113,8 @@ def handler(event, context):
         if path == "/chat" and method == "POST":
             body = json.loads(event.get("body") or "{}")
             message = (body.get("message") or "").strip()
-            if not message:
+            regenerate = bool(body.get("regenerate"))
+            if not message and not regenerate:
                 return resp(400, {"error": "message kosong"})
             if len(message) > 6000:
                 return resp(400, {"error": "message terlalu panjang (max 6000)"})
@@ -122,22 +123,49 @@ def handler(event, context):
                 mode = "AUTO"
             edit_from = body.get("editFrom")
             existing_sid = body.get("sessionId")
-            if existing_sid and edit_from is not None:
+            if existing_sid:
                 sid = existing_sid
                 rec = sessions_tbl.get_item(Key={"sessionId": sid}).get("Item")
                 if not rec or rec.get("userId") != cl["userId"]:
                     return resp(403, {"error": "bukan sesi Anda"})
-                # pesan user yang diedit sudah ditulis runtime saat regenerasi;
-                # di sini hanya tandai status processing agar polling mulai
-                sessions_tbl.update_item(Key={"sessionId": sid},
-                    UpdateExpression="SET #s = :st, #mo = :mo, updatedAt = :u",
-                    ExpressionAttributeNames={"#s": "status", "#mo": "mode"},
-                    ExpressionAttributeValues={":st": "processing", ":mo": mode,
-                                               ":u": str(now_ms())})
-                payload = {"type": "chat", "sessionId": sid, "userId": cl["userId"],
-                           "username": cl["username"], "message": message,
-                           "mode": mode, "modelId": body.get("modelId"),
-                           "editFrom": int(edit_from)}
+                if regenerate:
+                    # REGENERATE: jalankan ulang dari pesan user terakhir
+                    # (tanpa mengubah teks) -> jawaban lama jadi versions
+                    msgs = rec.get("messages", [])
+                    lu = -1
+                    for i, m in enumerate(msgs):
+                        if m.get("role") == "user":
+                            lu = i
+                    if lu < 0:
+                        return resp(400, {"error": "tidak ada pesan untuk diregenerasi"})
+                    message = msgs[lu].get("text", "") or message
+                    edit_from = lu
+                if edit_from is not None:
+                    # EDIT pesan user pada index edit_from (teks lama -> versions);
+                    # pesan user ditulis runtime saat regenerasi.
+                    # Tandai processing agar polling UI mulai sebelum runtime selesai.
+                    sessions_tbl.update_item(Key={"sessionId": sid},
+                        UpdateExpression="SET #s = :st, #mo = :mo, updatedAt = :u",
+                        ExpressionAttributeNames={"#s": "status", "#mo": "mode"},
+                        ExpressionAttributeValues={":st": "processing", ":mo": mode,
+                                                   ":u": str(now_ms())})
+                    payload = {"type": "chat", "sessionId": sid, "userId": cl["userId"],
+                               "username": cl["username"], "message": message,
+                               "mode": mode, "modelId": body.get("modelId"),
+                               "editFrom": int(edit_from)}
+                else:
+                    # PESAN LANJUTAN di sesi yang sama: tambahkan pesan user
+                    # ke record (runtime dedupe sehingga tidak dobel)
+                    msgs = rec.get("messages", [])
+                    msgs.append({"role": "user", "text": message, "ts": now_ms()})
+                    sessions_tbl.update_item(Key={"sessionId": sid},
+                        UpdateExpression="SET #s = :st, #mo = :mo, #m = :m, updatedAt = :u",
+                        ExpressionAttributeNames={"#s": "status", "#mo": "mode", "#m": "messages"},
+                        ExpressionAttributeValues={":st": "processing", ":mo": mode,
+                                                   ":m": msgs, ":u": str(now_ms())})
+                    payload = {"type": "chat", "sessionId": sid, "userId": cl["userId"],
+                               "username": cl["username"], "message": message,
+                               "mode": mode, "modelId": body.get("modelId")}
             else:
                 sid = f"chat-{uuid.uuid4().hex}"
                 sessions_tbl.put_item(Item={
@@ -199,9 +227,21 @@ def handler(event, context):
                         else rec["autoRoute"]
             except Exception:
                 pass
+            clarify = None
+            try:
+                for m in reversed(rec.get("messages", [])):
+                    if m.get("role") == "assistant":
+                        c = m.get("clarify")
+                        if c and isinstance(c, dict) and c.get("question"):
+                            clarify = {"question": c.get("question", ""),
+                                       "options": c.get("options", [])}
+                        break
+            except Exception:
+                pass
             return resp(200, {"sessionId": sid, "status": rec.get("status"),
                               "mode": rec.get("mode"), "modelId": rec.get("modelId"),
                               "autoRoute": auto_route,
+                              "clarify": clarify,
                               "title": rec.get("title"),
                               "messages": rec.get("messages", []),
                               "pendingConfirmation": pending})
@@ -248,6 +288,14 @@ def handler(event, context):
                     "createdAt": i.get("createdAt"), "updatedAt": i.get("updatedAt")}
                    for i in r.get("Items", [])]
             return resp(200, {"sessions": out})
+
+        if path == "/chat/sessions" and method == "DELETE":
+            sid = qs.get("sessionId", "")
+            rec = sessions_tbl.get_item(Key={"sessionId": sid}).get("Item")
+            if not rec or rec.get("userId") != cl["userId"]:
+                return resp(403, {"error": "bukan sesi Anda"})
+            sessions_tbl.delete_item(Key={"sessionId": sid})
+            return resp(200, {"deleted": True, "sessionId": sid})
 
         # ---------------- models ----------------
         if path == "/models" and method == "GET":

@@ -24,14 +24,18 @@ nilai `custom:role` (default `user`). UI memakai field ini untuk menampilkan men
 ### `POST /chat` → `202`
 ```json
 { "message": "Hapus bucket demo lalu buat ulang", "mode": "AUTO",
-  "modelId": null, "sessionId": null, "editFrom": null }
+  "modelId": null, "sessionId": null, "editFrom": null, "regenerate": false }
 ```
 - `mode`: `AUTO` (default) | `FAST` | `DEEP` | `MANUAL`.
 - Sesi baru: `sessionId` diabaikan → dibuat `chat-<hex>`, record DynamoDB berisi
   `title` (80 char pertama), TTL 30 hari.
+- **Pesan lanjutan**: kirim `sessionId` (tanpa `editFrom`) → pesan user ditambahkan
+  ke sesi yang sama (TIDAK membuat sesi baru).
 - **Edit pesan**: kirim `sessionId` + `editFrom` (indeks versi) + `message` baru →
   runtime meregenerasi jawaban; pesan user mendapat `versions[]`.
-- Validasi: pesan wajib, maks 6000 char.
+- **Regenerate**: kirim `sessionId` + `regenerate: true` (message boleh kosong) →
+  agent menjalankan ulang dari pesan user terakhir; jawaban lama masuk `versions[]`.
+- Validasi: pesan wajib (kecuali `regenerate`), maks 6000 char.
 
 ### `GET /chat/status?sessionId=…`
 Respons utama polling (interval UI 1,2 s):
@@ -54,8 +58,10 @@ Respons utama polling (interval UI 1,2 s):
   "operation": { "tool": "s3_delete_bucket", "params": { "bucket": "…" } } }
 ```
 
-`clarify` (dari status atau blok `[[CLARIFY]]{json}` di pesan assistant) memicu UI
-pertanyaan-opsi: `{ "question": "…", "options": ["…", "…"] }`.
+`clarify` (dari status — field `clarify` pada pesan assistant terakhir) memicu UI
+pertanyaan-opsi: `{ "question": "…", "options": ["…", "…"] }`. Hanya untuk
+ambiguitas target — konfirmasi keamanan destruktif selalu lewat
+`pendingConfirmation`, bukan clarify.
 
 ### `POST /chat/confirm`
 ```json
@@ -75,6 +81,9 @@ sudah dirender (incremental). Event: `{ts, type, content, model}`; `type` antara
 ### `GET /chat/sessions`
 25 sesi terakhir user (GSI `user-index`): `{sessionId, title, status, mode, createdAt, updatedAt}`.
 URL sesi di UI: `/c/<sessionId>` (rewrite Amplify → `index.html`).
+
+### `DELETE /chat/sessions?sessionId=…`
+Hapus sesi milik pemanggil (beserta seluruh riwayat). Respons `{"deleted": true}`.
 
 ## 3. Models
 

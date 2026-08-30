@@ -70,3 +70,7 @@ aws/probe_result.json
 db/
 *.log
 download/MAA-PANDUAN.md
+
+# ===== Non-project templates (bukan bagian produk MAA) =====
+/examples/
+/skills/

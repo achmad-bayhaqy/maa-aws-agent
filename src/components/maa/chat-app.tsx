@@ -12,7 +12,7 @@ import {
 import { Sheet, SheetContent, SheetHeader, SheetTitle } from '@/components/ui/sheet';
 import { useToast } from '@/hooks/use-toast';
 import {
-  CONFIG, getModels, getStatus, getSessions, getTrace, loadLastSession,
+  CONFIG, deleteSession, getModels, getStatus, getSessions, getTrace, loadLastSession,
   revokeToken, saveLastSession, sendChat, sessionIdFromPath, signOutAll,
   stripClarifyBlock, type Attachment, type AutoRoute, type ChatMessage,
   type ChatMode, type ChatStatus, type MeInfo, type MaaModel, type SessionRow,
@@ -30,7 +30,7 @@ import { initTheme, type MaaTheme } from './theme';
 
 const SUGGESTIONS = ['List EC2', 'Analisis biaya 30 hari', 'Buat VPC bernama staging', 'Apa runbook insiden database?'];
 
-type LastAction = { kind: 'send'; text: string } | { kind: 'edit'; text: string; editFrom: number } | null;
+type LastAction = { kind: 'send'; text: string } | { kind: 'edit'; text: string; editFrom: number } | { kind: 'regenerate' } | null;
 
 /** Normalisasi status: ekstrak blok [[CLARIFY]] dari pesan terakhir. */
 function normalizeStatus(st: ChatStatus): ChatStatus {
@@ -303,11 +303,59 @@ export function ChatApp({
     [activeId, manualModel, me?.userId, mode, notify, processing, startPolling, token]
   );
 
+  // ---------- regenerasi jawaban terakhir ----------
+
+  const doRegenerate = useCallback(
+    async () => {
+      if (processing) { notify('Tunggu respons agent selesai dulu.'); return; }
+      if (!activeId) return;
+      setLastAction({ kind: 'regenerate' });
+      const run = ++runIdRef.current;
+      setProcessing(true);
+      stickRef.current = true;
+      setErrorTop(null);
+      try {
+        await sendChat(token, {
+          message: '', mode,
+          modelId: mode === 'MANUAL' && manualModel ? manualModel : undefined,
+          sessionId: activeId, regenerate: true,
+        });
+        if (run !== runIdRef.current) return;
+        startPolling(run, activeId);
+      } catch (e) {
+        if (run !== runIdRef.current) return;
+        setProcessing(false);
+        setErrorTop(`Gagal regenerate: ${(e as Error).message}`);
+      }
+    },
+    [activeId, manualModel, mode, notify, processing, setErrorTop, startPolling, token]
+  );
+
   const retryLast = useCallback(() => {
     if (!lastAction) return;
     if (lastAction.kind === 'edit') void doSend(lastAction.text, lastAction.editFrom);
+    else if (lastAction.kind === 'regenerate') void doRegenerate();
     else void doSend(lastAction.text);
-  }, [doSend, lastAction]);
+  }, [doSend, doRegenerate, lastAction]);
+
+  // ---------- hapus sesi ----------
+
+  const handleDeleteSession = useCallback(
+    (sid: string) => {
+      if (!window.confirm('Hapus sesi ini beserta seluruh riwayat percakapannya?')) return;
+      void (async () => {
+        try {
+          await deleteSession(token, sid);
+          notify('Sesi dihapus.');
+          void refreshSessions();
+          if (sid === activeId) newChat();
+        } catch (e) {
+          notify(`Gagal menghapus sesi: ${(e as Error).message}`);
+        }
+      })();
+    },
+    [activeId, newChat, notify, refreshSessions, token]
+  );
 
   // ---------- efek awal ----------
 
@@ -415,6 +463,7 @@ export function ChatApp({
       sessions={sessions}
       activeId={activeId}
       onSelectSession={(id) => { setSidebarOpen(false); void openSession(id); }}
+      onDeleteSession={handleDeleteSession}
       onNewChat={() => newChat()}
       onOpenDocs={() => { setSidebarOpen(false); setDocsOpen(true); }}
       onOpenKb={() => { setSidebarOpen(false); setKbOpen(true); }}
@@ -633,6 +682,7 @@ export function ChatApp({
                   processing={processing}
                   onResendEdit={(idx, text) => void doSend(text, idx)}
                   notify={notify}
+                  onRegenerate={activeId ? () => void doRegenerate() : undefined}
                   clarifySlot={
                     clarify && !processing ? (
                       <div className="animate-msg-in mt-1 w-full max-w-[min(680px,85%)] rounded-[10px] border border-[var(--accent)] bg-[var(--accent-soft)] p-3.5">

@@ -37,6 +37,10 @@
     ".next/dev/types/**/*.ts"
   ],
   "exclude": [
-    "node_modules"
+    "aws/agent_runtime",
+    "aws/amplify-build",
+    "examples",
+    "node_modules",
+    "skills"
   ]
 }

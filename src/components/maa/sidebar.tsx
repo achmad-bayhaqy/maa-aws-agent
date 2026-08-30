@@ -1,6 +1,6 @@
 'use client';
 
-import { BookOpen, Check, Database, FileText, Loader2, LogOut, Moon, Palette, Plus, ShieldCheck, X } from 'lucide-react';
+import { BookOpen, Check, Database, FileText, Loader2, LogOut, Moon, Palette, Plus, ShieldCheck, Trash2, X } from 'lucide-react';
 import type { SessionRow } from '@/lib/maa';
 import { relTime } from '@/lib/maa';
 import { LogoWordmark } from './logo';
@@ -16,6 +16,7 @@ export function SidebarContent({
   sessions,
   activeId,
   onSelectSession,
+  onDeleteSession,
   onNewChat,
   onOpenDocs,
   onOpenKb,
@@ -28,6 +29,7 @@ export function SidebarContent({
   sessions: SessionRow[];
   activeId: string | null;
   onSelectSession: (id: string) => void;
+  onDeleteSession: (id: string) => void;
   onNewChat: () => void;
   onOpenDocs: () => void;
   onOpenKb: () => void;
@@ -67,7 +69,7 @@ export function SidebarContent({
             {sessions.map((s) => {
               const active = s.sessionId === activeId;
               return (
-                <li key={s.sessionId}>
+                <li key={s.sessionId} className="group relative">
                   <button
                     type="button"
                     onClick={() => onSelectSession(s.sessionId)}
@@ -87,6 +89,18 @@ export function SidebarContent({
                         {relTime(s.updatedAt || s.createdAt)}
                       </span>
                     </span>
+                  </button>
+                  <button
+                    type="button"
+                    aria-label={`Hapus sesi: ${s.title || s.sessionId}`}
+                    title="Hapus sesi"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      onDeleteSession(s.sessionId);
+                    }}
+                    className="absolute right-1.5 top-1/2 -translate-y-1/2 rounded-md bg-[var(--surface)] p-1.5 text-[var(--muted-fg)] opacity-0 shadow-sm transition-opacity hover:bg-[var(--danger-soft,var(--muted-bg))] hover:text-[var(--danger)] focus-visible:opacity-100 group-hover:opacity-100"
+                  >
+                    <Trash2 className="h-3.5 w-3.5" />
                   </button>
                 </li>
               );

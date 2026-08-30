@@ -198,6 +198,8 @@ export type SendChatBody = {
   modelId?: string;
   sessionId?: string;
   editFrom?: number;
+  /** true = jalankan ulang dari pesan user terakhir (jawaban lama jadi versi) */
+  regenerate?: boolean;
 };
 
 export const sendChat = (token: string, body: SendChatBody) =>
@@ -211,6 +213,9 @@ export const getTrace = (token: string, sessionId: string, after: number) =>
 
 export const getSessions = (token: string) =>
   apiFetch<{ sessions: SessionRow[] }>("GET", "/chat/sessions", token);
+
+export const deleteSession = (token: string, sessionId: string) =>
+  apiFetch<{ deleted: boolean }>("DELETE", "/chat/sessions", token, undefined, { sessionId });
 
 export const getModels = (token: string) => apiFetch<ModelsResponse>("GET", "/models", token);
 

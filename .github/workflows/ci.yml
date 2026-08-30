@@ -1,0 +1,89 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  frontend:
+    name: Frontend — lint, typecheck, build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Lint
+        run: bun run lint
+
+      - name: Typecheck
+        run: bunx tsc --noEmit
+
+      - name: Build (Next.js production)
+        run: bun run build
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: next-standalone
+          path: .next/standalone/
+          retention-days: 7
+          if-no-files-found: error
+
+  backend:
+    name: Backend — syntax & sanity check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Compile check (agent runtime, edge lambda, deploy scripts)
+        run: |
+          python3 -m py_compile aws/agent_runtime/main.py
+          python3 -m py_compile aws/lambda_edge/handler.py
+          python3 -m compileall -q aws
+
+      - name: Guard — pastikan tidak ada kredensial ter-commit
+        run: |
+          if grep -rEl "AKIA[0-9A-Z]{16}|github_pat_[A-Za-z0-9_]{40,}" \
+             --include="*.py" --include="*.ts" --include="*.tsx" --include="*.json" --include="*.md" . ; then
+            echo "::error::Potensi kredensial ditemukan di repositori!"
+            exit 1
+          fi
+          echo "OK — tidak ada pola kredensial."
+
+      - name: Verifikasi state.json valid JSON
+        run: python3 -c "import json; json.load(open('aws/state.json')); print('state.json OK')"
+
+  security:
+    name: Secret scan (trivy)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Trivy filesystem scan (secret mode)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: fs
+          scanners: secret
+          severity: CRITICAL,HIGH
+          exit-code: "1"
+          ignore-unfixed: "true"

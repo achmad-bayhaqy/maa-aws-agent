@@ -264,6 +264,7 @@ export function MessageList({
   attachments,
   autoRoute,
   showSkeleton,
+  onRegenerate,
 }: {
   messages: ChatMessage[];
   processing: boolean;
@@ -273,6 +274,7 @@ export function MessageList({
   attachments?: Attachment[] | null;
   autoRoute?: AutoRoute | null;
   showSkeleton?: boolean;
+  onRegenerate?: () => void;
 }) {
   const lastAssistant = useMemo(() => {
     for (let i = messages.length - 1; i >= 0; i--) if (messages[i].role === 'assistant') return i;
@@ -310,6 +312,19 @@ export function MessageList({
       )}
 
       {processing && showSkeleton !== false && <AssistantSkeleton />}
+
+      {/* regenerasi jawaban terakhir (bila tidak sedang memproses) */}
+      {onRegenerate && !processing && lastAssistant >= 0 && (
+        <div className="flex justify-start">
+          <button
+            type="button"
+            onClick={onRegenerate}
+            className="maa-btn-ghost flex items-center gap-1.5 px-2.5 py-1.5 text-[11.5px] font-medium text-[var(--muted-fg)] hover:text-[var(--ink)]"
+          >
+            <RefreshCcw className="h-3 w-3" /> Regenerate jawaban
+          </button>
+        </div>
+      )}
 
       {/* chips klarifikasi + galeri lampiran untuk jawaban terbaru */}
       {clarifySlot}
