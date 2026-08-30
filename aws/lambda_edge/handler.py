@@ -1,0 +1,410 @@
+#!/usr/bin/env python3
+"""MAA AWS Agent - Edge Lambda v3 (thin SigV4 proxy to AgentCore Runtime).
+v3: /me + superadmin user CRUD (undangan email via Cognito default sender),
+Live Trace dari CloudWatch Logs (pengganti DynamoDB traces), mode AUTO,
+edit pesan (editFrom) + versioning, katalog 88 model + autoDefaults."""
+import json
+import os
+import time
+import uuid
+import boto3
+from botocore.config import Config
+
+REGION = os.environ.get("AWS_REGION", "us-east-1")
+RUNTIME_ARN = os.environ["RUNTIME_ARN"]
+SESSIONS_TABLE = os.environ["SESSIONS_TABLE"]
+KB_BUCKET = os.environ["KB_BUCKET"]
+ART_BUCKET = os.environ["ART_BUCKET"]
+MODELS_KEY = os.environ.get("MODELS_KEY", "models/allowed-chat-models.json")
+KB_ID = os.environ.get("KB_ID", "")
+USER_POOL_ID = os.environ["USER_POOL_ID"]
+KMS_KEY_ID = os.environ["KMS_KEY_ID"]
+CONF_TABLE = os.environ["CONF_TABLE"]
+TRACE_LOG_GROUP = os.environ.get("TRACE_LOG_GROUP", "/maa/agent/trace")
+
+cfg = Config(retries={"max_attempts": 2, "mode": "standard"}, read_timeout=280)
+lam = boto3.client("lambda", region_name=REGION, config=cfg)
+ddb_res = boto3.resource("dynamodb", region_name=REGION, config=cfg)
+sessions_tbl = ddb_res.Table(SESSIONS_TABLE)
+s3 = boto3.client("s3", region_name=REGION, config=cfg)
+cog = boto3.client("cognito-idp", region_name=REGION, config=cfg)
+wlogs = boto3.client("logs", region_name=REGION, config=cfg)
+
+
+def now_ms():
+    return int(time.time() * 1000)
+
+
+MODELS_CACHE = {"ts": 0, "data": None}
+
+
+def get_models():
+    if MODELS_CACHE["data"] and now_ms() - MODELS_CACHE["ts"] < 300_000:
+        return MODELS_CACHE["data"]
+    obj = s3.get_object(Bucket=ART_BUCKET, Key=MODELS_KEY)
+    data = json.loads(obj["Body"].read())
+    MODELS_CACHE["ts"] = now_ms()
+    MODELS_CACHE["data"] = data
+    return data
+
+
+def invoke_runtime(payload):
+    r = boto3.client("bedrock-agentcore", region_name=REGION, config=cfg).invoke_agent_runtime(
+        agentRuntimeArn=RUNTIME_ARN,
+        runtimeSessionId=payload["sessionId"],
+        contentType="application/json",
+        accept="application/json",
+        payload=json.dumps(payload).encode(),
+    )
+    return json.loads(r["response"].read().decode())
+
+
+def claims_of(event):
+    c = event.get("requestContext", {}).get("authorizer", {}).get("claims", {})
+    groups = (c.get("cognito:groups") or "").split(",") if c.get("cognito:groups") else []
+    role = "superadmin" if "superadmin" in groups else c.get("custom:role", "user")
+    # ID token: cognito:username; access token: username
+    username = c.get("cognito:username") or c.get("username") \
+        or c.get("preferred_username") or "user"
+    return {"userId": c.get("sub", "unknown"),
+            "username": username,
+            "email": c.get("email", ""),
+            "role": role}
+
+
+def is_superadmin(cl):
+    return cl.get("role") == "superadmin"
+
+
+def resp(code, body):
+    return {"statusCode": code,
+            "headers": {"Content-Type": "application/json",
+                        "Access-Control-Allow-Origin": "*",
+                        "Access-Control-Allow-Headers": "Authorization,Content-Type",
+                        "Access-Control-Allow-Methods": "GET,POST,DELETE,OPTIONS"},
+            "body": json.dumps(body, ensure_ascii=False, default=str)}
+
+
+def handler(event, context):
+    method = event.get("httpMethod", "GET")
+    path = event.get("resource", event.get("path", ""))
+    qs = event.get("queryStringParameters") or {}
+    cl = claims_of(event)
+
+    try:
+        if method == "OPTIONS":
+            return resp(200, {})
+
+        # ---------------- identity ----------------
+        if path == "/me" and method == "GET":
+            email, role = cl.get("email", ""), cl.get("role", "user")
+            if not email:
+                try:
+                    u = cog.admin_get_user(UserPoolId=USER_POOL_ID, Username=cl["username"])
+                    for a in u.get("UserAttributes", []):
+                        if a["Name"] == "email":
+                            email = a["Value"]
+                except Exception:
+                    pass
+            return resp(200, {"userId": cl["userId"], "username": cl["username"],
+                              "email": email, "role": role})
+
+        # ---------------- chat ----------------
+        if path == "/chat" and method == "POST":
+            body = json.loads(event.get("body") or "{}")
+            message = (body.get("message") or "").strip()
+            if not message:
+                return resp(400, {"error": "message kosong"})
+            if len(message) > 6000:
+                return resp(400, {"error": "message terlalu panjang (max 6000)"})
+            mode = body.get("mode", "AUTO")
+            if mode not in ("AUTO", "FAST", "DEEP", "MANUAL"):
+                mode = "AUTO"
+            edit_from = body.get("editFrom")
+            existing_sid = body.get("sessionId")
+            if existing_sid and edit_from is not None:
+                sid = existing_sid
+                rec = sessions_tbl.get_item(Key={"sessionId": sid}).get("Item")
+                if not rec or rec.get("userId") != cl["userId"]:
+                    return resp(403, {"error": "bukan sesi Anda"})
+                # pesan user yang diedit sudah ditulis runtime saat regenerasi;
+                # di sini hanya tandai status processing agar polling mulai
+                sessions_tbl.update_item(Key={"sessionId": sid},
+                    UpdateExpression="SET #s = :st, #mo = :mo, updatedAt = :u",
+                    ExpressionAttributeNames={"#s": "status", "#mo": "mode"},
+                    ExpressionAttributeValues={":st": "processing", ":mo": mode,
+                                               ":u": str(now_ms())})
+                payload = {"type": "chat", "sessionId": sid, "userId": cl["userId"],
+                           "username": cl["username"], "message": message,
+                           "mode": mode, "modelId": body.get("modelId"),
+                           "editFrom": int(edit_from)}
+            else:
+                sid = f"chat-{uuid.uuid4().hex}"
+                sessions_tbl.put_item(Item={
+                    "sessionId": sid, "userId": cl["userId"], "username": cl["username"],
+                    "status": "processing", "mode": mode,
+                    "modelId": body.get("modelId", "") or "",
+                    "title": message[:80],
+                    "messages": [{"role": "user", "text": message, "ts": now_ms()}],
+                    "createdAt": str(now_ms()), "updatedAt": str(now_ms()),
+                    "expiresAt": now_ms() // 1000 + 30 * 86400,
+                })
+                payload = {"type": "chat", "sessionId": sid, "userId": cl["userId"],
+                           "username": cl["username"], "message": message,
+                           "mode": mode, "modelId": body.get("modelId")}
+            lam.invoke(FunctionName=context.function_name,
+                       InvocationType="Event",
+                       Payload=json.dumps({"_async": "chat", "runtimePayload": payload,
+                                           "user": cl}).encode())
+            return resp(202, {"sessionId": sid, "status": "processing"})
+
+        if path == "/chat/confirm" and method == "POST":
+            body = json.loads(event.get("body") or "{}")
+            sid = body.get("sessionId", "")
+            rec = sessions_tbl.get_item(Key={"sessionId": sid}).get("Item")
+            if not rec or rec.get("userId") != cl["userId"]:
+                return resp(403, {"error": "bukan sesi Anda"})
+            out = invoke_runtime({"type": "confirm", "sessionId": sid,
+                                  "userId": cl["userId"], "username": cl["username"],
+                                  "confirmToken": body.get("confirmToken"),
+                                  "typed1": body.get("typed1", ""),
+                                  "typed2": body.get("typed2", "")})
+            return resp(200, out)
+
+        if path == "/chat/status" and method == "GET":
+            sid = qs.get("sessionId", "")
+            rec = sessions_tbl.get_item(Key={"sessionId": sid}).get("Item")
+            if not rec or rec.get("userId") != cl["userId"]:
+                return resp(403, {"error": "bukan sesi Anda"})
+            pending = None
+            try:
+                scan = boto3.client("dynamodb", region_name=REGION, config=cfg).scan(
+                    TableName=CONF_TABLE,
+                    FilterExpression="#s = :p AND sessionId = :sid",
+                    ExpressionAttributeNames={"#s": "status"},
+                    ExpressionAttributeValues={":p": {"S": "pending"}, ":sid": {"S": sid}})
+                for item in scan.get("Items", []):
+                    if int(item.get("expiresAt", {}).get("N", "0")) > time.time():
+                        op = json.loads(item.get("operation", {}).get("S", "{}"))
+                        pending = {"confirmToken": item["confirmToken"]["S"],
+                                   "challenge": item["challenge"]["S"],
+                                   "operation": op}
+                        break
+            except Exception:
+                pass
+            auto_route = None
+            try:
+                if rec.get("autoRoute"):
+                    auto_route = json.loads(rec["autoRoute"]) if isinstance(rec["autoRoute"], str) \
+                        else rec["autoRoute"]
+            except Exception:
+                pass
+            return resp(200, {"sessionId": sid, "status": rec.get("status"),
+                              "mode": rec.get("mode"), "modelId": rec.get("modelId"),
+                              "autoRoute": auto_route,
+                              "title": rec.get("title"),
+                              "messages": rec.get("messages", []),
+                              "pendingConfirmation": pending})
+
+        if path == "/chat/trace" and method == "GET":
+            sid = qs.get("sessionId", "")
+            after = int(qs.get("after", "0") or 0)
+            rec = sessions_tbl.get_item(Key={"sessionId": sid}).get("Item")
+            if not rec or rec.get("userId") != cl["userId"]:
+                return resp(403, {"error": "bukan sesi Anda"})
+            events = []
+            try:
+                streams = wlogs.describe_log_streams(
+                    logGroupName=TRACE_LOG_GROUP,
+                    logStreamNamePrefix=sid, limit=5).get("logStreams", [])
+                for st_ in streams:
+                    kw = {"logGroupName": TRACE_LOG_GROUP, "logStreamName": st_["logStreamName"],
+                          "limit": 120, "startFromHead": True}
+                    if after:
+                        kw["startTime"] = after + 1
+                    evs = wlogs.get_log_events(**kw).get("events", [])
+                    for e in evs:
+                        try:
+                            d = json.loads(e["message"])
+                            events.append({"ts": str(d.get("ts", e["timestamp"])),
+                                           "type": d.get("type", "info"),
+                                           "content": d.get("content", ""),
+                                           "model": d.get("model", "")})
+                        except Exception:
+                            events.append({"ts": str(e["timestamp"]), "type": "info",
+                                           "content": e["message"][:400], "model": ""})
+            except Exception:
+                pass
+            events.sort(key=lambda x: int(x["ts"]))
+            return resp(200, {"events": events[:200]})
+
+        if path == "/chat/sessions" and method == "GET":
+            r = sessions_tbl.query(IndexName="user-index",
+                                   KeyConditionExpression="userId = :u",
+                                   ExpressionAttributeValues={":u": cl["userId"]},
+                                   ScanIndexForward=False, Limit=25)
+            out = [{"sessionId": i["sessionId"], "title": i.get("title", ""),
+                    "status": i.get("status"), "mode": i.get("mode"),
+                    "createdAt": i.get("createdAt"), "updatedAt": i.get("updatedAt")}
+                   for i in r.get("Items", [])]
+            return resp(200, {"sessions": out})
+
+        # ---------------- models ----------------
+        if path == "/models" and method == "GET":
+            return resp(200, get_models())
+
+        # ---------------- KB ----------------
+        if path == "/kb/docs" and method == "GET":
+            r = s3.list_objects_v2(Bucket=KB_BUCKET, Prefix="docs/", MaxKeys=100)
+            docs = [{"key": o["Key"], "size": o["Size"], "name": o["Key"].split("/")[-1],
+                     "updated": str(o["LastModified"])} for o in r.get("Contents", [])]
+            return resp(200, {"docs": docs})
+
+        if path == "/kb/presign" and method == "POST":
+            body = json.loads(event.get("body") or "{}")
+            name = body.get("name", "")
+            ctype = body.get("contentType", "application/octet-stream")
+            ext_ok = (".pdf", ".xlsx", ".xls", ".png", ".jpg", ".jpeg", ".csv", ".json", ".md", ".txt")
+            if not name.lower().endswith(ext_ok):
+                return resp(400, {"error": "format harus PDF/XLSX/PNG/JPG/CSV/JSON/MD/TXT"})
+            if ".." in name or name.startswith("/"):
+                return resp(400, {"error": "nama file tidak valid"})
+            key = f"docs/{uuid.uuid4().hex[:8]}-{name}"
+            url = s3.generate_presigned_url(
+                "put_object", Params={
+                    "Bucket": KB_BUCKET, "Key": key, "ContentType": ctype,
+                    "ServerSideEncryption": "aws:kms", "SSEKMSKeyId": KMS_KEY_ID},
+                ExpiresIn=600)
+            return resp(200, {"uploadUrl": url, "key": key})
+
+        if path == "/kb/docs" and method == "DELETE":
+            key = qs.get("key", "")
+            if not key.startswith("docs/"):
+                return resp(400, {"error": "key harus di bawah docs/"})
+            s3.delete_object(Bucket=KB_BUCKET, Key=key)
+            return resp(200, {"deleted": key})
+
+        if path == "/kb/sync" and method == "POST":
+            ba = boto3.client("bedrock-agent", region_name=REGION, config=cfg)
+            ds = ba.list_data_sources(knowledgeBaseId=KB_ID)["dataSourceSummaries"]
+            job = ba.start_ingestion_job(knowledgeBaseId=KB_ID,
+                                         dataSourceId=ds[0]["dataSourceId"],
+                                         description="manual sync from UI")
+            return resp(200, {"jobId": job["ingestionJob"]["ingestionJobId"],
+                              "status": job["ingestionJob"]["status"]})
+
+        # ---------------- superadmin ----------------
+        if path == "/admin/users" and method == "GET":
+            if not is_superadmin(cl):
+                return resp(403, {"error": "khusus superadmin"})
+            users = []
+            kw = {"UserPoolId": USER_POOL_ID, "Limit": 60}
+            while True:
+                r = cog.list_users(**kw)
+                for u in r.get("Users", []):
+                    attrs = {a["Name"]: a["Value"] for a in u.get("Attributes", [])}
+                    users.append({"username": u.get("Username", ""),
+                                  "email": attrs.get("email", ""),
+                                  "status": u.get("UserStatus", ""),
+                                  "enabled": u.get("Enabled", False),
+                                  "created": str(u.get("UserCreateDate", "")),
+                                  "role": attrs.get("custom:role", "user")})
+                tok = r.get("PaginationToken")
+                if not tok or len(users) >= 200:
+                    break
+                kw["PaginationToken"] = tok
+            return resp(200, {"users": users})
+
+        if path == "/admin/users" and method == "POST":
+            if not is_superadmin(cl):
+                return resp(403, {"error": "khusus superadmin"})
+            body = json.loads(event.get("body") or "{}")
+            email = (body.get("email") or "").strip().lower()
+            role = body.get("role", "user")
+            if role not in ("user", "superadmin"):
+                return resp(400, {"error": "role harus user|superadmin"})
+            import re as _re
+            if not _re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", email):
+                return resp(400, {"error": "email tidak valid"})
+            username = email.split("@")[0] + "-" + uuid.uuid4().hex[:4]
+            r = cog.admin_create_user(
+                UserPoolId=USER_POOL_ID, Username=username,
+                UserAttributes=[{"Name": "email", "Value": email},
+                                {"Name": "email_verified", "Value": "true"}],
+                DesiredDeliveryMediums=["EMAIL"],
+                # MessageAction default = SEND: Cognito mengirim email undangan
+                # (temp password) via sender default no-reply@verificationemail.com
+            )
+            if role == "superadmin":
+                try:
+                    cog.admin_add_user_to_group(UserPoolId=USER_POOL_ID,
+                                                GroupName="superadmin", Username=username)
+                except Exception:
+                    pass
+            return resp(200, {"username": username, "email": email, "role": role,
+                              "inviteSent": True,
+                              "note": "Email undangan berisi password sementara dikirim otomatis oleh Cognito."})
+
+        if path == "/admin/users/status" and method == "POST":
+            if not is_superadmin(cl):
+                return resp(403, {"error": "khusus superadmin"})
+            body = json.loads(event.get("body") or "{}")
+            username = body.get("username", "")
+            enabled = bool(body.get("enabled"))
+            if enabled:
+                cog.admin_enable_user(UserPoolId=USER_POOL_ID, Username=username)
+            else:
+                cog.admin_disable_user(UserPoolId=USER_POOL_ID, Username=username)
+            return resp(200, {"updated": True, "username": username, "enabled": enabled})
+
+        if path == "/admin/users" and method == "DELETE":
+            if not is_superadmin(cl):
+                return resp(403, {"error": "khusus superadmin"})
+            username = qs.get("username", "")
+            if username == cl["username"]:
+                return resp(400, {"error": "tidak bisa menghapus diri sendiri"})
+            cog.admin_delete_user(UserPoolId=USER_POOL_ID, Username=username)
+            return resp(200, {"deleted": True, "username": username})
+
+        if path == "/admin/signout" and method == "POST":
+            cog.admin_user_global_sign_out(UserPoolId=USER_POOL_ID, Username=cl["username"])
+            return resp(200, {"signedOut": True})
+
+        return resp(404, {"error": f"route {method} {path} tidak ada"})
+    except Exception as e:
+        return resp(500, {"error": str(e)[:300]})
+
+
+def async_handler(event, context):
+    """Entry untuk self-invoke async (proses chat di latar belakang)."""
+    if event.get("_async") == "chat":
+        rp = event["runtimePayload"]
+        sid = rp["sessionId"]
+        try:
+            out = invoke_runtime(rp)
+            rec = sessions_tbl.get_item(Key={"sessionId": sid}).get("Item")
+            if rec:
+                msgs = rec.get("messages", [])
+                has_reply = bool(msgs) and msgs[-1].get("role") == "assistant"
+                new_status = "done" if (out.get("status") == "done" or has_reply) else "error"
+                if not has_reply and out.get("response"):
+                    msgs = msgs + [{"role": "assistant", "text": out["response"], "ts": now_ms(),
+                                    "model": out.get("model", "")}]
+                sessions_tbl.update_item(
+                    Key={"sessionId": sid},
+                    UpdateExpression="SET #s = :st, #m = :m, updatedAt = :u, modelId = :mo",
+                    ExpressionAttributeNames={"#s": "status", "#m": "messages"},
+                    ExpressionAttributeValues={
+                        ":st": new_status, ":m": msgs, ":u": str(now_ms()),
+                        ":mo": out.get("model", rec.get("modelId", ""))})
+        except Exception as e:
+            sessions_tbl.update_item(
+                Key={"sessionId": sid},
+                UpdateExpression="SET #s = :st, err = :e, updatedAt = :u",
+                ExpressionAttributeNames={"#s": "status"},
+                ExpressionAttributeValues={":st": "error", ":e": str(e)[:500], ":u": str(now_ms())})
+        return {"ok": True}
+    return handler(event, context)
+
+
+lambda_handler = async_handler

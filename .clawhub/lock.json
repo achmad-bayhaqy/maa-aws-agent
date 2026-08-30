@@ -1,0 +1,70 @@
+{
+  "version": 1,
+  "skills": {
+    "skills-sh:aws/agent-toolkit-for-aws/agents-get-started": {
+      "version": "b4416dddac9b6a0cc5412136e6dbf8f07ffdb31c",
+      "installedAt": 1788079416913,
+      "sourceRef": "skills-sh:aws/agent-toolkit-for-aws/agents-get-started",
+      "sourceKind": "skills-sh",
+      "sourceRepository": "aws/agent-toolkit-for-aws",
+      "sourcePath": "plugins/aws-agents/skills/agents-get-started",
+      "sourceUrl": "https://github.com/aws/agent-toolkit-for-aws/tree/b4416dddac9b6a0cc5412136e6dbf8f07ffdb31c/plugins/aws-agents/skills/agents-get-started",
+      "canonicalRef": "@aws/agents-get-started",
+      "clawhubScan": "scanned",
+      "trustLabel": "Scanned by ClawHub"
+    },
+    "strands": {
+      "version": "2.0.3",
+      "installedAt": 1788079421363,
+      "ownerHandle": "trippingkelsea"
+    },
+    "skills-sh:aws/agent-toolkit-for-aws/agents-connect": {
+      "version": "b4416dddac9b6a0cc5412136e6dbf8f07ffdb31c",
+      "installedAt": 1788079482013,
+      "sourceRef": "skills-sh:aws/agent-toolkit-for-aws/agents-connect",
+      "sourceKind": "skills-sh",
+      "sourceRepository": "aws/agent-toolkit-for-aws",
+      "sourcePath": "plugins/aws-agents/skills/agents-connect",
+      "sourceUrl": "https://github.com/aws/agent-toolkit-for-aws/tree/b4416dddac9b6a0cc5412136e6dbf8f07ffdb31c/plugins/aws-agents/skills/agents-connect",
+      "canonicalRef": "@aws/agents-connect",
+      "clawhubScan": "scanned",
+      "trustLabel": "Scanned by ClawHub"
+    },
+    "skills-sh:aws/agent-toolkit-for-aws/agents-debug": {
+      "version": "b4416dddac9b6a0cc5412136e6dbf8f07ffdb31c",
+      "installedAt": 1788079488857,
+      "sourceRef": "skills-sh:aws/agent-toolkit-for-aws/agents-debug",
+      "sourceKind": "skills-sh",
+      "sourceRepository": "aws/agent-toolkit-for-aws",
+      "sourcePath": "plugins/aws-agents/skills/agents-debug",
+      "sourceUrl": "https://github.com/aws/agent-toolkit-for-aws/tree/b4416dddac9b6a0cc5412136e6dbf8f07ffdb31c/plugins/aws-agents/skills/agents-debug",
+      "canonicalRef": "@aws/agents-debug",
+      "clawhubScan": "scanned",
+      "trustLabel": "Scanned by ClawHub"
+    },
+    "skills-sh:aws/agent-toolkit-for-aws/agents-harden": {
+      "version": "b4416dddac9b6a0cc5412136e6dbf8f07ffdb31c",
+      "installedAt": 1788079494155,
+      "sourceRef": "skills-sh:aws/agent-toolkit-for-aws/agents-harden",
+      "sourceKind": "skills-sh",
+      "sourceRepository": "aws/agent-toolkit-for-aws",
+      "sourcePath": "plugins/aws-agents/skills/agents-harden",
+      "sourceUrl": "https://github.com/aws/agent-toolkit-for-aws/tree/b4416dddac9b6a0cc5412136e6dbf8f07ffdb31c/plugins/aws-agents/skills/agents-harden",
+      "canonicalRef": "@aws/agents-harden",
+      "clawhubScan": "scanned",
+      "trustLabel": "Scanned by ClawHub"
+    },
+    "skills-sh:aws/agent-toolkit-for-aws/agents-optimize": {
+      "version": "b4416dddac9b6a0cc5412136e6dbf8f07ffdb31c",
+      "installedAt": 1788079498176,
+      "sourceRef": "skills-sh:aws/agent-toolkit-for-aws/agents-optimize",
+      "sourceKind": "skills-sh",
+      "sourceRepository": "aws/agent-toolkit-for-aws",
+      "sourcePath": "plugins/aws-agents/skills/agents-optimize",
+      "sourceUrl": "https://github.com/aws/agent-toolkit-for-aws/tree/b4416dddac9b6a0cc5412136e6dbf8f07ffdb31c/plugins/aws-agents/skills/agents-optimize",
+      "canonicalRef": "@aws/agents-optimize",
+      "clawhubScan": "scanned",
+      "trustLabel": "Scanned by ClawHub"
+    }
+  }
+}

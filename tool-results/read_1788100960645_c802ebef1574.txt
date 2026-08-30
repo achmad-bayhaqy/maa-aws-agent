@@ -1,0 +1,748 @@
+     1→'use client';
+     2→
+     3→import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+     4→import {
+     5→  Activity, ChevronDown, LogOut, Menu, MessageSquarePlus, PanelRightClose,
+     6→  PanelRightOpen, RefreshCcw, ShieldCheck, Sparkles, X,
+     7→} from 'lucide-react';
+     8→import {
+     9→  DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuLabel,
+    10→  DropdownMenuSeparator, DropdownMenuTrigger,
+    11→} from '@/components/ui/dropdown-menu';
+    12→import { Sheet, SheetContent, SheetHeader, SheetTitle } from '@/components/ui/sheet';
+    13→import { useToast } from '@/hooks/use-toast';
+    14→import {
+    15→  CONFIG, getModels, getStatus, getSessions, getTrace, loadLastSession,
+    16→  revokeToken, saveLastSession, sendChat, sessionIdFromPath, signOutAll,
+    17→  stripClarifyBlock, type Attachment, type AutoRoute, type ChatMessage,
+    18→  type ChatMode, type ChatStatus, type MeInfo, type MaaModel, type SessionRow,
+    19→  type Tokens, type TraceEvent,
+    20→} from '@/lib/maa';
+    21→import { Logo, LogoWordmark } from './logo';
+    22→import { SidebarContent } from './sidebar';
+    23→import { Composer } from './composer';
+    24→import { MessageList } from './message-list';
+    25→import { TracePanel } from './trace-panel';
+    26→import { ConfirmModal } from './confirm-modal';
+    27→import { AdminDrawer, DocsDrawer, KbDrawer } from './drawers';
+    28→import { ThemeDialog, ThemeSwitcher } from './theme-switcher';
+    29→import { initTheme, type MaaTheme } from './theme';
+    30→
+    31→const SUGGESTIONS = ['List EC2', 'Analisis biaya 30 hari', 'Buat VPC bernama staging', 'Apa runbook insiden database?'];
+    32→
+    33→type LastAction = { kind: 'send'; text: string } | { kind: 'edit'; text: string; editFrom: number } | null;
+    34→
+    35→/** Normalisasi status: ekstrak blok [[CLARIFY]] dari pesan terakhir. */
+    36→function normalizeStatus(st: ChatStatus): ChatStatus {
+    37→  const msgs: ChatMessage[] = [...(st.messages || [])];
+    38→  let clarify = st.clarify ?? null;
+    39→  if (!clarify && msgs.length) {
+    40→    for (let i = msgs.length - 1; i >= 0; i--) {
+    41→      if (msgs[i].role === 'assistant') {
+    42→        const { text, clarify: c } = stripClarifyBlock(msgs[i].text);
+    43→        if (c) {
+    44→          msgs[i] = { ...msgs[i], text };
+    45→          clarify = c;
+    46→        }
+    47→        break;
+    48→      }
+    49→    }
+    50→  }
+    51→  return { ...st, messages: msgs, clarify };
+    52→}
+    53→
+    54→function traceLastTs(events: TraceEvent[]): number {
+    55→  let last = 0;
+    56→  for (const e of events) {
+    57→    const n = Number(e.ts);
+    58→    if (Number.isFinite(n) && n > last) last = n;
+    59→  }
+    60→  return last;
+    61→}
+    62→
+    63→export function ChatApp({
+    64→  tokens,
+    65→  username,
+    66→  me,
+    67→  onLogout,
+    68→}: {
+    69→  tokens: Tokens;
+    70→  username: string;
+    71→  me: MeInfo | null;
+    72→  onLogout: (msg?: string) => void;
+    73→}) {
+    74→  const { toast } = useToast();
+    75→  const token = tokens.IdToken;
+    76→
+    77→  // ---- tema ----
+    78→  const [theme, setTheme] = useState<MaaTheme>({ accent: '#DC2626', dark: false });
+    79→  useEffect(() => {
+    80→    setTheme(initTheme());
+    81→  }, []);
+    82→
+    83→  // ---- data ----
+    84→  const [sessions, setSessions] = useState<SessionRow[]>([]);
+    85→  const [activeId, setActiveId] = useState<string | null>(null);
+    86→  const [status, setStatus] = useState<ChatStatus | null>(null);
+    87→  const [trace, setTrace] = useState<TraceEvent[]>([]);
+    88→  const [models, setModels] = useState<MaaModel[]>([]);
+    89→  const [autoDefaults, setAutoDefaults] = useState<{ fast: string; deep: string } | undefined>(undefined);
+    90→  const [mode, setMode] = useState<ChatMode>('AUTO');
+    91→  const [manualModel, setManualModel] = useState('');
+    92→  const [loadingSession, setLoadingSession] = useState(false);
+    93→  const [processing, setProcessing] = useState(false);
+    94→  const [errorTop, setErrorTop] = useState<string | null>(null);
+    95→  const [lastAction, setLastAction] = useState<LastAction>(null);
+    96→
+    97→  // ---- UI ----
+    98→  const [sidebarOpen, setSidebarOpen] = useState(false); // sheet mobile
+    99→  const [traceSheetOpen, setTraceSheetOpen] = useState(false); // sheet mobile
+   100→  const [traceRailOpen, setTraceRailOpen] = useState(true); // rail desktop
+   101→  const [kbOpen, setKbOpen] = useState(false);
+   102→  const [docsOpen, setDocsOpen] = useState(false);
+   103→  const [adminOpen, setAdminOpen] = useState(false);
+   104→  const [themeOpen, setThemeOpen] = useState(false);
+   105→  const [confirmDismissed, setConfirmDismissed] = useState<string[]>([]);
+   106→
+   107→  // ---- refs / timers ----
+   108→  const runIdRef = useRef(0);
+   109→  const lastTraceTsRef = useRef(0);
+   110→  const pollIvRef = useRef<number | null>(null);
+   111→  const traceIvRef = useRef<number | null>(null);
+   112→  const pollFailRef = useRef(0);
+   113→  const stickRef = useRef(true);
+   114→  const scrollRef = useRef<HTMLDivElement>(null);
+   115→  const idleRef = useRef<number | null>(null);
+   116→
+   117→  const notify = useCallback(
+   118→    (msg: string, ok = false) => {
+   119→      toast({ description: msg, variant: ok ? undefined : 'destructive', duration: ok ? 3000 : 6000 });
+   120→    },
+   121→    [toast]
+   122→  );
+   123→
+   124→  const clearTimers = useCallback(() => {
+   125→    if (pollIvRef.current) { window.clearInterval(pollIvRef.current); pollIvRef.current = null; }
+   126→    if (traceIvRef.current) { window.clearInterval(traceIvRef.current); traceIvRef.current = null; }
+   127→  }, []);
+   128→
+   129→  // ---------- API helpers ----------
+   130→
+   131→  const refreshSessions = useCallback(async () => {
+   132→    try {
+   133→      const r = await getSessions(token);
+   134→      setSessions((r.sessions || []).slice().sort((a, b) => {
+   135→        const ta = Date.parse(a.updatedAt || a.createdAt || '') || 0;
+   136→        const tb = Date.parse(b.updatedAt || b.createdAt || '') || 0;
+   137→        return tb - ta;
+   138→      }));
+   139→    } catch {
+   140→      /* daftar sesi gagal — tidak fatal */
+   141→    }
+   142→  }, [token]);
+   143→
+   144→  const loadTrace = useCallback(
+   145→    async (run: number, sid: string, fromBeginning = false) => {
+   146→      try {
+   147→        const after = fromBeginning ? 0 : lastTraceTsRef.current;
+   148→        const r = await getTrace(token, sid, after);
+   149→        if (run !== runIdRef.current) return;
+   150→        const evs = r.events || [];
+   151→        if (evs.length) {
+   152→          setTrace((prev) => {
+   153→            const merged = fromBeginning ? evs : [...prev, ...evs];
+   154→            lastTraceTsRef.current = traceLastTs(merged);
+   155→            return merged;
+   156→          });
+   157→        }
+   158→      } catch {
+   159→        /* trace poling gagal — coba lagi di tick berikutnya */
+   160→      }
+   161→    },
+   162→    [token]
+   163→  );
+   164→
+   165→  const startPolling = useCallback(
+   166→    (run: number, sid: string) => {
+   167→      clearTimers();
+   168→      setProcessing(true);
+   169→      pollFailRef.current = 0;
+   170→
+   171→      const finish = () => {
+   172→        clearTimers();
+   173→        setProcessing(false);
+   174→        void loadTrace(run, sid); // fetch trace final
+   175→        void refreshSessions();
+   176→      };
+   177→
+   178→      // poling status
+   179→      pollIvRef.current = window.setInterval(async () => {
+   180→        if (run !== runIdRef.current) { clearTimers(); return; }
+   181→        try {
+   182→          const st = await getStatus(token, sid);
+   183→          if (run !== runIdRef.current) return;
+   184→          pollFailRef.current = 0;
+   185→          setStatus(normalizeStatus(st));
+   186→          setErrorTop(null);
+   187→          if (st.status !== 'processing') {
+   188→            finish();
+   189→            if (st.status === 'error') {
+   190→              setErrorTop(st.err || 'Agent melaporkan error pada sesi ini.');
+   191→            }
+   192→          }
+   193→        } catch (e) {
+   194→          pollFailRef.current += 1;
+   195→          if (pollFailRef.current >= 4) {
+   196→            finish();
+   197→            setErrorTop(`Gagal memuat status sesi: ${(e as Error).message}`);
+   198→          }
+   199→        }
+   200→      }, 1200);
+   201→
+   202→      // poling trace (CloudWatch)
+   203→      traceIvRef.current = window.setInterval(() => {
+   204→        if (run !== runIdRef.current) { clearTimers(); return; }
+   205→        void loadTrace(run, sid);
+   206→      }, 1500);
+   207→    },
+   208→    [clearTimers, loadTrace, refreshSessions, token]
+   209→  );
+   210→
+   211→  const openSession = useCallback(
+   212→    async (sid: string, opts?: { push?: boolean }) => {
+   213→      const run = ++runIdRef.current;
+   214→      clearTimers();
+   215→      setErrorTop(null);
+   216→      setLoadingSession(true);
+   217→      setProcessing(false);
+   218→      try {
+   219→        const st = await getStatus(token, sid);
+   220→        if (run !== runIdRef.current) return;
+   221→        const norm = normalizeStatus(st);
+   222→        setStatus(norm);
+   223→        setActiveId(sid);
+   224→        setTrace([]);
+   225→        lastTraceTsRef.current = 0;
+   226→        stickRef.current = true;
+   227→        if (opts?.push !== false) window.history.pushState({ sid }, '', `/c/${sid}`);
+   228→        if (me?.userId) saveLastSession(me.userId, sid);
+   229→        if (norm.status === 'processing') startPolling(run, sid);
+   230→        else {
+   231→          setProcessing(false);
+   232→          if (norm.status === 'error') setErrorTop(norm.err || 'Agent melaporkan error pada sesi ini.');
+   233→        }
+   234→        void loadTrace(run, sid, true);
+   235→        void refreshSessions();
+   236→      } catch (e) {
+   237→        if (run !== runIdRef.current) return;
+   238→        window.history.replaceState({}, '', '/');
+   239→        setActiveId(null);
+   240→        setStatus(null);
+   241→        setErrorTop(`Gagal membuka sesi ${sid}: ${(e as Error).message}`);
+   242→      } finally {
+   243→        if (run === runIdRef.current) setLoadingSession(false);
+   244→      }
+   245→    },
+   246→    [clearTimers, loadTrace, me?.userId, refreshSessions, startPolling, token]
+   247→  );
+   248→
+   249→  const newChat = useCallback(() => {
+   250→    ++runIdRef.current;
+   251→    clearTimers();
+   252→    setActiveId(null);
+   253→    setStatus(null);
+   254→    setTrace([]);
+   255→    setProcessing(false);
+   256→    setErrorTop(null);
+   257→    lastTraceTsRef.current = 0;
+   258→    window.history.pushState({}, '', '/');
+   259→    setSidebarOpen(false);
+   260→  }, [clearTimers]);
+   261→
+   262→  // ---------- kirim / edit ----------
+   263→
+   264→  const doSend = useCallback(
+   265→    async (text: string, editFrom?: number) => {
+   266→      if (processing) { notify('Tunggu respons agent selesai dulu.'); return; }
+   267→      const modelId = mode === 'MANUAL' && manualModel ? manualModel : undefined;
+   268→      setErrorTop(null);
+   269→      setLastAction(editFrom === undefined ? { kind: 'send', text } : { kind: 'edit', text, editFrom });
+   270→
+   271→      const run = ++runIdRef.current;
+   272→      setProcessing(true);
+   273→      stickRef.current = true;
+   274→
+   275→      try {
+   276→        if (!activeId) {
+   277→          // sesi baru — tampilkan pesan user secara optimistis
+   278→          setStatus({
+   279→            sessionId: '', status: 'processing',
+   280→            messages: [{ role: 'user', text, ts: Date.now() }],
+   281→          });
+   282→          const r = await sendChat(token, { message: text, mode, modelId });
+   283→          if (run !== runIdRef.current) return;
+   284→          setActiveId(r.sessionId);
+   285→          window.history.pushState({ sid: r.sessionId }, '', `/c/${r.sessionId}`);
+   286→          if (me?.userId) saveLastSession(me.userId, r.sessionId);
+   287→          startPolling(run, r.sessionId);
+   288→        } else {
+   289→          const sid = activeId;
+   290→          await sendChat(token, {
+   291→            message: text, mode, modelId, sessionId: sid,
+   292→            ...(editFrom !== undefined ? { editFrom } : {}),
+   293→          });
+   294→          if (run !== runIdRef.current) return;
+   295→          startPolling(run, sid);
+   296→        }
+   297→      } catch (e) {
+   298→        if (run !== runIdRef.current) return;
+   299→        setProcessing(false);
+   300→        setErrorTop(`Gagal mengirim: ${(e as Error).message}`);
+   301→      }
+   302→    },
+   303→    [activeId, manualModel, me?.userId, mode, notify, processing, startPolling, token]
+   304→  );
+   305→
+   306→  const retryLast = useCallback(() => {
+   307→    if (!lastAction) return;
+   308→    if (lastAction.kind === 'edit') void doSend(lastAction.text, lastAction.editFrom);
+   309→    else void doSend(lastAction.text);
+   310→  }, [doSend, lastAction]);
+   311→
+   312→  // ---------- efek awal ----------
+   313→
+   314→  useEffect(() => {
+   315→    void refreshSessions();
+   316→    void (async () => {
+   317→      try {
+   318→        const r = await getModels(token);
+   319→        setModels(r.models || []);
+   320→        if (r.autoDefaults) setAutoDefaults(r.autoDefaults);
+   321→      } catch (e) {
+   322→        notify(`Gagal memuat katalog model: ${(e as Error).message}`);
+   323→      }
+   324→    })();
+   325→  }, [token, refreshSessions, notify]);
+   326→
+   327→  // URL routing: buka sesi dari path saat mount, atau sesi terakhir user
+   328→  const bootRef = useRef(false);
+   329→  useEffect(() => {
+   330→    if (bootRef.current) return;
+   331→    bootRef.current = true;
+   332→    const sid = sessionIdFromPath(window.location.pathname);
+   333→    if (sid) {
+   334→      void openSession(sid, { push: false });
+   335→    } else {
+   336→      const last = me?.userId ? loadLastSession(me.userId) : null;
+   337→      if (last) void openSession(last, { push: true });
+   338→      else window.history.replaceState({}, '', '/');
+   339→    }
+   340→    // eslint-disable-next-line react-hooks/exhaustive-deps
+   341→  }, [me?.userId]);
+   342→
+   343→  // tombol back/forward browser
+   344→  useEffect(() => {
+   345→    const onPop = () => {
+   346→      const sid = sessionIdFromPath(window.location.pathname);
+   347→      if (sid) void openSession(sid, { push: false });
+   348→      else newChat();
+   349→    };
+   350→    window.addEventListener('popstate', onPop);
+   351→    return () => window.removeEventListener('popstate', onPop);
+   352→  }, [openSession, newChat]);
+   353→
+   354→  // ---------- idle 15 menit → logout ----------
+   355→
+   356→  const doLogout = useCallback(
+   357→    async (msg?: string) => {
+   358→      clearTimers();
+   359→      try { await signOutAll(token); } catch { /* best-effort */ }
+   360→      if (tokens.RefreshToken) void revokeToken(tokens.RefreshToken);
+   361→      onLogout(msg);
+   362→    },
+   363→    [clearTimers, onLogout, token, tokens.RefreshToken]
+   364→  );
+   365→
+   366→  useEffect(() => {
+   367→    const reset = () => {
+   368→      if (idleRef.current) window.clearTimeout(idleRef.current);
+   369→      idleRef.current = window.setTimeout(() => {
+   370→        void doLogout('Sesi berakhir karena idle');
+   371→      }, CONFIG.idleTimeoutMs);
+   372→    };
+   373→    reset();
+   374→    const evs: (keyof WindowEventMap)[] = ['mousedown', 'keydown', 'touchstart', 'scroll'];
+   375→    evs.forEach((ev) => window.addEventListener(ev, reset, { passive: true }));
+   376→    return () => {
+   377→      if (idleRef.current) window.clearTimeout(idleRef.current);
+   378→      evs.forEach((ev) => window.removeEventListener(ev, reset));
+   379→    };
+   380→  }, [doLogout]);
+   381→
+   382→  // ---------- auto-scroll chat ----------
+   383→
+   384→  const messages = status?.messages ?? [];
+   385→  useEffect(() => {
+   386→    if (stickRef.current) {
+   387→      scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight });
+   388→    }
+   389→  }, [messages.length, processing]);
+   390→
+   391→  // ---------- turunan render ----------
+   392→
+   393→  const pending = status?.pendingConfirmation || null;
+   394→  const showConfirm = !!pending && !confirmDismissed.includes(pending.confirmToken);
+   395→
+   396→  const activeTitle =
+   397→    status?.title ||
+   398→    sessions.find((s) => s.sessionId === activeId)?.title ||
+   399→    (activeId ? 'Sesi' : 'Chat Baru');
+   400→
+   401→  const clarify = status?.clarify && status.clarify.options?.length ? status.clarify : null;
+   402→  const attachments: Attachment[] | null =
+   403→    status?.status === 'done' && status.attachments?.length ? status.attachments : null;
+   404→  const autoRoute: AutoRoute | null = status?.autoRoute ?? null;
+   405→
+   406→  const sessionMenuItems = useMemo(() => sessions.slice(0, 12), [sessions]);
+   407→
+   408→  const sidebarNode = (
+   409→    <SidebarContent
+   410→      sessions={sessions}
+   411→      activeId={activeId}
+   412→      onSelectSession={(id) => { setSidebarOpen(false); void openSession(id); }}
+   413→      onNewChat={() => newChat()}
+   414→      onOpenDocs={() => { setSidebarOpen(false); setDocsOpen(true); }}
+   415→      onOpenKb={() => { setSidebarOpen(false); setKbOpen(true); }}
+   416→      onOpenAdmin={() => { setSidebarOpen(false); setAdminOpen(true); }}
+   417→      onOpenTheme={() => { setSidebarOpen(false); setThemeOpen(true); }}
+   418→      canAdmin={me?.role === 'superadmin'}
+   419→      userName={me?.email || username}
+   420→      onLogout={() => void doLogout()}
+   421→    />
+   422→  );
+   423→
+   424→  return (
+   425→    <div className="flex h-dvh flex-col overflow-hidden bg-[var(--bg)] text-[var(--ink)]">
+   426→      {/* ================= HEADER 56px ================= */}
+   427→      <header className="flex h-14 shrink-0 items-center gap-2 border-b border-[var(--line)] bg-[var(--bg)] px-3 sm:px-4">
+   428→        <button
+   429→          type="button"
+   430→          onClick={() => setSidebarOpen(true)}
+   431→          aria-label="Buka menu"
+   432→          className="maa-btn-ghost flex h-9 w-9 items-center justify-center lg:hidden"
+   433→        >
+   434→          <Menu className="h-5 w-5" />
+   435→        </button>
+   436→
+   437→        <span className="hidden sm:block"><LogoWordmark size={22} /></span>
+   438→        <span className="sm:hidden"><Logo size={22} /></span>
+   439→
+   440→        {/* chip sesi: title ▾ */}
+   441→        <DropdownMenu>
+   442→          <DropdownMenuTrigger asChild>
+   443→            <button
+   444→              type="button"
+   445→              className="maa-btn-ghost mx-1 flex h-9 min-w-0 max-w-[40vw] items-center gap-1.5 border border-[var(--line-soft)] px-3 sm:max-w-[320px]"
+   446→              aria-label="Ganti sesi"
+   447→            >
+   448→              <span className="truncate text-[12.5px] font-medium">{activeTitle}</span>
+   449→              <ChevronDown className="h-3.5 w-3.5 shrink-0 text-[var(--muted-fg)]" />
+   450→            </button>
+   451→          </DropdownMenuTrigger>
+   452→          <DropdownMenuContent align="start" className="w-72">
+   453→            <DropdownMenuLabel className="text-[11px] uppercase tracking-widest text-[var(--muted-fg)]">
+   454→              Sesi terbaru
+   455→            </DropdownMenuLabel>
+   456→            <DropdownMenuItem onSelect={newChat}>
+   457→              <MessageSquarePlus className="h-4 w-4" /> Chat Baru
+   458→            </DropdownMenuItem>
+   459→            <DropdownMenuSeparator />
+   460→            {sessionMenuItems.length === 0 && (
+   461→              <p className="px-2 py-3 text-center text-[11.5px] text-[var(--muted-fg)]">Belum ada sesi</p>
+   462→            )}
+   463→            {sessionMenuItems.map((s) => (
+   464→              <DropdownMenuItem
+   465→                key={s.sessionId}
+   466→                onSelect={() => void openSession(s.sessionId)}
+   467→                className={s.sessionId === activeId ? 'bg-[var(--accent-soft)]' : ''}
+   468→              >
+   469→                <span className="min-w-0 flex-1 truncate text-[12.5px]">{s.title || 'Sesi tanpa judul'}</span>
+   470→              </DropdownMenuItem>
+   471→            ))}
+   472→          </DropdownMenuContent>
+   473→        </DropdownMenu>
+   474→
+   475→        <span className="ml-auto" />
+   476→
+   477→        {/* mode aktif kecil di header (desktop) */}
+   478→        <span className="hidden rounded-full border border-[var(--line-soft)] px-2.5 py-1 font-mono text-[10px] font-semibold text-[var(--muted-fg)] md:inline">
+   479→          {mode}
+   480→        </span>
+   481→
+   482→        <ThemeSwitcher theme={theme} onChange={setTheme} />
+   483→
+   484→        {/* toggle trace rail desktop */}
+   485→        <button
+   486→          type="button"
+   487→          onClick={() => setTraceRailOpen((v) => !v)}
+   488→          aria-label={traceRailOpen ? 'Sembunyikan Live Trace' : 'Tampilkan Live Trace'}
+   489→          title="Live Trace"
+   490→          className="maa-btn-ghost hidden h-9 w-9 items-center justify-center lg:flex"
+   491→        >
+   492→          {traceRailOpen ? <PanelRightClose className="h-4.5 w-4.5" /> : <PanelRightOpen className="h-4.5 w-4.5" />}
+   493→        </button>
+   494→        {/* trace sheet mobile */}
+   495→        <button
+   496→          type="button"
+   497→          onClick={() => setTraceSheetOpen(true)}
+   498→          aria-label="Buka Live Trace"
+   499→          className="maa-btn-ghost flex h-9 w-9 items-center justify-center lg:hidden"
+   500→        >
+   501→          <Activity className="h-4.5 w-4.5" />
+   502→        </button>
+   503→
+   504→        {/* user menu */}
+   505→        <DropdownMenu>
+   506→          <DropdownMenuTrigger asChild>
+   507→            <button
+   508→              type="button"
+   509→              aria-label="Menu pengguna"
+   510→              className="maa-btn-ghost flex h-9 items-center gap-2 px-2"
+   511→            >
+   512→              <span
+   513→                className="flex h-7 w-7 items-center justify-center rounded-full text-[11px] font-bold text-[var(--accent-ink)]"
+   514→                style={{ background: 'var(--accent)' }}
+   515→              >
+   516→                {(me?.username || username || '?').slice(0, 2).toUpperCase()}
+   517→              </span>
+   518→              <span className="hidden max-w-[140px] truncate text-[12px] font-medium md:inline">
+   519→                {me?.username || username}
+   520→              </span>
+   521→            </button>
+   522→          </DropdownMenuTrigger>
+   523→          <DropdownMenuContent align="end" className="w-60">
+   524→            <DropdownMenuLabel>
+   525→              <span className="block truncate text-[12.5px] font-semibold text-[var(--ink)]">
+   526→                {me?.email || username}
+   527→              </span>
+   528→              <span className="mt-0.5 flex items-center gap-1 text-[10.5px] font-medium text-[var(--muted-fg)]">
+   529→                {me?.role === 'superadmin' ? (
+   530→                  <>
+   531→                    <ShieldCheck className="h-3 w-3" style={{ color: 'var(--accent)' }} /> superadmin
+   532→                  </>
+   533→                ) : (
+   534→                  'user'
+   535→                )}
+   536→              </span>
+   537→            </DropdownMenuLabel>
+   538→            <DropdownMenuSeparator />
+   539→            <DropdownMenuItem onSelect={() => void doLogout()} className="text-[var(--danger)]">
+   540→              <LogOut className="h-4 w-4" /> Keluar
+   541→            </DropdownMenuItem>
+   542→          </DropdownMenuContent>
+   543→        </DropdownMenu>
+   544→      </header>
+   545→
+   546→      {/* ================= BODY 3 KOLOM ================= */}
+   547→      <div className="flex min-h-0 flex-1">
+   548→        {/* sidebar desktop */}
+   549→        <aside className="hidden w-[264px] shrink-0 border-r border-[var(--line)] lg:block">
+   550→          {sidebarNode}
+   551→        </aside>
+   552→
+   553→        {/* chat area */}
+   554→        <main className="flex min-w-0 flex-1 flex-col">
+   555→          {errorTop && (
+   556→            <div
+   557→              role="alert"
+   558→              className="animate-slide-down mx-3 mt-3 flex items-start gap-2.5 rounded-[10px] border border-[var(--danger)] bg-[var(--danger)]/5 px-3.5 py-2.5 sm:mx-4"
+   559→            >
+   560→              <X className="mt-0.5 h-4 w-4 shrink-0 text-[var(--danger)]" />
+   561→              <p className="min-w-0 flex-1 break-words text-[12.5px] leading-relaxed text-[var(--ink)]">{errorTop}</p>
+   562→              <button
+   563→                type="button"
+   564→                onClick={retryLast}
+   565→                className="maa-btn-secondary flex shrink-0 items-center gap-1.5 px-2.5 py-1.5 text-[11.5px]"
+   566→              >
+   567→                <RefreshCcw className="h-3.5 w-3.5" /> Coba lagi
+   568→              </button>
+   569→              <button
+   570→                type="button"
+   571→                onClick={() => setErrorTop(null)}
+   572→                aria-label="Tutup pesan error"
+   573→                className="rounded-md p-1 text-[var(--muted-fg)] hover:bg-[var(--muted-bg)] hover:text-[var(--ink)]"
+   574→              >
+   575→                <X className="h-3.5 w-3.5" />
+   576→              </button>
+   577→            </div>
+   578→          )}
+   579→
+   580→          <div
+   581→            ref={scrollRef}
+   582→            onScroll={(e) => {
+   583→              const el = e.currentTarget;
+   584→              stickRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+   585→            }}
+   586→            className="nice-scroll min-h-0 flex-1 overflow-y-auto"
+   587→          >
+   588→            <div className="mx-auto w-full max-w-[760px] px-4 py-6">
+   589→              {loadingSession && messages.length === 0 ? (
+   590→                <div className="space-y-4">
+   591→                  <div className="skeleton-line h-16 w-3/4 rounded-[10px]" />
+   592→                  <div className="skeleton-line h-24 w-full rounded-[10px]" />
+   593→                  <div className="skeleton-line h-16 w-2/3 rounded-[10px]" />
+   594→                </div>
+   595→              ) : messages.length === 0 ? (
+   596→                /* ---------- empty state ---------- */
+   597→                <div className="flex flex-col items-center py-10 text-center sm:py-16">
+   598→                  <Logo size={56} className="mb-4" />
+   599→                  <h2 className="text-[20px] font-bold tracking-tight text-[var(--ink)]">
+   600→                    Halo, {me?.username || username}
+   601→                  </h2>
+   602→                  <p className="mt-1.5 max-w-[420px] text-[13px] leading-relaxed text-[var(--muted-fg)]">
+   603→                    Insinyur AWS otonom Anda. Tanyakan apa saja — dari listing resource sampai
+   604→                    operasi destruktif (dengan konfirmasi ganda).
+   605→                  </p>
+   606→                  <div className="mt-6 flex flex-wrap items-center justify-center gap-2">
+   607→                    {SUGGESTIONS.map((s) => (
+   608→                      <button
+   609→                        key={s}
+   610→                        type="button"
+   611→                        onClick={() => void doSend(s)}
+   612→                        className="maa-btn-secondary flex items-center gap-1.5 px-3.5 py-2 text-[12px]"
+   613→                      >
+   614→                        <Sparkles className="h-3.5 w-3.5" style={{ color: 'var(--accent)' }} />
+   615→                        {s}
+   616→                      </button>
+   617→                    ))}
+   618→                  </div>
+   619→                  {mode === 'MANUAL' && !manualModel && (
+   620→                    <p className="mt-4 text-[11.5px] text-[var(--muted-fg)]">
+   621→                      Mode MANUAL aktif — pilih model dulu di atas composer.
+   622→                    </p>
+   623→                  )}
+   624→                </div>
+   625→              ) : (
+   626→                <MessageList
+   627→                  messages={messages}
+   628→                  processing={processing}
+   629→                  onResendEdit={(idx, text) => void doSend(text, idx)}
+   630→                  notify={notify}
+   631→                  clarifySlot={
+   632→                    clarify && !processing ? (
+   633→                      <div className="animate-msg-in mt-1 w-full max-w-[min(680px,85%)] rounded-[10px] border border-[var(--accent)] bg-[var(--accent-soft)] p-3.5">
+   634→                        <p className="mb-2.5 text-[13px] font-semibold leading-relaxed text-[var(--ink)]">
+   635→                          {clarify.question}
+   636→                        </p>
+   637→                        <div className="flex flex-wrap gap-1.5">
+   638→                          {clarify.options.map((opt) => (
+   639→                            <button
+   640→                              key={opt}
+   641→                              type="button"
+   642→                              disabled={processing}
+   643→                              onClick={() => void doSend(opt)}
+   644→                              className="rounded-full border border-[var(--line)] bg-[var(--bg)] px-3 py-1.5 text-[12px] font-medium text-[var(--ink)] transition-colors hover:border-[var(--accent)] disabled:opacity-50"
+   645→                            >
+   646→                              {opt}
+   647→                            </button>
+   648→                          ))}
+   649→                        </div>
+   650→                      </div>
+   651→                    ) : undefined
+   652→                  }
+   653→                  attachments={attachments}
+   654→                  autoRoute={autoRoute}
+   655→                />
+   656→              )}
+   657→            </div>
+   658→          </div>
+   659→
+   660→          {/* composer */}
+   661→          <div className="shrink-0 border-t border-[var(--line)] bg-[var(--bg)] px-3 pb-3 pt-3 sm:px-4">
+   662→            <div className="mx-auto w-full max-w-[760px]">
+   663→              <Composer
+   664→                mode={mode}
+   665→                onModeChange={setMode}
+   666→                manualModel={manualModel}
+   667→                onManualModelChange={setManualModel}
+   668→                models={models}
+   669→                autoDefaults={autoDefaults}
+   670→                onSend={(t) => void doSend(t)}
+   671→                disabled={loadingSession}
+   672→                busy={processing}
+   673→                hint={
+   674→                  mode === 'AUTO' && autoDefaults
+   675→                    ? `AUTO memilih model otomatis · cepat: ${autoDefaults.fast} · dalam: ${autoDefaults.deep}`
+   676→                    : null
+   677→                }
+   678→              />
+   679→            </div>
+   680→          </div>
+   681→        </main>
+   682→
+   683→        {/* trace rail desktop */}
+   684→        {traceRailOpen && (
+   685→          <aside className="hidden w-[340px] shrink-0 border-l border-[var(--line)] bg-[var(--bg)] lg:block">
+   686→            <TracePanel
+   687→              events={trace}
+   688→              processing={processing}
+   689→              onClear={() => setTrace([])}
+   690→            />
+   691→          </aside>
+   692→        )}
+   693→      </div>
+   694→
+   695→      {/* ================= sheets & drawers ================= */}
+   696→      <Sheet open={sidebarOpen} onOpenChange={setSidebarOpen}>
+   697→        <SheetContent side="left" className="w-[280px] gap-0 p-0">
+   698→          <SheetHeader className="sr-only">
+   699→            <SheetTitle>Menu</SheetTitle>
+   700→          </SheetHeader>
+   701→          {sidebarNode}
+   702→        </SheetContent>
+   703→      </Sheet>
+   704→
+   705→      <Sheet open={traceSheetOpen} onOpenChange={setTraceSheetOpen}>
+   706→        <SheetContent side="right" className="w-full max-w-md gap-0 p-0">
+   707→          <SheetHeader className="sr-only">
+   708→            <SheetTitle>Live Trace</SheetTitle>
+   709→          </SheetHeader>
+   710→          <div className="h-full pt-10">
+   711→            <TracePanel
+   712→              events={trace}
+   713→              processing={processing}
+   714→              onClear={() => setTrace([])}
+   715→              onClose={() => setTraceSheetOpen(false)}
+   716→            />
+   717→          </div>
+   718→        </SheetContent>
+   719→      </Sheet>
+   720→
+   721→      <KbDrawer open={kbOpen} onOpenChange={setKbOpen} token={token} notify={notify} />
+   722→      <DocsDrawer open={docsOpen} onOpenChange={setDocsOpen} />
+   723→      <AdminDrawer open={adminOpen} onOpenChange={setAdminOpen} token={token} notify={notify} />
+   724→      <ThemeDialog theme={theme} onChange={setTheme} open={themeOpen} onOpenChange={setThemeOpen} />
+   725→
+   726→      {showConfirm && pending && activeId && (
+   727→        <ConfirmModal
+   728→          pending={pending}
+   729→          sessionId={activeId}
+   730→          token={token}
+   731→          notify={notify}
+   732→          onDone={() => {
+   733→            setConfirmDismissed((prev) => [...prev, pending.confirmToken]);
+   734→            const run = ++runIdRef.current;
+   735→            clearTimers();
+   736→            setProcessing(true);
+   737→            startPolling(run, activeId);
+   738→          }}
+   739→          onCancel={() => {
+   740→            setConfirmDismissed((prev) => [...prev, pending.confirmToken]);
+   741→            notify('Konfirmasi dibatalkan — operasi destruktif tidak dieksekusi.');
+   742→          }}
+   743→        />
+   744→      )}
+   745→    </div>
+   746→  );
+   747→}
+   748→

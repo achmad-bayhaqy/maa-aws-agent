@@ -1,0 +1,574 @@
+     1→'use client';
+     2→
+     3→import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+     4→import {
+     5→  Bot, Brain, CloudCog, Database, History, Info, Loader2, LogOut, PanelRightOpen,
+     6→  SendHorizontal, SlidersHorizontal, User, X, Zap,
+     7→} from 'lucide-react';
+     8→import {
+     9→  CONFIG, getModels, getStatus, getTrace, loadSession, revokeToken, sendChat,
+    10→  signOutAll, traceLabel, type ChatMessage, type ChatStatus, type PendingConfirm,
+    11→  type Tokens, type TraceEvent,
+    12→} from '@/lib/maa';
+    13→import { Markdown } from './markdown';
+    14→import { ModelPicker, PROVIDER_LABEL, type MaaModel } from './model-picker';
+    15→import { TracePanel } from './trace-panel';
+    16→import { ConfirmModal } from './confirm-modal';
+    17→import { KbDrawer, SessionsDrawer } from './drawers';
+    18→
+    19→type Mode = 'FAST' | 'DEEP' | 'MANUAL';
+    20→type Toast = { id: number; msg: string; ok: boolean };
+    21→
+    22→const MODES: { id: Mode; icon: React.ReactNode; name: string; desc: string }[] = [
+    23→  { id: 'FAST', icon: <Zap className="h-4 w-4" />, name: 'Kilat', desc: 'Nova Micro · hemat & cepat' },
+    24→  { id: 'DEEP', icon: <Brain className="h-4 w-4" />, name: 'Dalam', desc: 'GPT-OSS 120B · reasoning' },
+    25→  { id: 'MANUAL', icon: <SlidersHorizontal className="h-4 w-4" />, name: 'Manual', desc: 'Pilih model sendiri' },
+    26→];
+    27→
+    28→const SUGGESTIONS = [
+    29→  'Tampilkan semua instance EC2 beserta statusnya',
+    30→  'Apa prosedur restart untuk EC2 yang tidak sehat? (lihat KB)',
+    31→  'Buatkan IaC template S3 bucket dengan enkripsi KMS',
+    32→  'Analisis aset infrastruktur kami dan rekomendasikan optimasi biaya',
+    33→];
+    34→
+    35→let toastSeq = 0;
+    36→
+    37→export function ChatApp({ tokens, username, onLogout }: {
+    38→  tokens: Tokens; username: string; onLogout: (msg?: string) => void;
+    39→}) {
+    40→  const [messages, setMessages] = useState<ChatMessage[]>([]);
+    41→  const [input, setInput] = useState('');
+    42→  const [mode, setMode] = useState<Mode>('FAST');
+    43→  const [manualModel, setManualModel] = useState('');
+    44→  const [models, setModels] = useState<MaaModel[]>([]);
+    45→  const [sessionId, setSessionId] = useState<string | null>(null);
+    46→  const [processing, setProcessing] = useState(false);
+    47→  const [traceEvents, setTraceEvents] = useState<TraceEvent[]>([]);
+    48→  const [showTrace, setShowTrace] = useState(false);
+    49→  const [showSidebar, setShowSidebar] = useState(false);
+    50→  const [pendingConfirm, setPendingConfirm] = useState<PendingConfirm | null>(null);
+    51→  const [showKb, setShowKb] = useState(false);
+    52→  const [showSessions, setShowSessions] = useState(false);
+    53→  const [toasts, setToasts] = useState<Toast[]>([]);
+    54→
+    55→  const pollRef = useRef<{ stop: boolean } | null>(null);
+    56→  const scrollRef = useRef<HTMLDivElement>(null);
+    57→  const taRef = useRef<HTMLTextAreaElement>(null);
+    58→  const lastActivity = useRef(Date.now());
+    59→
+    60→  const notify = useCallback((msg: string, ok = true) => {
+    61→    const id = ++toastSeq;
+    62→    setToasts((t) => [...t.slice(-3), { id, msg, ok }]);
+    63→    setTimeout(() => setToasts((t) => t.filter((x) => x.id !== id)), 4200);
+    64→  }, []);
+    65→
+    66→  const finishSession = useCallback(async (msg?: string) => {
+    67→    if (pollRef.current) pollRef.current.stop = true;
+    68→    const s = loadSession();
+    69→    if (s?.tokens?.RefreshToken) await revokeToken(s.tokens.RefreshToken);
+    70→    try { await signOutAll(tokens.IdToken); } catch { /* best effort */ }
+    71→    onLogout(msg);
+    72→  }, [tokens.IdToken, onLogout]);
+    73→
+    74→  // FR 1.4: idle 15 menit -> paksa logout
+    75→  useEffect(() => {
+    76→    const bump = () => { lastActivity.current = Date.now(); };
+    77→    ['keydown', 'touchstart', 'click', 'scroll'].forEach((e) =>
+    78→      window.addEventListener(e, bump, { passive: true }));
+    79→    const iv = setInterval(() => {
+    80→      if (Date.now() - lastActivity.current > CONFIG.idleTimeoutMs) {
+    81→        finishSession('Sesi diakhiri otomatis setelah 15 menit tanpa aktivitas.');
+    82→      }
+    83→    }, 10_000);
+    84→    return () => { ['keydown', 'touchstart', 'click', 'scroll'].forEach((e) => window.removeEventListener(e, bump)); clearInterval(iv); };
+    85→  }, [finishSession]);
+    86→
+    87→  useEffect(() => {
+    88→    getModels(tokens.IdToken)
+    89→      .then((r) => {
+    90→        const list = r.models || [];
+    91→        setModels(list);
+    92→        setManualModel((cur) => cur || list.find((m) => m.modelId === 'zai.glm-5')?.modelId || list[0]?.modelId || '');
+    93→      })
+    94→      .catch((e) => notify(`Gagal memuat daftar model: ${(e as Error).message}`, false));
+    95→  }, [tokens.IdToken, notify]);
+    96→
+    97→  useEffect(() => {
+    98→    scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: 'smooth' });
+    99→  }, [messages.length, processing]);
+   100→
+   101→  const openSession = useCallback(async (sid: string) => {
+   102→    try {
+   103→      const s = await getStatus(tokens.IdToken, sid);
+   104→      setSessionId(sid);
+   105→      setMessages(s.messages || []);
+   106→      setPendingConfirm(s.pendingConfirmation || null);
+   107→      if (s.mode === 'DEEP' || s.mode === 'MANUAL') setMode(s.mode as Mode);
+   108→      if (s.modelId) setManualModel(s.modelId);
+   109→      setShowSessions(false);
+   110→      notify('Sesi dibuka dari riwayat');
+   111→    } catch (e) { notify(`Gagal membuka sesi: ${(e as Error).message}`, false); }
+   112→  }, [tokens.IdToken, notify]);
+   113→
+   114→  const startPolling = useCallback((sid: string) => {
+   115→    const handle = { stop: false };
+   116→    pollRef.current = handle;
+   117→    let cursor = 0;
+   118→    const tick = async () => {
+   119→      if (handle.stop) return;
+   120→      try {
+   121→        const tr = await getTrace(tokens.IdToken, sid, cursor);
+   122→        if (tr.events?.length) {
+   123→          setTraceEvents((prev) => [...prev, ...tr.events]);
+   124→          cursor = Number(tr.events[tr.events.length - 1].ts) + 1;
+   125→        }
+   126→        const st = await getStatus(tokens.IdToken, sid);
+   127→        if (st.pendingConfirmation) setPendingConfirm(st.pendingConfirmation);
+   128→        if (st.status === 'done' || st.status === 'error') {
+   129→          const msgs = st.messages || [];
+   130→          const last = msgs[msgs.length - 1];
+   131→          if (st.status === 'error' && (!last || last.role !== 'assistant')) {
+   132→            msgs.push({
+   133→              role: 'assistant',
+   134→              text: `Terjadi kendala saat memproses:\n\n> ${st.err || 'kesalahan tidak diketahui'}`,
+   135→              ts: Date.now(), kind: 'error',
+   136→            } as ChatMessage & { kind?: string });
+   137→          }
+   138→          setMessages(msgs);
+   139→          setProcessing(false);
+   140→          setPendingConfirm(st.pendingConfirmation || null);
+   141→          handle.stop = true;
+   142→          return;
+   143→        }
+   144→      } catch { /* jaringan flaky: lanjut polling */ }
+   145→      setTimeout(tick, 1800);
+   146→    };
+   147→    setTimeout(tick, 800);
+   148→  }, [tokens.IdToken]);
+   149→
+   150→  const send = async () => {
+   151→    const msg = input.trim();
+   152→    if (!msg || processing) return;
+   153→    setInput('');
+   154→    if (taRef.current) taRef.current.style.height = 'auto';
+   155→    setMessages((m) => [...m, { role: 'user', text: msg, ts: Date.now() }]);
+   156→    setTraceEvents([]);
+   157→    setPendingConfirm(null);
+   158→    setProcessing(true);
+   159→    setShowTrace(true);
+   160→    try {
+   161→      const r = await sendChat(tokens.IdToken, msg, mode, mode === 'MANUAL' ? manualModel : undefined);
+   162→      setSessionId(r.sessionId);
+   163→      startPolling(r.sessionId);
+   164→    } catch (e) {
+   165→      setProcessing(false);
+   166→      const em = (e as Error).message;
+   167→      notify(`Pesan gagal terkirim: ${em}`, false);
+   168→      setMessages((m) => [...m, {
+   169→        role: 'assistant', ts: Date.now(), kind: 'error',
+   170→        text: `Pesan tidak dapat dikirim ke agen.\n\n> ${em}\n\nCoba lagi — jika terus gagal, periksa koneksi atau muat ulang halaman.`,
+   171→      } as ChatMessage & { kind?: string }]);
+   172→    }
+   173→  };
+   174→
+   175→  const liveStep = useMemo(() => {
+   176→    if (!processing || traceEvents.length === 0) return null;
+   177→    const e = traceEvents[traceEvents.length - 1];
+   178→    return { label: traceLabel(e.type), content: e.content };
+   179→  }, [processing, traceEvents]);
+   180→
+   181→  const groupedBySide = useMemo(() => {
+   182→    const g: Record<string, MaaModel[]> = {};
+   183→    models.forEach((m) => { (g[m.provider] = g[m.provider] || []).push(m); });
+   184→    return g;
+   185→  }, [models]);
+   186→
+   187→  const modeMeta = MODES.find((m) => m.id === mode)!;
+   188→
+   189→  /* ============================ render ============================ */
+   190→
+   191→  const ModeCards = (
+   192→    <div className="space-y-1.5">
+   193→      {MODES.map((m) => {
+   194→        const active = mode === m.id;
+   195→        return (
+   196→          <button
+   197→            key={m.id}
+   198→            onClick={() => { if (!processing) setMode(m.id); }}
+   199→            disabled={processing}
+   200→            className={`flex w-full items-center gap-3 rounded-xl border px-3 py-2.5 text-left transition-all disabled:opacity-60 ${
+   201→              active
+   202→                ? 'border-amber-400/40 bg-gradient-to-r from-amber-400/[0.12] to-transparent shadow-[0_0_20px_-6px] shadow-amber-500/30'
+   203→                : 'border-white/[0.06] bg-white/[0.02] hover:border-white/[0.14] hover:bg-white/[0.05]'}`}
+   204→          >
+   205→            <span className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-lg transition-colors ${
+   206→              active ? 'bg-amber-400/20 text-amber-300' : 'bg-white/[0.05] text-zinc-500'}`}>
+   207→              {m.icon}
+   208→            </span>
+   209→            <span className="min-w-0">
+   210→              <span className={`block text-[12.5px] font-semibold ${active ? 'text-amber-200' : 'text-zinc-300'}`}>{m.name}</span>
+   211→              <span className="block truncate text-[10.5px] text-zinc-500">{m.desc}</span>
+   212→            </span>
+   213→          </button>
+   214→        );
+   215→      })}
+   216→    </div>
+   217→  );
+   218→
+   219→  const modeName = mode === 'FAST' ? 'Kilat' : mode === 'DEEP' ? 'Dalam' : 'Manual';
+   220→
+   221→  return (
+   222→    <div className="relative flex h-dvh overflow-hidden bg-zinc-950 text-zinc-100">
+   223→      {/* background glows */}
+   224→      <div aria-hidden className="pointer-events-none absolute inset-0">
+   225→        <div className="absolute -left-40 -top-40 h-[480px] w-[480px] rounded-full bg-amber-500/[0.07] blur-[120px]" />
+   226→        <div className="absolute -bottom-40 -right-32 h-[420px] w-[420px] rounded-full bg-teal-500/[0.06] blur-[120px]" />
+   227→        <div className="absolute left-1/2 top-1/3 h-[300px] w-[600px] -translate-x-1/2 rounded-full bg-orange-500/[0.03] blur-[110px]" />
+   228→      </div>
+   229→
+   230→      {/* ============ LEFT SIDEBAR (desktop) ============ */}
+   231→      <aside className="relative z-10 hidden w-[268px] shrink-0 flex-col border-r border-white/[0.06] bg-black/20 backdrop-blur-xl lg:flex">
+   232→        <div className="flex items-center gap-2.5 px-5 pb-4 pt-5">
+   233→          <span className="flex h-9 w-9 items-center justify-center rounded-xl bg-gradient-to-br from-amber-400 to-orange-600 shadow-lg shadow-amber-500/25">
+   234→            <Bot className="h-5 w-5 text-zinc-950" />
+   235→          </span>
+   236→          <div>
+   237→            <p className="text-[14px] font-bold leading-tight tracking-tight">MAA <span className="bg-gradient-to-r from-amber-300 to-orange-400 bg-clip-text text-transparent">AWS Agent</span></p>
+   238→            <p className="text-[10px] font-medium text-zinc-500">Autonomous CloudOps · Bedrock</p>
+   239→          </div>
+   240→        </div>
+   241→
+   242→        <div className="px-4">
+   243→          <p className="mb-2 px-1 text-[10px] font-semibold uppercase tracking-widest text-zinc-600">Mode Eksekusi</p>
+   244→          {ModeCards}
+   245→        </div>
+   246→
+   247→        <div className="mt-4 px-4">
+   248→          <p className="mb-2 px-1 text-[10px] font-semibold uppercase tracking-widest text-zinc-600">Workbench</p>
+   249→          <div className="space-y-1.5">
+   250→            <button onClick={() => setShowKb(true)}
+   251→              className="flex w-full items-center gap-3 rounded-xl border border-white/[0.06] bg-white/[0.02] px-3 py-2.5 text-left transition-all hover:border-teal-400/30 hover:bg-teal-400/[0.05]">
+   252→              <span className="flex h-8 w-8 items-center justify-center rounded-lg bg-teal-400/10 text-teal-300"><Database className="h-4 w-4" /></span>
+   253→              <span><span className="block text-[12.5px] font-semibold text-zinc-300">Knowledge Base</span>
+   254→              <span className="block text-[10.5px] text-zinc-500">Dokumen &amp; sinkronisasi</span></span>
+   255→            </button>
+   256→            <button onClick={() => setShowSessions(true)}
+   257→              className="flex w-full items-center gap-3 rounded-xl border border-white/[0.06] bg-white/[0.02] px-3 py-2.5 text-left transition-all hover:border-sky-400/30 hover:bg-sky-400/[0.05]">
+   258→              <span className="flex h-8 w-8 items-center justify-center rounded-lg bg-sky-400/10 text-sky-300"><History className="h-4 w-4" /></span>
+   259→              <span><span className="block text-[12.5px] font-semibold text-zinc-300">Riwayat Sesi</span>
+   260→              <span className="block text-[10.5px] text-zinc-500">Lanjutkan percakapan</span></span>
+   261→            </button>
+   262→          </div>
+   263→        </div>
+   264→
+   265→        <div className="mt-auto p-4">
+   266→          <div className="rounded-xl border border-white/[0.06] bg-white/[0.03] p-3">
+   267→            <div className="flex items-center gap-2.5">
+   268→              <span className="flex h-8 w-8 items-center justify-center rounded-full bg-gradient-to-br from-zinc-600 to-zinc-800 text-[11px] font-bold text-zinc-200">
+   269→                {username.slice(0, 2).toUpperCase()}
+   270→              </span>
+   271→              <div className="min-w-0 flex-1">
+   272→                <p className="truncate text-[12px] font-semibold text-zinc-200">{username}</p>
+   273→                <p className="flex items-center gap-1 text-[9.5px] text-zinc-500">
+   274→                  <span className="h-1.5 w-1.5 rounded-full bg-emerald-400" /> MFA TOTP aktif · WAF on
+   275→                </p>
+   276→              </div>
+   277→              <button
+   278→                onClick={() => finishSession()}
+   279→                title="Keluar (revokes token + global signout)"
+   280→                className="rounded-lg p-1.5 text-zinc-500 transition-colors hover:bg-rose-500/10 hover:text-rose-400">
+   281→                <LogOut className="h-4 w-4" />
+   282→              </button>
+   283→            </div>
+   284→          </div>
+   285→          <p className="mt-2 px-1 text-center text-[9px] leading-relaxed text-zinc-700">
+   286→            AgentCore Runtime · KMS AES-256 · STS 5 menit
+   287→          </p>
+   288→        </div>
+   289→      </aside>
+   290→
+   291→      {/* ============ CENTER ============ */}
+   292→      <main className="relative z-10 flex min-w-0 flex-1 flex-col">
+   293→        {/* header mobile + trace toggle */}
+   294→        <header className="flex shrink-0 items-center gap-2 border-b border-white/[0.06] bg-black/20 px-3 py-2.5 backdrop-blur-xl lg:px-5">
+   295→          <button onClick={() => setShowSidebar(true)} className="rounded-lg p-2 text-zinc-400 hover:bg-white/[0.06] lg:hidden" aria-label="Menu">
+   296→            <Bot className="h-4.5 w-4.5" />
+   297→          </button>
+   298→          <div className="flex min-w-0 items-center gap-2 lg:hidden">
+   299→            <span className="text-[13px] font-bold">MAA <span className="text-amber-400">Agent</span></span>
+   300→            <span className="truncate rounded-md bg-white/[0.06] px-1.5 py-0.5 text-[9.5px] font-semibold uppercase tracking-wide text-amber-300">{modeName}</span>
+   301→          </div>
+   302→          <div className="hidden min-w-0 items-center gap-2 lg:flex">
+   303→            <CloudCog className="h-4 w-4 text-zinc-500" />
+   304→            <span className="truncate text-[12px] text-zinc-500">
+   305→              {mode === 'MANUAL' && manualModel
+   306→                ? `${PROVIDER_LABEL[models.find((m) => m.modelId === manualModel)?.provider || 'other'] || ''} · ${manualModel}`
+   307→                : modeMeta.desc}
+   308→            </span>
+   309→          </div>
+   310→          <div className="ml-auto flex items-center gap-1.5">
+   311→            {processing && (
+   312→              <span className="mr-1 flex items-center gap-1.5 rounded-full bg-amber-400/10 px-2.5 py-1 text-[10px] font-semibold text-amber-300">
+   313→                <Loader2 className="h-3 w-3 animate-spin" /> memproses
+   314→              </span>
+   315→            )}
+   316→            <button onClick={() => setShowSessions(true)} className="rounded-lg p-2 text-zinc-400 transition-colors hover:bg-white/[0.06] hover:text-zinc-200 lg:hidden" aria-label="Riwayat">
+   317→              <History className="h-4 w-4" />
+   318→            </button>
+   319→            <button onClick={() => setShowKb(true)} className="rounded-lg p-2 text-zinc-400 transition-colors hover:bg-white/[0.06] hover:text-zinc-200 lg:hidden" aria-label="KB">
+   320→              <Database className="h-4 w-4" />
+   321→            </button>
+   322→            <button
+   323→              onClick={() => setShowTrace((v) => !v)}
+   324→              className={`flex items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-[11px] font-medium transition-colors ${
+   325→                showTrace ? 'bg-amber-400/15 text-amber-300' : 'text-zinc-400 hover:bg-white/[0.06] hover:text-zinc-200'}`}
+   326→              aria-label="Live Trace">
+   327→              <PanelRightOpen className="h-4 w-4" />
+   328→              <span className="hidden sm:inline">Trace</span>
+   329→              {traceEvents.length > 0 && (
+   330→                <span className="rounded-full bg-white/[0.08] px-1.5 text-[9px] text-zinc-300">{traceEvents.length}</span>
+   331→              )}
+   332→            </button>
+   333→          </div>
+   334→        </header>
+   335→
+   336→        {/* messages */}
+   337→        <div ref={scrollRef} className="min-h-0 flex-1 overflow-y-auto nice-scroll">
+   338→          <div className="mx-auto w-full max-w-3xl px-4 py-6 lg:px-6">
+   339→            {messages.length === 0 && !processing && <EmptyState onPick={(s) => { setInput(s); taRef.current?.focus(); }} />}
+   340→
+   341→            <div className="space-y-4">
+   342→              {messages.map((m, i) => <Bubble key={i} m={m} username={username} />)}
+   343→
+   344→              {processing && <ThinkingBubble step={liveStep} modeName={modeName} />}
+   345→            </div>
+   346→          </div>
+   347→        </div>
+   348→
+   349→        {/* composer */}
+   350→        <div className="shrink-0 border-t border-white/[0.06] bg-black/20 px-3 pb-4 pt-3 backdrop-blur-xl lg:px-6">
+   351→          <div className="mx-auto w-full max-w-3xl">
+   352→            {mode === 'MANUAL' && (
+   353→              <div className="mb-2">
+   354→                <ModelPicker models={models} value={manualModel} onChange={setManualModel} disabled={processing} />
+   355→              </div>
+   356→            )}
+   357→            <div className={`flex items-end gap-2 rounded-2xl border bg-white/[0.03] p-2 transition-all focus-within:border-amber-400/40 focus-within:bg-white/[0.05] focus-within:shadow-[0_0_30px_-10px] focus-within:shadow-amber-500/40 ${
+   358→              processing ? 'border-white/[0.06] opacity-60' : 'border-white/[0.08]'}`}>
+   359→              <textarea
+   360→                ref={taRef}
+   361→                rows={1}
+   362→                value={input}
+   363→                disabled={processing}
+   364→                onChange={(e) => {
+   365→                  setInput(e.target.value);
+   366→                  const el = e.target;
+   367→                  el.style.height = 'auto';
+   368→                  el.style.height = Math.min(el.scrollHeight, 160) + 'px';
+   369→                }}
+   370→                onKeyDown={(e) => {
+   371→                  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
+   372→                }}
+   373→                placeholder={processing ? 'Agen sedang bekerja…' : `Tanya apa saja soal cloud Anda — mode ${modeName}`}
+   374→                className="max-h-40 min-h-[42px] w-full resize-none bg-transparent px-3 py-2.5 text-[14px] leading-relaxed text-zinc-100 outline-none placeholder:text-zinc-600 disabled:cursor-not-allowed"
+   375→                maxLength={6000}
+   376→              />
+   377→              <button
+   378→                onClick={send}
+   379→                disabled={processing || !input.trim()}
+   380→                className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-gradient-to-br from-amber-400 to-orange-500 text-zinc-950 shadow-lg shadow-amber-500/25 transition-all hover:from-amber-300 hover:to-orange-400 hover:shadow-amber-400/30 disabled:from-zinc-700 disabled:to-zinc-700 disabled:text-zinc-500 disabled:shadow-none"
+   381→                aria-label="Kirim">
+   382→                <SendHorizontal className="h-4.5 w-4.5" />
+   383→              </button>
+   384→            </div>
+   385→            <div className="mt-1.5 flex items-center justify-between px-1">
+   386→              <p className="text-[9.5px] text-zinc-700">
+   387→                Operasi destruktif selalu butuh konfirmasi ganda · Enter kirim, Shift+Enter baris baru
+   388→              </p>
+   389→              {input.length > 5200 && (
+   390→                <p className="text-[9.5px] text-amber-400/80">{input.length}/6000</p>
+   391→              )}
+   392→            </div>
+   393→          </div>
+   394→        </div>
+   395→      </main>
+   396→
+   397→      {/* ============ RIGHT TRACE PANEL (desktop) ============ */}
+   398→      {showTrace && (
+   399→        <aside className="relative z-10 hidden w-[340px] shrink-0 border-l border-white/[0.06] bg-black/20 backdrop-blur-xl xl:flex xl:flex-col">
+   400→          <TracePanel events={traceEvents} />
+   401→        </aside>
+   402→      )}
+   403→      {/* trace panel mobile/tablet overlay */}
+   404→      {showTrace && (
+   405→        <div className="fixed inset-0 z-[60] bg-black/60 backdrop-blur-sm xl:hidden" onClick={() => setShowTrace(false)}>
+   406→          <div className="absolute right-0 top-0 h-full w-full max-w-sm border-l border-white/[0.08] bg-zinc-950 animate-slide-in" onClick={(e) => e.stopPropagation()}>
+   407→            <TracePanel events={traceEvents} onClose={() => setShowTrace(false)} />
+   408→          </div>
+   409→        </div>
+   410→      )}
+   411→
+   412→      {/* mobile sidebar drawer */}
+   413→      {showSidebar && (
+   414→        <div className="fixed inset-0 z-[65] bg-black/60 backdrop-blur-sm lg:hidden" onClick={() => setShowSidebar(false)}>
+   415→          <aside className="absolute left-0 top-0 flex h-full w-[290px] flex-col border-r border-white/[0.08] bg-zinc-950 p-4 animate-slide-in-left" onClick={(e) => e.stopPropagation()}>
+   416→            <div className="mb-4 flex items-center justify-between">
+   417→              <span className="text-[14px] font-bold">MAA <span className="text-amber-400">Agent</span></span>
+   418→              <button onClick={() => setShowSidebar(false)} className="rounded-lg p-1.5 text-zinc-500 hover:bg-white/[0.06]"><X className="h-4 w-4" /></button>
+   419→            </div>
+   420→            {ModeCards}
+   421→            <div className="mt-3 space-y-1.5">
+   422→              <button onClick={() => { setShowSidebar(false); setShowKb(true); }} className="w-full rounded-xl border border-white/[0.06] bg-white/[0.02] px-3 py-2.5 text-left text-[12.5px] font-medium text-zinc-300">Knowledge Base</button>
+   423→              <button onClick={() => { setShowSidebar(false); setShowSessions(true); }} className="w-full rounded-xl border border-white/[0.06] bg-white/[0.02] px-3 py-2.5 text-left text-[12.5px] font-medium text-zinc-300">Riwayat Sesi</button>
+   424→            </div>
+   425→            <button onClick={() => finishSession()} className="mt-auto flex items-center gap-2 rounded-xl border border-rose-500/20 bg-rose-500/[0.06] px-3 py-2.5 text-[12.5px] font-medium text-rose-300">
+   426→              <LogOut className="h-4 w-4" /> Keluar
+   427→            </button>
+   428→          </aside>
+   429→        </div>
+   430→      )}
+   431→
+   432→      {/* overlays */}
+   433→      {pendingConfirm && sessionId && (
+   434→        <ConfirmModal
+   435→          pending={pendingConfirm}
+   436→          sessionId={sessionId}
+   437→          token={tokens.IdToken}
+   438→          onDone={async () => {
+   439→            setPendingConfirm(null);
+   440→            notify('Operasi destruktif dieksekusi setelah konfirmasi ganda');
+   441→            if (sessionId) {
+   442→              try {
+   443→                const st = await getStatus(tokens.IdToken, sessionId);
+   444→                setMessages(st.messages || []);
+   445→              } catch { /* ignore */ }
+   446→            }
+   447→          }}
+   448→          onCancel={() => { setPendingConfirm(null); notify('Konfirmasi dibatalkan — operasi tidak dijalankan'); }}
+   449→        />
+   450→      )}
+   451→      <KbDrawer token={tokens.IdToken} open={showKb} onClose={() => setShowKb(false)} notify={notify} />
+   452→      <SessionsDrawer token={tokens.IdToken} open={showSessions} onClose={() => setShowSessions(false)} onOpenSession={openSession} />
+   453→
+   454→      {/* toasts */}
+   455→      <div className="pointer-events-none fixed left-1/2 top-4 z-[90] flex w-full max-w-md -translate-x-1/2 flex-col gap-2 px-4">
+   456→        {toasts.map((t) => (
+   457→          <div key={t.id}
+   458→            className={`pointer-events-auto flex items-start gap-2.5 rounded-xl border px-4 py-3 text-[12.5px] shadow-2xl backdrop-blur-xl animate-slide-down ${
+   459→              t.ok ? 'border-emerald-500/30 bg-emerald-950/80 text-emerald-100' : 'border-rose-500/30 bg-rose-950/80 text-rose-100'}`}>
+   460→            {t.ok ? <Info className="mt-0.5 h-4 w-4 shrink-0" /> : <X className="mt-0.5 h-4 w-4 shrink-0" />}
+   461→            <span className="min-w-0 flex-1 leading-relaxed">{t.msg}</span>
+   462→          </div>
+   463→        ))}
+   464→      </div>
+   465→    </div>
+   466→  );
+   467→}
+   468→
+   469→/* ============================ sub components ============================ */
+   470→
+   471→function Bubble({ m, username }: { m: ChatMessage; username: string }) {
+   472→  const [copied, setCopied] = useState(false);
+   473→  const isUser = m.role === 'user';
+   474→  const isErr = (m as ChatMessage & { kind?: string }).kind === 'error';
+   475→
+   476→  if (isUser) {
+   477→    return (
+   478→      <div className="flex justify-end gap-2.5">
+   479→        <div className="max-w-[85%] rounded-2xl rounded-br-md bg-gradient-to-br from-amber-400/90 to-orange-500/90 px-4 py-2.5 text-[14px] leading-relaxed text-zinc-950 shadow-lg shadow-amber-950/30">
+   480→          <p className="whitespace-pre-wrap break-words font-medium">{m.text}</p>
+   481→        </div>
+   482→        <span className="mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-gradient-to-br from-zinc-600 to-zinc-800 ring-1 ring-white/10">
+   483→          <User className="h-4 w-4 text-zinc-300" />
+   484→        </span>
+   485→      </div>
+   486→    );
+   487→  }
+   488→
+   489→  return (
+   490→    <div className="flex gap-2.5">
+   491→      <span className={`mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-full ring-1 ${
+   492→        isErr ? 'bg-rose-500/15 ring-rose-500/30' : 'bg-gradient-to-br from-amber-400 to-orange-600 ring-amber-400/30'}`}>
+   493→        <Bot className={`h-4 w-4 ${isErr ? 'text-rose-300' : 'text-zinc-950'}`} />
+   494→      </span>
+   495→      <div className={`group min-w-0 max-w-[88%] rounded-2xl rounded-tl-md border px-4 py-3 ${
+   496→        isErr
+   497→          ? 'border-rose-500/25 bg-rose-950/30'
+   498→          : 'border-white/[0.07] bg-white/[0.04] shadow-lg shadow-black/20'}`}>
+   499→        <Markdown text={m.text} />
+   500→        {!isErr && (
+   501→          <div className="mt-2 flex items-center gap-2 opacity-0 transition-opacity group-hover:opacity-100">
+   502→            <button
+   503→              onClick={() => { navigator.clipboard?.writeText(m.text); setCopied(true); setTimeout(() => setCopied(false), 1500); }}
+   504→              className="text-[10px] font-medium text-zinc-500 hover:text-amber-300">
+   505→              {copied ? 'tersalin' : 'salin'}
+   506→            </button>
+   507→          </div>
+   508→        )}
+   509→      </div>
+   510→    </div>
+   511→  );
+   512→}
+   513→
+   514→function ThinkingBubble({ step, modeName }: {
+   515→  step: { label: string; content: string } | null; modeName: string;
+   516→}) {
+   517→  return (
+   518→    <div className="flex gap-2.5">
+   519→      <span className="mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-gradient-to-br from-amber-400 to-orange-600 ring-1 ring-amber-400/30">
+   520→        <Bot className="h-4 w-4 text-zinc-950" />
+   521→      </span>
+   522→      <div className="min-w-0 max-w-[88%] rounded-2xl rounded-tl-md border border-amber-400/20 bg-white/[0.03] px-4 py-3">
+   523→        <div className="flex items-center gap-2">
+   524→          <span className="flex gap-1">
+   525→            <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-amber-400 [animation-delay:0ms]" />
+   526→            <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-amber-400 [animation-delay:150ms]" />
+   527→            <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-amber-400 [animation-delay:300ms]" />
+   528→          </span>
+   529→          <span className="text-[11px] font-semibold uppercase tracking-wide text-amber-300">
+   530→            Mode {modeName} · bekerja
+   531→          </span>
+   532→        </div>
+   533→        {step && (
+   534→          <div className="mt-2 min-w-0">
+   535→            <p className="text-[10.5px] font-semibold text-zinc-400">{step.label}</p>
+   536→            <p className="mt-0.5 truncate text-[11px] text-zinc-600">{step.content}</p>
+   537→          </div>
+   538→        )}
+   539→      </div>
+   540→    </div>
+   541→  );
+   542→}
+   543→
+   544→function EmptyState({ onPick }: { onPick: (s: string) => void }) {
+   545→  return (
+   546→    <div className="flex flex-col items-center pb-4 pt-10 text-center">
+   547→      <div className="relative mb-5">
+   548→        <span className="absolute inset-0 animate-pulse-soft rounded-3xl bg-amber-400/20 blur-2xl" />
+   549→        <span className="relative flex h-16 w-16 items-center justify-center rounded-3xl bg-gradient-to-br from-amber-400 to-orange-600 shadow-2xl shadow-amber-500/30">
+   550→          <Bot className="h-8 w-8 text-zinc-950" />
+   551→        </span>
+   552→      </div>
+   553→      <h2 className="text-xl font-bold tracking-tight">
+   554→        Halo <span className="bg-gradient-to-r from-amber-300 to-orange-400 bg-clip-text text-transparent">Insinyur</span> — saya MAA
+   555→      </h2>
+   556→      <p className="mt-2 max-w-md text-[13px] leading-relaxed text-zinc-500">
+   557→        Agen otonom untuk operasi cloud AWS Anda. Saya bisa memeriksa infrastruktur, menjalankan aksi aman,
+   558→        mencari runbook di Knowledge Base, dan men-generate IaC — semua teraudit di Live Trace.
+   559→      </p>
+   560→      <div className="mt-6 grid w-full max-w-2xl gap-2 sm:grid-cols-2">
+   561→        {SUGGESTIONS.map((s) => (
+   562→          <button
+   563→            key={s}
+   564→            onClick={() => onPick(s)}
+   565→            className="group rounded-xl border border-white/[0.07] bg-white/[0.03] px-3.5 py-3 text-left text-[12px] leading-relaxed text-zinc-400 transition-all hover:-translate-y-0.5 hover:border-amber-400/30 hover:bg-amber-400/[0.05] hover:text-zinc-200"
+   566→          >
+   567→            {s}
+   568→          </button>
+   569→        ))}
+   570→      </div>
+   571→    </div>
+   572→  );
+   573→}
+   574→

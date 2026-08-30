@@ -1,0 +1,602 @@
+     1→'use client';
+     2→
+     3→import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+     4→import QRCode from 'qrcode';
+     5→import {
+     6→  CONFIG, TRACE_META, associateSoftwareToken, clearSession, completeMfaSetup, confirmDestructive,
+     7→  deleteKbDoc, getModels, getStatus, getSessions, getTrace, listKbDocs, loadSession, login,
+     8→  presignUpload, respondMfaChallenge, revokeToken, saveSession, sendChat, signOutAll, syncKb,
+     9→  verifySoftwareToken, type ChatMessage, type ChatStatus, type PendingConfirm, type Tokens, type TraceEvent,
+    10→} from '@/lib/maa';
+    11→
+    12→type View = 'login' | 'mfa_setup' | 'mfa_challenge' | 'chat';
+    13→type Mode = 'FAST' | 'DEEP' | 'MANUAL';
+    14→
+    15→export default function Home() {
+    16→  const [view, setView] = useState<View>('login');
+    17→  const [username, setUsername] = useState('');
+    18→  const [password, setPassword] = useState('');
+    19→  const [authSession, setAuthSession] = useState('');
+    20→  const [secret, setSecret] = useState('');
+    21→  const [qrData, setQrData] = useState('');
+    22→  const [code, setCode] = useState('');
+    23→  const [busy, setBusy] = useState(false);
+    24→  const [error, setError] = useState('');
+    25→  const [info, setInfo] = useState('');
+    26→
+    27→  const [tokens, setTokens] = useState<Tokens | null>(null);
+    28→
+    29→  useEffect(() => {
+    30→    const s = loadSession();
+    31→    if (s) {
+    32→      setTokens(s.tokens);
+    33→      setUsername(s.username);
+    34→      setView('chat');
+    35→    }
+    36→  }, []);
+    37→
+    38→  const doLogin = async () => {
+    39→    setBusy(true); setError(''); setInfo('');
+    40→    try {
+    41→      const r = await login(username.trim(), password);
+    42→      if (r.kind === 'tokens') {
+    43→        saveSession(username.trim(), r.tokens);
+    44→        setTokens(r.tokens);
+    45→        setView('chat');
+    46→      } else if (r.kind === 'mfa_setup') {
+    47→        // FR 1.2: pendaftaran dipaksa sebelum masuk dasbor
+    48→        setAuthSession(r.session);
+    49→        const s = await associateSoftwareToken(r.session);
+    50→        setSecret(s);
+    51→        const uri = `otpauth://totp/MAA-AWS-Agent:${encodeURIComponent(username.trim())}?secret=${s}&issuer=MAA%20AWS%20Agent&algorithm=SHA1&digits=6&period=30`;
+    52→        setQrData(await QRCode.toDataURL(uri, { width: 220, margin: 1, color: { dark: '#0c0a09', light: '#fbbf24' } }));
+    53→        setView('mfa_setup');
+    54→      } else {
+    55→        setAuthSession(r.session);
+    56→        setView('mfa_challenge');
+    57→      }
+    58→    } catch (e) {
+    59→      setError((e as Error).message);
+    60→    } finally {
+    61→      setBusy(false);
+    62→    }
+    63→  };
+    64→
+    65→  const doVerifyEnroll = async () => {
+    66→    setBusy(true); setError('');
+    67→    try {
+    68→      const ns = await verifySoftwareToken(authSession, code.trim());
+    69→      const t = await completeMfaSetup(ns, username.trim());
+    70→      saveSession(username.trim(), t);
+    71→      setTokens(t);
+    72→      setInfo('MFA TOTP berhasil didaftarkan!');
+    73→      setView('chat');
+    74→    } catch (e) {
+    75→      setError((e as Error).message);
+    76→    } finally {
+    77→      setBusy(false);
+    78→    }
+    79→  };
+    80→
+    81→  const doMfaChallenge = async () => {
+    82→    setBusy(true); setError('');
+    83→    try {
+    84→      const t = await respondMfaChallenge(authSession, username.trim(), code.trim());
+    85→      saveSession(username.trim(), t);
+    86→      setTokens(t);
+    87→      setView('chat');
+    88→    } catch (e) {
+    89→      setError((e as Error).message);
+    90→    } finally {
+    91→      setBusy(false);
+    92→    }
+    93→  };
+    94→
+    95→  if (view === 'login')
+    96→    return (
+    97→      <Shell>
+    98→        <LoginCard username={username} setUsername={setUsername} password={password} setPassword={setPassword}
+    99→          onSubmit={doLogin} busy={busy} error={error} info={info} />
+   100→      </Shell>
+   101→    );
+   102→
+   103→  if (view === 'mfa_setup')
+   104→    return (
+   105→      <Shell>
+   106→        <MfaSetupCard qrData={qrData} secret={secret} code={code} setCode={setCode}
+   107→          onVerify={doVerifyEnroll} busy={busy} error={error} />
+   108→      </Shell>
+   109→    );
+   110→
+   111→  if (view === 'mfa_challenge')
+   112→    return (
+   113→      <Shell>
+   114→        <MfaChallengeCard code={code} setCode={setCode} onSubmit={doMfaChallenge} busy={busy} error={error}
+   115→          onBack={() => setView('login')} />
+   116→      </Shell>
+   117→    );
+   118→
+   119→  return <ChatApp tokens={tokens!} username={username} onLogout={(msg) => {
+   120→    clearSession(); setTokens(null); setView('login'); setCode(''); setPassword(''); setInfo(msg || '');
+   121→  }} setErrorTop={setError} />;
+   122→}
+   123→
+   124→/* ============================ Layout kecil ============================ */
+   125→
+   126→function Shell({ children }: { children: React.ReactNode }) {
+   127→  return (
+   128→    <main className="min-h-screen bg-gradient-to-b from-stone-950 via-neutral-950 to-stone-950 text-zinc-100 flex flex-col items-center justify-center p-4">
+   129→      <div className="w-full max-w-sm">{children}</div>
+   130→      <footer className="mt-8 text-[11px] text-zinc-500 text-center">
+   131→        MAA AWS Agent • Zero-Trust • Bedrock AgentCore • Data tidak pernah keluar dari VPC Anda
+   132→      </footer>
+   133→    </main>
+   134→  );
+   135→}
+   136→
+   137→function Alert({ error, info }: { error?: string; info?: string }) {
+   138→  if (!error && !info) return null;
+   139→  return (
+   140→    <div className={`rounded-lg px-3 py-2 text-sm mb-3 ${error ? 'bg-rose-950/60 text-rose-200 border border-rose-800' : 'bg-emerald-950/60 text-emerald-200 border border-emerald-800'}`}>
+   141→      {error || info}
+   142→    </div>
+   143→  );
+   144→}
+   145→
+   146→const inputCls = 'w-full rounded-lg bg-stone-900 border border-stone-700 px-3 py-2.5 text-sm outline-none focus:border-amber-500 placeholder:text-zinc-600';
+   147→const btnCls = 'w-full rounded-lg bg-amber-500 hover:bg-amber-400 disabled:opacity-50 text-stone-950 font-semibold px-3 py-2.5 text-sm transition-colors';
+   148→
+   149→function LoginCard(p: {
+   150→  username: string; setUsername: (v: string) => void; password: string; setPassword: (v: string) => void;
+   151→  onSubmit: () => void; busy: boolean; error: string; info: string;
+   152→}) {
+   153→  return (
+   154→    <section aria-label="Login" className="bg-stone-900/70 backdrop-blur border border-stone-800 rounded-2xl p-6 shadow-2xl">
+   155→      <h1 className="text-xl font-bold text-amber-400 tracking-tight">🤖 MAA AWS Agent</h1>
+   156→      <p className="text-xs text-zinc-400 mt-1 mb-5">Insinyur cloud otonom di genggaman Anda</p>
+   157→      <Alert error={p.error} info={p.info} />
+   158→      <form className="space-y-3" onSubmit={(e) => { e.preventDefault(); p.onSubmit(); }}>
+   159→        <input className={inputCls} placeholder="Username" autoComplete="username" value={p.username}
+   160→          onChange={(e) => p.setUsername(e.target.value)} />
+   161→        <input className={inputCls} placeholder="Password" type="password" autoComplete="current-password"
+   162→          value={p.password} onChange={(e) => p.setPassword(e.target.value)} />
+   163→        <button className={btnCls} disabled={p.busy || !p.username || !p.password} type="submit">
+   164→          {p.busy ? 'Memeriksa…' : 'Masuk'}
+   165→        </button>
+   166→      </form>
+   167→    </section>
+   168→  );
+   169→}
+   170→
+   171→function MfaSetupCard(p: { qrData: string; secret: string; code: string; setCode: (v: string) => void; onVerify: () => void; busy: boolean; error: string }) {
+   172→  return (
+   173→    <section aria-label="Pendaftaran MFA" className="bg-stone-900/70 backdrop-blur border border-stone-800 rounded-2xl p-6 shadow-2xl">
+   174→      <h2 className="text-lg font-bold text-amber-400">🔐 Wajib Daftar MFA TOTP</h2>
+   175→      <p className="text-xs text-zinc-400 mt-1 mb-4">
+   176→        Akun MFA Anda belum aktif. Pindai QR dengan Google/Microsoft Authenticator, lalu masukkan 6 digit kode.
+   177→        Akses dasbor diblokir sampai pendaftaran selesai.
+   178→      </p>
+   179→      <Alert error={p.error} />
+   180→      <div className="flex flex-col items-center gap-3">
+   181→        {p.qrData && <img src={p.qrData} alt="QR MFA" width={190} height={190} className="rounded-xl" />}
+   182→        <div className="w-full">
+   183→          <p className="text-[10px] uppercase tracking-wide text-zinc-500 mb-1">Secret Key (manual entry)</p>
+   184→          <code className="block bg-stone-950 border border-stone-800 rounded-lg p-2 text-[11px] text-amber-200 break-all select-all">{p.secret}</code>
+   185→        </div>
+   186→        <input className={inputCls + ' text-center text-xl tracking-[0.4em] font-mono'} placeholder="123456" inputMode="numeric"
+   187→          maxLength={6} value={p.code} onChange={(e) => p.setCode(e.target.value.replace(/\D/g, ''))} />
+   188→        <button className={btnCls} disabled={p.busy || p.code.length !== 6} onClick={p.onVerify}>
+   189→          {p.busy ? 'Memverifikasi…' : 'Daftarkan & Masuk'}
+   190→        </button>
+   191→      </div>
+   192→    </section>
+   193→  );
+   194→}
+   195→
+   196→function MfaChallengeCard(p: { code: string; setCode: (v: string) => void; onSubmit: () => void; busy: boolean; error: string; onBack: () => void }) {
+   197→  return (
+   198→    <section aria-label="Validasi MFA" className="bg-stone-900/70 backdrop-blur border border-stone-800 rounded-2xl p-6 shadow-2xl">
+   199→      <h2 className="text-lg font-bold text-amber-400">🔑 Kode Authenticator</h2>
+   200→      <p className="text-xs text-zinc-400 mt-1 mb-4">Masukkan 6 digit kode TOTP (jendela 30 detik).</p>
+   201→      <Alert error={p.error} />
+   202→      <form className="space-y-3" onSubmit={(e) => { e.preventDefault(); p.onSubmit(); }}>
+   203→        <input className={inputCls + ' text-center text-xl tracking-[0.4em] font-mono'} placeholder="123456"
+   204→          inputMode="numeric" maxLength={6} value={p.code}
+   205→          onChange={(e) => p.setCode(e.target.value.replace(/\D/g, ''))} autoFocus />
+   206→        <button className={btnCls} disabled={p.busy || p.code.length !== 6} type="submit">
+   207→          {p.busy ? 'Memvalidasi…' : 'Verifikasi'}
+   208→        </button>
+   209→        <button type="button" className="w-full text-xs text-zinc-500 hover:text-zinc-300" onClick={p.onBack}>
+   210→          ← kembali ke login
+   211→        </button>
+   212→      </form>
+   213→    </section>
+   214→  );
+   215→}
+   216→
+   217→/* ============================ Chat App ============================ */
+   218→
+   219→function ChatApp({ tokens, username, onLogout, setErrorTop }: {
+   220→  tokens: Tokens; username: string; onLogout: (msg?: string) => void; setErrorTop: (s: string) => void;
+   221→}) {
+   222→  const [messages, setMessages] = useState<ChatMessage[]>([]);
+   223→  const [input, setInput] = useState('');
+   224→  const [mode, setMode] = useState<Mode>('FAST');
+   225→  const [manualModel, setManualModel] = useState('');
+   226→  const [models, setModels] = useState<{ modelId: string; provider: string; name: string }[]>([]);
+   227→  const [sessionId, setSessionId] = useState<string | null>(null);
+   228→  const [processing, setProcessing] = useState(false);
+   229→  const [traceEvents, setTraceEvents] = useState<TraceEvent[]>([]);
+   230→  const [showTrace, setShowTrace] = useState(false);
+   231→  const [pendingConfirm, setPendingConfirm] = useState<PendingConfirm | null>(null);
+   232→  const [typed1, setTyped1] = useState('');
+   233→  const [typed2, setTyped2] = useState('');
+   234→  const [confirmBusy, setConfirmBusy] = useState(false);
+   235→  const [confirmMsg, setConfirmMsg] = useState('');
+   236→  const [showKb, setShowKb] = useState(false);
+   237→  const [showMenu, setShowMenu] = useState(false);
+   238→  const [sessions, setSessions] = useState<{ sessionId: string; title: string; status: string; mode: string }[]>([]);
+   239→  const [kbDocs, setKbDocs] = useState<{ key: string; name: string; size: number }[]>([]);
+   240→  const [kbBusy, setKbBusy] = useState('');
+   241→  const pollRef = useRef<{ stop: boolean } | null>(null);
+   242→  const scrollRef = useRef<HTMLDivElement>(null);
+   243→  const lastActivity = useRef(Date.now());
+   244→
+   245→  const finishSession = useCallback(async (msg?: string) => {
+   246→    if (pollRef.current) pollRef.current.stop = true;
+   247→    const s = loadSession();
+   248→    if (s?.tokens?.RefreshToken) await revokeToken(s.tokens.RefreshToken);
+   249→    try { await signOutAll(tokens.IdToken); } catch { /* best effort */ }
+   250→    onLogout(msg);
+   251→  }, [tokens?.IdToken, onLogout]);
+   252→
+   253→  // ------- idle 15 menit (FR 1.4) -------
+   254→  useEffect(() => {
+   255→    const bump = () => { lastActivity.current = Date.now(); };
+   256→    const evs = ['keydown', 'touchstart', 'click', 'scroll'];
+   257→    evs.forEach((e) => window.addEventListener(e, bump, { passive: true }));
+   258→    const iv = setInterval(() => {
+   259→      if (Date.now() - lastActivity.current > CONFIG.idleTimeoutMs) {
+   260→        finishSession('Sesi hangus otomatis setelah 15 menit tidak ada aktivitas.');
+   261→      }
+   262→    }, 10_000);
+   263→    return () => { evs.forEach((e) => window.removeEventListener(e, bump)); clearInterval(iv); };
+   264→  }, [finishSession]);
+   265→
+   266→  // load models
+   267→  useEffect(() => {
+   268→    getModels(tokens.IdToken).then((r) => {
+   269→      setModels(r.models);
+   270→      if (r.models.length) setManualModel('zai.glm-5');
+   271→    }).catch(() => {});
+   272→  }, [tokens.IdToken]);
+   273→
+   274→  // open previous session
+   275→  const openSession = useCallback(async (sid: string) => {
+   276→    try {
+   277→      const s = await getStatus(tokens.IdToken, sid);
+   278→      setSessionId(sid);
+   279→      setMessages(s.messages || []);
+   280→      setTraceEvents([]);
+   281→      setPendingConfirm(s.pendingConfirmation || null);
+   282→      if (s.mode === 'DEEP' || s.mode === 'MANUAL') setMode(s.mode as Mode);
+   283→    } catch (e) { setErrorTop((e as Error).message); }
+   284→  }, [tokens.IdToken]);
+   285→
+   286→  // ------- polling -------
+   287→  const startPolling = useCallback((sid: string) => {
+   288→    const handle = { stop: false };
+   289→    pollRef.current = handle;
+   290→    let cursor = 0;
+   291→    const tick = async () => {
+   292→      if (handle.stop) return;
+   293→      try {
+   294→        const tr = await getTrace(tokens.IdToken, sid, cursor);
+   295→        if (tr.events?.length) {
+   296→          setTraceEvents((prev) => [...prev, ...tr.events]);
+   297→          cursor = Number(tr.events[tr.events.length - 1].ts) + 1;
+   298→        }
+   299→        const st = await getStatus(tokens.IdToken, sid);
+   300→        if (st.pendingConfirmation) setPendingConfirm(st.pendingConfirmation);
+   301→        if (st.status === 'done' || st.status === 'error') {
+   302→          setMessages(st.messages || []);
+   303→          setProcessing(false);
+   304→          setPendingConfirm(st.pendingConfirmation || null);
+   305→          handle.stop = true;
+   306→          return;
+   307→        }
+   308→      } catch { /* jaringan flaky: lanjut polling */ }
+   309→      setTimeout(tick, 2000);
+   310→    };
+   311→    setTimeout(tick, 900);
+   312→  }, [tokens.IdToken]);
+   313→
+   314→  const send = async () => {
+   315→    const msg = input.trim();
+   316→    if (!msg || processing) return;
+   317→    setInput('');
+   318→    setMessages((m) => [...m, { role: 'user', text: msg, ts: Date.now() }]);
+   319→    setTraceEvents([]);
+   320→    setPendingConfirm(null);
+   321→    setProcessing(true);
+   322→    setShowTrace(true);
+   323→    try {
+   324→      const r = await sendChat(tokens.IdToken, msg, mode, mode === 'MANUAL' ? manualModel : undefined);
+   325→      setSessionId(r.sessionId);
+   326→      startPolling(r.sessionId);
+   327→    } catch (e) {
+   328→      setProcessing(false);
+   329→      setErrorTop((e as Error).message);
+   330→    }
+   331→  };
+   332→
+   333→  const doConfirm = async () => {
+   334→    if (!pendingConfirm || !sessionId) return;
+   335→    setConfirmBusy(true); setConfirmMsg('');
+   336→    try {
+   337→      const r = await confirmDestructive(tokens.IdToken, sessionId, pendingConfirm.confirmToken, typed1, typed2);
+   338→      if (r.status === 'executed') {
+   339→        setPendingConfirm(null); setTyped1(''); setTyped2('');
+   340→        const st = await getStatus(tokens.IdToken, sessionId);
+   341→        setMessages(st.messages || []);
+   342→        setShowTrace(true);
+   343→      } else {
+   344→        setConfirmMsg(r.message || 'Konfirmasi gagal');
+   345→      }
+   346→    } catch (e) {
+   347→      setConfirmMsg((e as Error).message);
+   348→    } finally {
+   349→      setConfirmBusy(false);
+   350→    }
+   351→  };
+   352→
+   353→  // ------- KB -------
+   354→  const refreshKb = useCallback(async () => {
+   355→    try {
+   356→      const r = await listKbDocs(tokens.IdToken);
+   357→      setKbDocs(r.docs);
+   358→    } catch { /* ignore */ }
+   359→  }, [tokens.IdToken]);
+   360→
+   361→  const uploadDoc = async (file: File) => {
+   362→    setKbBusy('mengunggah…');
+   363→    try {
+   364→      const { uploadUrl, key } = await presignUpload(tokens.IdToken, file.name, file.type || 'application/octet-stream');
+   365→      await fetch(uploadUrl, { method: 'PUT', body: file, headers: { 'Content-Type': file.type || 'application/octet-stream' } });
+   366→      setKbBusy('sinkronisasi KB…');
+   367→      await syncKb(tokens.IdToken);
+   368→      setKbBusy('');
+   369→      await refreshKb();
+   370→      setInfo2(`Dokumen ${file.name} terunggah & KB sedang disinkronkan`);
+   371→    } catch (e) {
+   372→      setKbBusy('');
+   373→      setInfo2(`Upload gagal: ${(e as Error).message}`);
+   374→    }
+   375→  };
+   376→
+   377→  const [info2, setInfo2] = useState('');
+   378→  useEffect(() => { if (info2) { const t = setTimeout(() => setInfo2(''), 4000); return () => clearTimeout(t); } }, [info2]);
+   379→
+   380→  const openMenu = async () => {
+   381→    setShowMenu(true);
+   382→    try {
+   383→      const r = await getSessions(tokens.IdToken);
+   384→      setSessions(r.sessions);
+   385→    } catch { /* ignore */ }
+   386→  };
+   387→
+   388→  useEffect(() => { scrollRef.current?.scrollTo({ top: 999999, behavior: 'smooth' }); }, [messages.length]);
+   389→
+   390→  const groupedModels = useMemo(() => {
+   391→    const g: Record<string, typeof models> = {};
+   392→    models.forEach((m) => { (g[m.provider] = g[m.provider] || []).push(m); });
+   393→    return g;
+   394→  }, [models]);
+   395→
+   396→  return (
+   397→    <main className="h-screen bg-stone-950 text-zinc-100 flex flex-col" onKeyDown={() => { lastActivity.current = Date.now(); }}>
+   398→      {/* Header */}
+   399→      <header className="border-b border-stone-800 bg-stone-900/80 backdrop-blur px-3 py-2 flex items-center gap-2 shrink-0">
+   400→        <h1 className="font-bold text-amber-400 text-sm mr-1">🤖 MAA <span className="hidden sm:inline">AWS Agent</span></h1>
+   401→        <ModeSelector mode={mode} setMode={setMode} disabled={processing} />
+   402→        <div className="ml-auto flex items-center gap-1.5">
+   403→          {processing && <span className="h-2 w-2 rounded-full bg-amber-400 animate-pulse" aria-label="memproses" />}
+   404→          <button aria-label="Knowledge Base" onClick={() => { setShowKb(true); refreshKb(); }}
+   405→            className="h-9 px-2.5 rounded-lg bg-stone-800 hover:bg-stone-700 text-xs">📚<span className="hidden sm:inline ml-1">Dokumen</span></button>
+   406→          <button aria-label="Menu" onClick={openMenu} className="h-9 px-2.5 rounded-lg bg-stone-800 hover:bg-stone-700 text-xs">☰</button>
+   407→        </div>
+   408→      </header>
+   409→      {mode === 'MANUAL' && (
+   410→        <div className="px-3 py-1.5 bg-stone-900 border-b border-stone-800 shrink-0">
+   411→          <select value={manualModel} onChange={(e) => setManualModel(e.target.value)}
+   412→            className="w-full text-xs bg-stone-800 border border-stone-700 rounded-lg px-2 py-2">
+   413→            {Object.entries(groupedModels).map(([prov, list]) => (
+   414→              <optgroup key={prov} label={prov.toUpperCase()}>
+   415→                {list.map((m) => <option key={m.modelId} value={m.modelId}>{m.name}</option>)}
+   416→              </optgroup>
+   417→            ))}
+   418→          </select>
+   419→        </div>
+   420→      )}
+   421→      {info2 && <div className="px-3 py-1.5 text-xs bg-emerald-950/60 text-emerald-200 border-b border-emerald-900 shrink-0">{info2}</div>}
+   422→
+   423→      {/* Messages */}
+   424→      <div ref={scrollRef} className="flex-1 overflow-y-auto px-3 py-3 space-y-3">
+   425→        {messages.length === 0 && (
+   426→          <div className="text-center text-zinc-500 text-sm mt-10 space-y-2">
+   427→            <p className="text-3xl">🤖</p>
+   428→            <p className="font-medium text-zinc-300">Perintahkan AWS apa pun lewat chat.</p>
+   429→            <p className="text-xs">Contoh: &quot;Cek instance EC2&quot; • &quot;Analisis biaya 30 hari&quot; • &quot;Buatkan arsitektur + CloudFormation&quot;</p>
+   430→          </div>
+   431→        )}
+   432→        {messages.map((m, i) => (
+   433→          <div key={i} className={`flex ${m.role === 'user' ? 'justify-end' : 'justify-start'}`}>
+   434→            <div className={`max-w-[85%] rounded-2xl px-3.5 py-2.5 text-sm whitespace-pre-wrap leading-relaxed ${m.role === 'user'
+   435→              ? 'bg-amber-500 text-stone-950 rounded-br-sm' : 'bg-stone-800 border border-stone-700 rounded-bl-sm'}`}>
+   436→              {m.text}
+   437→            </div>
+   438→          </div>
+   439→        ))}
+   440→        {processing && (
+   441→          <div className="flex justify-start">
+   442→            <div className="bg-stone-800 border border-stone-700 rounded-2xl rounded-bl-sm px-4 py-3 text-sm text-zinc-400">
+   443→              <span className="inline-flex gap-1">
+   444→                <span className="h-2 w-2 rounded-full bg-amber-400 animate-bounce [animation-delay:0ms]" />
+   445→                <span className="h-2 w-2 rounded-full bg-amber-400 animate-bounce [animation-delay:150ms]" />
+   446→                <span className="h-2 w-2 rounded-full bg-amber-400 animate-bounce [animation-delay:300ms]" />
+   447→              </span>
+   448→            </div>
+   449→          </div>
+   450→        )}
+   451→      </div>
+   452→
+   453→      {/* Live Trace bar */}
+   454→      <button onClick={() => setShowTrace(true)}
+   455→        className="mx-3 mb-1 shrink-0 flex items-center justify-between rounded-xl border border-stone-800 bg-stone-900 px-3 py-2 text-xs text-zinc-400 hover:border-amber-500/50">
+   456→        <span>🧬 Live Trace {processing ? <span className="text-amber-400">• agen sedang berpikir…</span> : ''}</span>
+   457→        <span className="text-zinc-500">{traceEvents.length} event ›</span>
+   458→      </button>
+   459→
+   460→      {/* Composer */}
+   461→      <form className="p-3 pt-1 border-t border-stone-800 bg-stone-900/60 shrink-0 flex gap-2 items-end"
+   462→        onSubmit={(e) => { e.preventDefault(); send(); }}>
+   463→        <textarea value={input} onChange={(e) => setInput(e.target.value)}
+   464→          onKeyDown={(e) => { lastActivity.current = Date.now(); }}
+   465→          rows={1} placeholder="Tulis perintah AWS…" enterKeyHint="send"
+   466→          className="flex-1 resize-none max-h-28 rounded-xl bg-stone-800 border border-stone-700 px-3 py-2.5 text-sm outline-none focus:border-amber-500"
+   467→          onInput={(e) => { const t = e.target as HTMLTextAreaElement; t.style.height = 'auto'; t.style.height = Math.min(t.scrollHeight, 112) + 'px'; }} />
+   468→        <button type="submit" disabled={processing || !input.trim()} aria-label="Kirim"
+   469→          className="h-11 w-11 shrink-0 rounded-xl bg-amber-500 disabled:opacity-40 text-stone-950 font-bold text-lg hover:bg-amber-400">➤</button>
+   470→      </form>
+   471→
+   472→      {/* Live Trace Sheet */}
+   473→      {showTrace && (
+   474→        <Sheet onClose={() => setShowTrace(false)} title="🧬 Live Trace — Trajektori Agen">
+   475→          {traceEvents.length === 0 ? (
+   476→            <p className="text-xs text-zinc-500">Belum ada aktivitas pada sesi ini.</p>
+   477→          ) : (
+   478→            <ol className="space-y-2">
+   479→              {traceEvents.map((t, i) => {
+   480→                const meta = TRACE_META[t.type] || { label: t.type, icon: '•', cls: 'text-zinc-300 border-zinc-700' };
+   481→                return (
+   482→                  <li key={i} className={`rounded-xl border bg-stone-900/70 p-2.5 ${meta.cls}`}>
+   483→                    <div className="flex items-center gap-2 text-[11px] font-semibold uppercase tracking-wide">
+   484→                      <span>{meta.icon}</span>{meta.label}
+   485→                      {t.model && <span className="ml-auto text-zinc-500 normal-case font-normal">{t.model}</span>}
+   486→                    </div>
+   487→                    <pre className="mt-1 whitespace-pre-wrap break-words text-[11px] text-zinc-300 font-mono leading-relaxed">{t.content}</pre>
+   488→                  </li>
+   489→                );
+   490→              })}
+   491→            </ol>
+   492→          )}
+   493→        </Sheet>
+   494→      )}
+   495→
+   496→      {/* Confirmation modal (FR 3.5.1) */}
+   497→      {pendingConfirm && (
+   498→        <div className="fixed inset-0 z-50 bg-black/70 backdrop-blur-sm flex items-end sm:items-center justify-center p-4"
+   499→          role="dialog" aria-modal="true" aria-label="Konfirmasi operasi destruktif">
+   500→          <div className="w-full max-w-sm bg-stone-900 border border-rose-800 rounded-2xl p-5 shadow-2xl">
+   501→            <h3 className="font-bold text-rose-300 text-base">⚠️ Operasi Destruktif</h3>
+   502→            <p className="text-xs text-zinc-400 mt-1">
+   503→              {pendingConfirm.operation?.tool} → <code className="text-rose-200">{JSON.stringify(pendingConfirm.operation?.input)}</code>
+   504→            </p>
+   505→            <p className="text-xs text-zinc-400 mt-2">Ketik string konfirmasi ini <b>dua kali</b> untuk mengeksekusi:</p>
+   506→            <code className="block mt-1 bg-stone-950 border border-rose-900 rounded-lg p-2 text-center text-amber-300 font-mono text-sm select-all">{pendingConfirm.challenge}</code>
+   507→            <input className={inputCls + ' mt-3 font-mono text-sm'} placeholder="Ketik ulang (1)" value={typed1} onChange={(e) => setTyped1(e.target.value)} />
+   508→            <input className={inputCls + ' mt-2 font-mono text-sm'} placeholder="Ketik ulang (2)" value={typed2} onChange={(e) => setTyped2(e.target.value)} />
+   509→            {confirmMsg && <p className="text-xs text-rose-300 mt-2">{confirmMsg}</p>}
+   510→            <div className="flex gap-2 mt-4">
+   511→              <button className="flex-1 rounded-lg bg-stone-800 py-2.5 text-sm" onClick={() => { setPendingConfirm(null); setTyped1(''); setTyped2(''); }}>Batal</button>
+   512→              <button className="flex-1 rounded-lg bg-rose-600 hover:bg-rose-500 disabled:opacity-40 py-2.5 text-sm font-semibold"
+   513→                disabled={confirmBusy || typed1 !== pendingConfirm.challenge || typed2 !== pendingConfirm.challenge} onClick={doConfirm}>
+   514→                {confirmBusy ? 'Mengeksekusi…' : 'Konfirmasi & Hapus'}
+   515→              </button>
+   516→            </div>
+   517→          </div>
+   518→        </div>
+   519→      )}
+   520→
+   521→      {/* KB drawer */}
+   522→      {showKb && (
+   523→        <Sheet onClose={() => setShowKb(false)} title="📚 Dokumen Internal (Knowledge Base)">
+   524→          <label className="block mb-3">
+   525→            <span className={btnCls + ' block text-center cursor-pointer'}>⬆️ Upload PDF / XLSX / PNG</span>
+   526→            <input type="file" accept=".pdf,.xlsx,.xls,.png,.jpg,.jpeg,.csv,.json,.md,.txt" className="hidden"
+   527→              onChange={(e) => { const f = e.target.files?.[0]; if (f) uploadDoc(f); e.target.value = ''; }} />
+   528→          </label>
+   529→          {kbBusy && <p className="text-xs text-amber-300 mb-2">{kbBusy}</p>}
+   530→          <div className="space-y-2 max-h-72 overflow-y-auto">
+   531→            {kbDocs.map((d) => (
+   532→              <div key={d.key} className="flex items-center gap-2 rounded-xl border border-stone-800 bg-stone-900 p-2.5">
+   533→                <span className="text-sm">📄</span>
+   534→                <div className="flex-1 min-w-0">
+   535→                  <p className="text-xs font-medium truncate">{d.name}</p>
+   536→                  <p className="text-[10px] text-zinc-500">{(d.size / 1024).toFixed(1)} KB</p>
+   537→                </div>
+   538→                <button className="text-xs text-rose-400 px-2" onClick={async () => {
+   539→                  try { await deleteKbDoc(tokens.IdToken, d.key); await refreshKb(); } catch { /* */ }
+   540→                }}>hapus</button>
+   541→              </div>
+   542→            ))}
+   543→            {kbDocs.length === 0 && <p className="text-xs text-zinc-500">Belum ada dokumen.</p>}
+   544→          </div>
+   545→        </Sheet>
+   546→      )}
+   547→
+   548→      {/* Menu drawer */}
+   549→      {showMenu && (
+   550→        <Sheet onClose={() => setShowMenu(false)} title={`⚙️ ${username}`}>
+   551→          <button className={btnCls + ' mb-3'} onClick={() => finishSession('Anda telah logout.')}>Logout</button>
+   552→          <p className="text-[11px] uppercase tracking-wide text-zinc-500 mb-2">Sesi Terakhir</p>
+   553→          <div className="space-y-2 max-h-72 overflow-y-auto">
+   554→            {sessions.map((s) => (
+   555→              <button key={s.sessionId} onClick={() => { openSession(s.sessionId); setShowMenu(false); }}
+   556→                className="w-full text-left rounded-xl border border-stone-800 bg-stone-900 p-2.5 hover:border-amber-500/50">
+   557→                <p className="text-xs font-medium truncate">{s.title || s.sessionId}</p>
+   558→                <p className="text-[10px] text-zinc-500">{s.mode} • {s.status}</p>
+   559→              </button>
+   560→            ))}
+   561→            {sessions.length === 0 && <p className="text-xs text-zinc-500">Belum ada sesi.</p>}
+   562→          </div>
+   563→        </Sheet>
+   564→      )}
+   565→    </main>
+   566→  );
+   567→}
+   568→
+   569→function ModeSelector({ mode, setMode, disabled }: { mode: Mode; setMode: (m: Mode) => void; disabled: boolean }) {
+   570→  const items: { k: Mode; label: string; icon: string; hint: string }[] = [
+   571→    { k: 'FAST', label: 'FAST', icon: '⚡', hint: 'Nova Micro • murah & kilat' },
+   572→    { k: 'DEEP', label: 'DEEP', icon: '🔬', hint: 'GPT-OSS 120B • extended thinking' },
+   573→    { k: 'MANUAL', label: 'MANUAL', icon: '🛠️', hint: 'Pilih model sendiri' },
+   574→  ];
+   575→  return (
+   576→    <div role="tablist" aria-label="Mode model" className="flex bg-stone-800 rounded-lg p-0.5">
+   577→      {items.map((it) => (
+   578→        <button key={it.k} role="tab" aria-selected={mode === it.k} title={it.hint} disabled={disabled}
+   579→          onClick={() => setMode(it.k)}
+   580→          className={`px-2 sm:px-3 py-1.5 rounded-md text-[11px] font-semibold transition-colors ${mode === it.k ? 'bg-amber-500 text-stone-950' : 'text-zinc-400 hover:text-zinc-200'}`}>
+   581→          {it.icon} {it.label}
+   582→        </button>
+   583→      ))}
+   584→    </div>
+   585→  );
+   586→}
+   587→
+   588→function Sheet({ onClose, title, children }: { onClose: () => void; title: string; children: React.ReactNode }) {
+   589→  return (
+   590→    <div className="fixed inset-0 z-40 bg-black/60 backdrop-blur-sm" onClick={onClose}>
+   591→      <div className="absolute bottom-0 inset-x-0 sm:inset-x-auto sm:right-4 sm:top-16 sm:bottom-4 sm:w-96 bg-stone-900 border-t sm:border border-stone-700 rounded-t-2xl sm:rounded-2xl p-4 max-h-[75vh] overflow-y-auto"
+   592→        onClick={(e) => e.stopPropagation()}>
+   593→        <div className="flex items-center justify-between mb-3 sticky top-0 bg-stone-900 pb-2">
+   594→          <h3 className="text-sm font-bold text-zinc-200">{title}</h3>
+   595→          <button aria-label="Tutup" onClick={onClose} className="h-8 w-8 rounded-lg bg-stone-800 text-zinc-400">✕</button>
+   596→        </div>
+   597→        {children}
+   598→      </div>
+   599→    </div>
+   600→  );
+   601→}
+   602→
