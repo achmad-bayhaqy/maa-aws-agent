@@ -283,7 +283,7 @@ export const listKbDocs = (token: string) =>
   apiFetch<{ docs: { key: string; name: string; size: number; updated: string }[] }>("GET", "/kb/docs", token);
 
 export const presignUpload = (token: string, name: string, contentType: string) =>
-  apiFetch<{ uploadUrl: string; key: string }>("POST", "/kb/presign", token, { name, contentType });
+  apiFetch<{ uploadUrl: string; key: string; headers: Record<string, string> }>("POST", "/kb/presign", token, { name, contentType });
 
 export const deleteKbDoc = (token: string, key: string) =>
   apiFetch<{ deleted: boolean }>("DELETE", "/kb/docs", token, undefined, { key });
@@ -298,7 +298,7 @@ export const presignChatUpload = (
   name: string,
   contentType: string,
   size: number
-) => apiFetch<{ uploadUrl: string; key: string }>("POST", "/uploads/presign", token, { name, contentType, size });
+) => apiFetch<{ uploadUrl: string; key: string; headers: Record<string, string> }>("POST", "/uploads/presign", token, { name, contentType, size });
 
 // ----- translate EN -> ID (v3.4) -----
 

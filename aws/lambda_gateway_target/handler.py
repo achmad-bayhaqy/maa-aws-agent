@@ -24,8 +24,24 @@ UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
 
 
 def _norm(event):
-    tool = (event.get("toolName") or event.get("tool") or event.get("name") or "")
-    args = (event.get("arguments") or event.get("parameters") or event.get("input") or {})
+    # AgentCore Gateway Lambda target mengirim ARGUMEN TOOL langsung sebagai
+    # event (mis. {"query": "...", "max_results": 2}) TANPA nama tool.
+    # Nama tool ditentukan dari argumen khas schema masing-masing tool.
+    if not isinstance(event, dict):
+        return "", {}
+    mcp = event.get("mcp") if isinstance(event.get("mcp"), dict) else {}
+    mcp_params = mcp.get("params") if isinstance(mcp.get("params"), dict) else {}
+    tool = (event.get("toolName") or event.get("tool") or event.get("name")
+            or mcp.get("name") or mcp_params.get("name") or "")
+    if not tool:
+        if event.get("query"):
+            tool = "web_search"
+        elif event.get("url"):
+            tool = "web_fetch"
+    args = (event.get("arguments") or event.get("parameters") or event.get("input")
+            or mcp.get("arguments") or mcp_params.get("arguments"))
+    if not isinstance(args, dict):
+        args = {k: v for k, v in event.items() if k not in ("toolName", "tool", "name")}
     if isinstance(args, str):
         try:
             args = json.loads(args)
@@ -237,6 +253,10 @@ TOOLS = {
 
 
 def handler(event, context):
+    try:
+        print(json.dumps({"gw_event": event}, default=str)[:2400])
+    except Exception:
+        print("gw_event unprintable")
     tool, args = _norm(event if isinstance(event, dict) else {})
     fn = TOOLS.get(tool, (None, None))[0]
     print(json.dumps({"gw_event_tool": tool, "args": str(args)[:300]}))

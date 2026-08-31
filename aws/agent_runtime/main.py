@@ -274,12 +274,45 @@ def gw_ensure_session():
     return False
 
 
+def _sanitize_conv_for_synthesis(conv):
+    """Buat salinan percakapan TANPA blok toolUse/toolResult (untuk panggilan
+    Converse tanpa toolConfig): blok tool diganti ringkasan teks."""
+    out = []
+    for m in conv:
+        role = m.get("role", "user")
+        content = m.get("content", [])
+        texts, tools = [], []
+        for c in content:
+            if "text" in c:
+                texts.append(c["text"])
+            elif "toolUse" in c:
+                tu = c["toolUse"]
+                tools.append(json.dumps({"tool": tu.get("name"),
+                                         "input": tu.get("input")}, ensure_ascii=False)[:400])
+            elif "toolResult" in c:
+                tr = c["toolResult"]
+                tools.append(json.dumps({"toolResult": tr.get("content")}, ensure_ascii=False)[:2400])
+        if tools:
+            joined = "\n".join(texts + [f"[HASIL TOOL]\n{t}" for t in tools])
+            out.append({"role": "user" if role != "assistant" else "assistant",
+                        "content": [{"text": joined[:8000]}]})
+        elif texts:
+            out.append({"role": role, "content": [{"text": "\n".join(texts)}]})
+    # Converse menuntut pesan pertama role user
+    while out and out[0]["role"] != "user":
+        out.pop(0)
+    return out or [{"role": "user", "content": [{"text": "Ringkas hasil pekerjaan."}]}]
+
+
 def gw_call_tool(name, args):
     """Panggil tool via AgentCore Gateway (MCP tools/call). Return dict hasil."""
     if not GW_URL:
         raise RuntimeError("gateway belum dikonfigurasi")
     if not _gw["session_id"]:
         gw_ensure_session()
+    # Gateway memberi prefiks nama target: webtools___web_search
+    if "___" not in name:
+        name = f"webtools___{name}"
     for attempt in range(2):
         _gw["id"] += 1
         resp = _gw_post({"jsonrpc": "2.0", "id": _gw["id"], "method": "tools/call",
@@ -1224,6 +1257,14 @@ def route_model(mode, model_id):
 LOOP_LIMITS = {"AUTO": 8, "FAST": 5, "DEEP": 10, "MANUAL": 8,
                "LONG": 24, "FULLSTACK": 16, "PRESENTATION": 16}
 
+# ---- lampiran chat (v3.4) ----
+ATT_MAX_PER_FILE = 24_000        # maksimal karakter teks per file ke konteks
+ATT_TOTAL_BUDGET = 60_000        # budget total karakter semua lampiran
+IMG_FMT = {"png": "png", "jpg": "jpeg", "jpeg": "jpeg", "gif": "gif", "webp": "webp"}
+TEXT_EXTS = {"txt", "md", "csv", "json", "log", "yaml", "yml", "xml", "html",
+             "js", "ts", "tsx", "jsx", "py", "java", "go", "rs", "c", "cpp", "h",
+             "sh", "sql", "ini", "conf", "toml", "env", "tsv"}
+
 
 def call_converse(model_id, messages, inference, extra, use_cache, with_tools=True, with_guardrail=True, mode=None):
     system_text = SYSTEM_PROMPT + MODE_PROMPTS.get(mode or "", "")
@@ -1391,8 +1432,8 @@ def handle_chat(payload):
                 extra={"createdAt": rec["createdAt"]["S"] if rec else str(now_ms())})
 
     # memori jangka panjang (lintas sesi)
-    mem_block = ""
     mems = memory_recall(user_id, message)
+    mem_block = ""
     if mems:
         mem_block = "[MEMORI JANGKA PANJANG (AgentCore Memory, sesi-sesi sebelumnya)]\n" + \
                     "\n".join(f"- {m['text']}" for m in mems[:4]) + "\n[/MEMORI]\n\n"
@@ -1408,9 +1449,9 @@ def handle_chat(payload):
     # sisipkan lampiran ke pesan user TERAKHIR (teks file + blok gambar)
     if conv and conv[-1]["role"] == "user":
         base_text = conv[-1]["content"][0]["text"]
-        merged = base_text
+        merged = mem_block + base_text if mem_block else base_text
         if att_texts:
-            merged = base_text + "\n\n" + "\n\n".join(att_texts)
+            merged = merged + "\n\n" + "\n\n".join(att_texts)
         blocks = [{"text": merged}]
         if att_blocks:
             blocks.extend(att_blocks)
@@ -1466,7 +1507,31 @@ def handle_chat(payload):
             if stop == "guardrail_intervened":
                 guardrail_hit = True
                 put_trace(sid, "guardrail", "Guardrail menahan respons - coba sintesis ulang tanpa guardrail", model=model)
-                final_text = "".join(c.get("text", "") for c in out["content"] if "text" in c).strip()
+                held = "".join(c.get("text", "") for c in out["content"] if "text" in c).strip()
+                low_held = held.lower()
+                blocked_msg = ("diblokir" in low_held or "blocked" in low_held
+                               or "guardrail" in low_held)
+                if held and not blocked_msg:
+                    final_text = held
+                    break
+                # teks kosong ATAU sekadar pesan blocked -> sintesis ulang TANPA guardrail
+                try:
+                    sconv = _sanitize_conv_for_synthesis(conv)
+                    sconv.append({"role": "user", "content": [{"text":
+                        "Ringkaskan sekarang seluruh HASIL TOOL di atas menjadi jawaban final "
+                        "yang lengkap untuk pengguna. Jangan menyebut nama tool, langsung jawab."}]})
+                    syn_inf = dict(inf)
+                    syn_inf["maxTokens"] = min(int(syn_inf.get("maxTokens", 4000) or 4000), 6000)
+                    syn = call_converse(model, sconv, syn_inf, extra, False,
+                                        with_tools=False, with_guardrail=False, mode=mode)
+                    sout = syn.get("output", {}).get("message", {})
+                    cand = "".join(c.get("text", "") for c in sout.get("content", [])
+                                   if "text" in c).strip()
+                    if cand:
+                        final_text = cand
+                        put_trace(sid, "thinking", "Sintesis ulang tanpa guardrail berhasil", model=model)
+                except Exception as se:
+                    put_trace(sid, "error", f"synthesis tanpa guardrail gagal: {str(se)[:150]}", model=model)
                 if final_text:
                     break
                 continue  # beri kesempatan iterasi berikut (mode/prompt sama)
@@ -1554,18 +1619,19 @@ def handle_chat(payload):
             # ---- FINAL SYNTHESIS (v3.4): loop habis / guardrail -> paksa jawaban final ----
             put_trace(sid, "thinking", "Loop selesai tanpa teks final - paksa sintesis jawaban", model=model)
             try:
-                conv.append({"role": "user", "content": [{"text":
-                    "Waktunya berhenti bekerja. RINGKAS sekarang seluruh hasil tool di atas menjadi jawaban final yang lengkap dan bermakna untuk pengguna. JANGAN memanggil tool lagi."}]})
+                sconv = _sanitize_conv_for_synthesis(conv)
+                sconv.append({"role": "user", "content": [{"text":
+                    "Waktunya berhenti bekerja. RINGKAS sekarang seluruh hasil tool di atas menjadi "
+                    "jawaban final yang lengkap dan bermakna untuk pengguna. JANGAN memanggil tool lagi."}]})
                 syn_inf = dict(inf)
                 syn_inf["maxTokens"] = min(int(syn_inf.get("maxTokens", 4000) or 4000), 6000)
                 syn = None
                 try:
-                    syn = call_converse(model, conv, syn_inf, extra, False,
+                    syn = call_converse(model, sconv, syn_inf, extra, False,
                                         with_tools=False, with_guardrail=True, mode=mode)
                 except Exception:
-                    if GUARDRAIL_ID:
-                        syn = call_converse(model, conv, syn_inf, extra, False,
-                                            with_tools=False, with_guardrail=False, mode=mode)
+                    syn = call_converse(model, sconv, syn_inf, extra, False,
+                                        with_tools=False, with_guardrail=False, mode=mode)
                 if syn and syn.get("output", {}).get("message"):
                     sout = syn["output"]["message"]
                     final_text = "".join(c.get("text", "") for c in sout["content"] if "text" in c).strip()

@@ -27,6 +27,10 @@ lam = boto3.client("lambda", region_name=REGION, config=cfg)
 ddb_res = boto3.resource("dynamodb", region_name=REGION, config=cfg)
 sessions_tbl = ddb_res.Table(SESSIONS_TABLE)
 s3 = boto3.client("s3", region_name=REGION, config=cfg)
+# WAJIB SigV4 utk presigned URL dengan SSE-KMS (SigV2 default -> S3 tolak 400)
+s3v4 = boto3.client("s3", region_name=REGION,
+                    config=Config(signature_version="s3v4",
+                                  retries={"max_attempts": 2, "mode": "standard"}))
 cog = boto3.client("cognito-idp", region_name=REGION, config=cfg)
 wlogs = boto3.client("logs", region_name=REGION, config=cfg)
 
@@ -339,12 +343,16 @@ def handler(event, context):
             if ".." in name or name.startswith("/"):
                 return resp(400, {"error": "nama file tidak valid"})
             key = f"docs/{uuid.uuid4().hex[:8]}-{name}"
-            url = s3.generate_presigned_url(
+            url = s3v4.generate_presigned_url(
                 "put_object", Params={
                     "Bucket": KB_BUCKET, "Key": key, "ContentType": ctype,
                     "ServerSideEncryption": "aws:kms", "SSEKMSKeyId": KMS_KEY_ID},
                 ExpiresIn=600)
-            return resp(200, {"uploadUrl": url, "key": key})
+            # SigV4: header yang di-signed WAJIB dikirim client saat PUT
+            return resp(200, {"uploadUrl": url, "key": key, "headers": {
+                "Content-Type": ctype,
+                "x-amz-server-side-encryption": "aws:kms",
+                "x-amz-server-side-encryption-aws-kms-key-id": KMS_KEY_ID}})
 
         if path == "/kb/docs" and method == "DELETE":
             key = qs.get("key", "")
@@ -375,12 +383,16 @@ def handler(event, context):
             if size > 200 * 1024 * 1024:
                 return resp(400, {"error": "ukuran maksimal 200 MB per file"})
             key = f"uploads/{cl['userId']}/{uuid.uuid4().hex[:10]}-{name}"
-            url = s3.generate_presigned_url(
+            url = s3v4.generate_presigned_url(
                 "put_object", Params={
                     "Bucket": ART_BUCKET, "Key": key, "ContentType": ctype,
                     "ServerSideEncryption": "aws:kms", "SSEKMSKeyId": KMS_KEY_ID},
                 ExpiresIn=900)
-            return resp(200, {"uploadUrl": url, "key": key})
+            # SigV4: header yang di-signed WAJIB dikirim client saat PUT
+            return resp(200, {"uploadUrl": url, "key": key, "headers": {
+                "Content-Type": ctype,
+                "x-amz-server-side-encryption": "aws:kms",
+                "x-amz-server-side-encryption-aws-kms-key-id": KMS_KEY_ID}})
 
         # ---------------- translate EN -> ID (v3.4) ----------------
         if path == "/translate" and method == "POST":
@@ -390,8 +402,12 @@ def handler(event, context):
                 return resp(400, {"error": "teks kosong"})
             if len(text) > 12000:
                 return resp(400, {"error": "teks terlalu panjang (max 12000)"})
+            # runtimeSessionId AgentCore butuh >= 33 char
+            tsession = body.get("sessionId") or f"translate-{uuid.uuid4().hex}"
+            if len(tsession) < 33:
+                tsession = f"translate-{tsession}-{uuid.uuid4().hex}"[:128]
             out = invoke_runtime({"type": "translate", "text": text,
-                                  "sessionId": body.get("sessionId", "-")})
+                                  "sessionId": tsession})
             return resp(200, out)
 
         # ---------------- dokumentasi editable (v3.4, superadmin) ----------------

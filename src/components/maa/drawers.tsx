@@ -117,11 +117,11 @@ export function KbDrawer({
     }
     setBusy('Mengunggah…');
     try {
-      const { uploadUrl } = await presignUpload(token, file.name, file.type || 'application/octet-stream');
+      const { uploadUrl, headers } = await presignUpload(token, file.name, file.type || 'application/octet-stream');
       const res = await fetch(uploadUrl, {
         method: 'PUT',
         body: file,
-        headers: { 'Content-Type': file.type || 'application/octet-stream' },
+        headers: { ...(headers || {}) },
       });
       if (!res.ok) throw new Error(`S3 upload ${res.status}`);
       setBusy('Menyinkronkan indeks…');

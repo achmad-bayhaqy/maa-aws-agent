@@ -282,12 +282,15 @@ export function ChatApp({
         ]);
         void (async () => {
           try {
-            const { uploadUrl, key } = await presignChatUpload(token, file.name, contentType, file.size);
-            // PUT langsung ke S3 dengan progress via XHR
+            const { uploadUrl, key, headers } = await presignChatUpload(token, file.name, contentType, file.size);
+            // PUT langsung ke S3 dengan progress via XHR (headers wajib dari presign)
             await new Promise<void>((resolve, reject) => {
               const xhr = new XMLHttpRequest();
               xhr.open('PUT', uploadUrl);
-              xhr.setRequestHeader('Content-Type', contentType);
+              Object.entries(headers || {}).forEach(([h, v]) => xhr.setRequestHeader(h, v));
+              if (!headers || !Object.keys(headers).some((h) => h.toLowerCase() === 'content-type')) {
+                xhr.setRequestHeader('Content-Type', contentType);
+              }
               xhr.upload.onprogress = (e) => {
                 if (e.lengthComputable) {
                   const pct = Math.round((e.loaded / e.total) * 100);
