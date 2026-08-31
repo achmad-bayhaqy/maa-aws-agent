@@ -2,21 +2,29 @@
 
 import { useEffect, useRef, useState } from 'react';
 import {
-  ArrowUp, Brain, Clapperboard, Code2, Eye, EyeOff, Gauge, Loader2, Paperclip,
-  Route, SlidersHorizontal, Timer, X,
+  ArrowUp, Brain, Check, Clapperboard, Code2, Gauge, ListTodo, Loader2,
+  Paperclip, Route, SlidersHorizontal, Sparkles, Timer, Users, X, Zap,
 } from 'lucide-react';
-import type { ChatMode, MaaModel } from '@/lib/maa';
+import type { AgentMode, ChatMode, MaaModel } from '@/lib/maa';
 import { fmtBytes } from '@/lib/maa';
 import { ModelPicker } from './model-picker';
 
-const MODES: { id: ChatMode; label: string; icon: React.ReactNode; hint: string }[] = [
-  { id: 'AUTO', label: 'AUTO', icon: <Route className="h-3.5 w-3.5" />, hint: 'Model dipilih otomatis sesuai kompleksitas' },
-  { id: 'FAST', label: 'FAST', icon: <Gauge className="h-3.5 w-3.5" />, hint: 'Balasan cepat & hemat' },
-  { id: 'DEEP', label: 'DEEP', icon: <Brain className="h-3.5 w-3.5" />, hint: 'Reasoning untuk soal kompleks' },
-  { id: 'LONG', label: 'LONG', icon: <Timer className="h-3.5 w-3.5" />, hint: 'Tugas besar multi-langkah + todo list live' },
-  { id: 'FULLSTACK', label: 'FULLSTACK', icon: <Code2 className="h-3.5 w-3.5" />, hint: 'Bangun aplikasi web lengkap + preview URL' },
-  { id: 'PRESENTATION', label: 'PRESENT', icon: <Clapperboard className="h-3.5 w-3.5" />, hint: 'Susun slide deck profesional otomatis' },
-  { id: 'MANUAL', label: 'MANUAL', icon: <SlidersHorizontal className="h-3.5 w-3.5" />, hint: 'Anda pilih modelnya sendiri' },
+/** Mode pemilihan model — hanya 4 (routing model). */
+const MODES: { id: ChatMode; label: string; icon: React.ReactNode }[] = [
+  { id: 'AUTO', label: 'AUTO', icon: <Route className="h-3.5 w-3.5" /> },
+  { id: 'FAST', label: 'FAST', icon: <Gauge className="h-3.5 w-3.5" /> },
+  { id: 'DEEP', label: 'DEEP', icon: <Brain className="h-3.5 w-3.5" /> },
+  { id: 'MANUAL', label: 'MANUAL', icon: <SlidersHorizontal className="h-3.5 w-3.5" /> },
+];
+
+/** Mode tugas agent — gaya kerja, TERPISAH dari pemilihan model. */
+const AGENT_MODES: { id: AgentMode; label: string; icon: React.ReactNode; desc: string }[] = [
+  { id: 'STANDARD', label: 'Standar', icon: <Sparkles className="h-4 w-4" />, desc: 'Percakapan normal — jawaban cepat dan langsung' },
+  { id: 'LONG', label: 'Tugas Panjang', icon: <Timer className="h-4 w-4" />, desc: 'Long-running task besar multi-langkah dengan todo list live (24 iterasi)' },
+  { id: 'FULLSTACK', label: 'Full-Stack', icon: <Code2 className="h-4 w-4" />, desc: 'Bangun aplikasi web lengkap + URL preview langsung' },
+  { id: 'PRESENTATION', label: 'Presentasi', icon: <Clapperboard className="h-4 w-4" />, desc: 'Susun slide deck profesional otomatis' },
+  { id: 'TODO', label: 'Todo List', icon: <ListTodo className="h-4 w-4" />, desc: 'Rencana langkah tampil sebagai checklist live yang diperbarui agent' },
+  { id: 'MULTI', label: 'Multi-Agent', icon: <Users className="h-4 w-4" />, desc: 'Delegasi ke subagent spesialis (riset, arsitek, coder, reviewer) lalu sintesis' },
 ];
 
 const MAX_H = 5 * 24 + 16; // ±5 baris
@@ -34,6 +42,8 @@ export type PendingUpload = {
 export function Composer({
   mode,
   onModeChange,
+  agentMode,
+  onAgentModeChange,
   manualModel,
   onManualModelChange,
   models,
@@ -44,11 +54,12 @@ export function Composer({
   onRemoveUpload,
   disabled,
   busy,
-  hint,
   placeholder = 'Tanya apa saja tentang AWS Anda…',
 }: {
   mode: ChatMode;
   onModeChange: (m: ChatMode) => void;
+  agentMode: AgentMode;
+  onAgentModeChange: (m: AgentMode) => void;
   manualModel: string;
   onManualModelChange: (id: string) => void;
   models: MaaModel[];
@@ -59,13 +70,13 @@ export function Composer({
   onRemoveUpload?: (key: string) => void;
   disabled?: boolean;
   busy?: boolean;
-  hint?: string | null;
   placeholder?: string;
 }) {
   const [text, setText] = useState('');
-  const [showHints, setShowHints] = useState(false);
+  const [agentOpen, setAgentOpen] = useState(false);
   const taRef = useRef<HTMLTextAreaElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
+  const agentRef = useRef<HTMLDivElement>(null);
 
   // auto-grow
   useEffect(() => {
@@ -74,6 +85,16 @@ export function Composer({
     el.style.height = 'auto';
     el.style.height = `${Math.min(el.scrollHeight, MAX_H)}px`;
   }, [text]);
+
+  // tutup popover mode tugas saat klik di luar
+  useEffect(() => {
+    if (!agentOpen) return;
+    const onDoc = (e: MouseEvent) => {
+      if (agentRef.current && !agentRef.current.contains(e.target as Node)) setAgentOpen(false);
+    };
+    document.addEventListener('mousedown', onDoc);
+    return () => document.removeEventListener('mousedown', onDoc);
+  }, [agentOpen]);
 
   const uploadsReady = (uploads || []).filter((u) => !u.error && u.progress >= 100);
   const uploadingNow = (uploads || []).some((u) => u.progress < 100 && !u.error);
@@ -100,41 +121,35 @@ export function Composer({
     if (fileRef.current) fileRef.current.value = '';
   };
 
-  const activeMode = MODES.find((m) => m.id === mode)!;
-  const hintLine =
-    hint ||
-    (mode === 'MANUAL'
-      ? manualModel
-        ? 'Model dipilih manual — jalankan tool hanya pada model berbadge "tools"'
-        : 'Pilih model dulu untuk mode MANUAL'
-      : activeMode.hint);
+  const activeAgent = AGENT_MODES.find((m) => m.id === agentMode) || AGENT_MODES[0];
 
   return (
     <div className="w-full">
-      {/* pilihan mode */}
-      <div className="mb-2 flex flex-wrap items-center gap-1.5" role="radiogroup" aria-label="Mode agent">
-        {MODES.map((m) => {
-          const active = m.id === mode;
-          return (
-            <button
-              key={m.id}
-              type="button"
-              role="radio"
-              aria-checked={active}
-              title={m.hint}
-              disabled={disabled}
-              onClick={() => onModeChange(m.id)}
-              className={`flex h-8 items-center gap-1.5 rounded-full border px-3 text-[11.5px] font-semibold tracking-wide transition-colors disabled:opacity-50 ${
-                active
-                  ? 'border-[var(--accent)] bg-[var(--accent)] text-[var(--accent-ink)]'
-                  : 'border-[var(--line-soft)] bg-[var(--bg)] text-[var(--muted-fg)] hover:border-[var(--line)] hover:text-[var(--ink)]'
-              }`}
-            >
-              {m.icon}
-              {m.label}
-            </button>
-          );
-        })}
+      {/* baris mode: routing model + mode tugas agent */}
+      <div className="mb-2 flex flex-wrap items-center gap-1.5">
+        <div className="flex flex-wrap items-center gap-1.5" role="radiogroup" aria-label="Mode model">
+          {MODES.map((m) => {
+            const active = m.id === mode;
+            return (
+              <button
+                key={m.id}
+                type="button"
+                role="radio"
+                aria-checked={active}
+                disabled={disabled}
+                onClick={() => onModeChange(m.id)}
+                className={`flex h-8 items-center gap-1.5 rounded-full border px-3 text-[11.5px] font-semibold tracking-wide transition-colors disabled:opacity-50 ${
+                  active
+                    ? 'border-[var(--accent)] bg-[var(--accent)] text-[var(--accent-ink)]'
+                    : 'border-[var(--line-soft)] bg-[var(--bg)] text-[var(--muted-fg)] hover:border-[var(--line)] hover:text-[var(--ink)]'
+                }`}
+              >
+                {m.icon}
+                {m.label}
+              </button>
+            );
+          })}
+        </div>
 
         {mode === 'MANUAL' && (
           <ModelPicker
@@ -145,6 +160,70 @@ export function Composer({
             autoDefaults={autoDefaults}
           />
         )}
+
+        {/* mode tugas agent: dropdown ringkas ala toolbar */}
+        <div className="relative ml-auto" ref={agentRef}>
+          <button
+            type="button"
+            disabled={disabled}
+            onClick={() => setAgentOpen((v) => !v)}
+            aria-haspopup="listbox"
+            aria-expanded={agentOpen}
+            title="Mode tugas agent (gaya kerja)"
+            className={`flex h-8 items-center gap-1.5 rounded-full border px-3 text-[11.5px] font-semibold transition-colors disabled:opacity-50 ${
+              agentMode !== 'STANDARD'
+                ? 'border-[var(--accent)] text-[var(--accent)]'
+                : 'border-[var(--line-soft)] bg-[var(--bg)] text-[var(--muted-fg)] hover:border-[var(--line)] hover:text-[var(--ink)]'
+            }`}
+          >
+            <span className="inline-flex h-3.5 w-3.5 items-center justify-center">{activeAgent.icon}</span>
+            {activeAgent.label}
+            <Zap className="h-3 w-3 opacity-60" />
+          </button>
+          {agentOpen && (
+            <div
+              role="listbox"
+              aria-label="Mode tugas agent"
+              className="maa-panel absolute bottom-10 right-0 z-40 w-[290px] p-1.5 shadow-[var(--shadow-soft)]"
+            >
+              <p className="px-2.5 py-1.5 text-[10px] font-semibold uppercase tracking-widest text-[var(--muted-fg)]">
+                Mode tugas agent
+              </p>
+              {AGENT_MODES.map((m) => {
+                const active = m.id === agentMode;
+                return (
+                  <button
+                    key={m.id}
+                    type="button"
+                    role="option"
+                    aria-selected={active}
+                    onClick={() => {
+                      onAgentModeChange(m.id);
+                      setAgentOpen(false);
+                    }}
+                    className={`flex w-full items-start gap-2.5 rounded-lg px-2.5 py-2 text-left transition-colors hover:bg-[var(--muted-bg)] ${
+                      active ? 'bg-[var(--accent-soft)]' : ''
+                    }`}
+                  >
+                    <span className="mt-0.5 shrink-0" style={{ color: active ? 'var(--accent)' : 'var(--muted-fg)' }}>
+                      {m.icon}
+                    </span>
+                    <span className="min-w-0 flex-1">
+                      <span className="flex items-center gap-1.5 text-[12.5px] font-semibold text-[var(--ink)]">
+                        {m.label}
+                        {active && <Check className="h-3 w-3" style={{ color: 'var(--accent)' }} />}
+                      </span>
+                      <span className="mt-0.5 block text-[10.5px] leading-snug text-[var(--muted-fg)]">{m.desc}</span>
+                    </span>
+                  </button>
+                );
+              })}
+              <p className="mt-1 border-t border-[var(--line-soft)] px-2.5 py-1.5 text-[9.5px] leading-relaxed text-[var(--muted-fg)]">
+                Mode tugas menentukan <em>cara kerja</em> agent; pemilihan model tetap lewat AUTO/FAST/DEEP/MANUAL.
+              </p>
+            </div>
+          )}
+        </div>
       </div>
 
       {/* chips lampiran yang sedang diunggah / siap kirim */}
@@ -244,46 +323,11 @@ export function Composer({
         </button>
       </div>
 
-      <div className="mt-1.5 flex flex-wrap items-center justify-between gap-x-3 gap-y-1 px-1">
-        <p className="flex items-center gap-1.5 text-[10.5px] text-[var(--muted-fg)]">
-          {hintLine}
-          <button
-            type="button"
-            onClick={() => setShowHints((v) => !v)}
-            className="inline-flex items-center gap-0.5 rounded px-1 hover:text-[var(--ink)]"
-            aria-expanded={showHints}
-          >
-            {showHints ? <EyeOff className="h-3 w-3" /> : <Eye className="h-3 w-3" />}
-            contoh
-          </button>
-        </p>
-        <p className="hidden text-[10.5px] text-[var(--muted-fg)] sm:block">
+      <div className="mt-1.5 flex flex-wrap items-center justify-end gap-x-3 gap-y-1 px-1">
+        <p className="text-[10.5px] text-[var(--muted-fg)]">
           <kbd className="font-mono">Enter</kbd> kirim · <kbd className="font-mono">Shift+Enter</kbd> baris baru
         </p>
       </div>
-      {showHints && (
-        <div className="mt-1.5 flex flex-wrap gap-1.5 px-1">
-          {[
-            'Kamu bisa apa?',
-            'Analisis CSV ini lalu buat chart',
-            'Buatkan dashboard monitoring (FULLSTACK)',
-            'Buat deck presentasi biaya AWS (PRESENT)',
-            'Riset harga terbaru EC2 lalu rekomendasikan (LONG)',
-          ].map((s) => (
-            <button
-              key={s}
-              type="button"
-              onClick={() => {
-                setText(s);
-                taRef.current?.focus();
-              }}
-              className="rounded-full border border-[var(--line-soft)] bg-[var(--surface)] px-2.5 py-1 text-[10.5px] text-[var(--muted-fg)] transition-colors hover:border-[var(--accent)] hover:text-[var(--ink)]"
-            >
-              {s}
-            </button>
-          ))}
-        </div>
-      )}
     </div>
   );
 }

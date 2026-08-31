@@ -294,7 +294,7 @@ export default function Home() {
               <form className="space-y-3" onSubmit={(e) => { e.preventDefault(); void doLogin(); }}>
                 <label className="block">
                   <span className="mb-1.5 block text-[11px] font-semibold uppercase tracking-wider text-[var(--muted-fg)]">Email / username</span>
-                  <input className={inputCls} placeholder="architect atau nama@perusahaan.com" autoComplete="username" value={username} onChange={(e) => setUsername(e.target.value)} />
+                  <input className={inputCls} placeholder="Please input your username/email" autoComplete="username" value={username} onChange={(e) => setUsername(e.target.value)} />
                 </label>
                 <label className="block">
                   <span className="mb-1.5 block text-[11px] font-semibold uppercase tracking-wider text-[var(--muted-fg)]">Password</span>

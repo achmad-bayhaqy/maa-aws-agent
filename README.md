@@ -9,6 +9,7 @@
 
 - [Ringkasan](#-ringkasan)
 - [Akses Demo](#-akses-demo)
+- [Yang Baru di v3.4.2](#-yang-baru-di-v342)
 - [Yang Baru di v3.4](#-yang-baru-di-v34)
 - [Fitur Utama (v3)](#-fitur-utama-v3)
 - [Arsitektur](#-arsitektur)
@@ -18,6 +19,21 @@
 - [Keamanan](#-keamanan)
 - [Biaya](#-biaya)
 
+
+## 🚀 Yang Baru di v3.4.2
+
+| Perubahan | Detail |
+|---|---|
+| **Fix crash upload gambar** | Akar masalah ditemukan: runtime menyimpan metadata lampiran sebagai string JSON di DynamoDB sehingga UI crash saat render. Kini disimpan sebagai list native + sanitasi di edge + hardening renderer + error boundary (app tidak pernah mati total). |
+| **Mode model ≠ mode tugas** | Pemilihan model kembali murni **AUTO / FAST / DEEP / MANUAL**. Mode agent (Long-running, Full-Stack, Presentasi, Todo List, Multi-Agent) menjadi **mode tugas terpisah** (dropdown petir di composer) — tidak ada lagi pertukaran fungsi. |
+| **Superadmin bebas guardrail** | Guardrail konten hanya berlaku untuk level di bawah superadmin. Role dikirim aman dari Cognito claims (bukan dari klien) — superadmin bisa menanyakan apa pun. Protokol konfirmasi ganda operasi destruktif tetap berlaku untuk semua. |
+| **Tanpa info model dobel** | Chip model hanya tampil sekali di bawah jawaban terakhir (routing chip); pesan lama tetap menampilkan modelnya. |
+| **UI dibersihkan** | Tombol "contoh" & saran prompt di bawah composer dihapus; info model per mode dihapus; tombol translate per-pesan dihapus (UI sudah 100% Bahasa Indonesia). Empty state kini menampilkan **kapabilitas agent** (info terkini, browsing web, code interpreter, multi-agent, memori). |
+| **Pengetahuan terkini** | System prompt menyatakan pengetahuan selalu diperbarui sampai hari ini + instruksi wajib web_search untuk hal yang berubah-ubah + menyimpan update AWS penting ke Knowledge Base (`kb_upload_doc`/`kb_sync`). Dokumen "Kapabilitas Agent" di-seed ke KB + ingestion. |
+| **Placeholder login** | "Please input your username/email". |
+| **Best-practice claude.ai 2026** | Diadaptasi: pemisahan routing model vs gaya kerja agent (ala adaptive mode), capability-first empty state, artefak live (deck/webapp), multi-agent orchestration, todo tracking, memori lintas sesi. |
+
+Deploy satu perintah: `python3 aws/deploy_v342.py` (runtime → edge → docs+KB → Amplify).
 
 ## 🚀 Yang Baru di v3.4
 

@@ -133,14 +133,21 @@ async function apiFetch<T>(method: string, path: string, token: string, body?: u
 
 // ----- tipe inti -----
 
-export type ChatMode =
-  | "AUTO"
-  | "FAST"
-  | "DEEP"
-  | "MANUAL"
+/** Mode pemilihan model (routing) — hanya 4, sesuai kontrak v3.4.2. */
+export type ChatMode = "AUTO" | "FAST" | "DEEP" | "MANUAL";
+
+/**
+ * Mode tugas agent (gaya kerja) — TERPISAH dari pemilihan model.
+ * STANDARD = percakapan normal; lainnya memicu perilaku agent khusus
+ * (loop lebih panjang, prompt tambahan, tool khusus) di runtime.
+ */
+export type AgentMode =
+  | "STANDARD"
   | "LONG"
   | "FULLSTACK"
-  | "PRESENTATION";
+  | "PRESENTATION"
+  | "TODO"
+  | "MULTI";
 
 export type MessageVersion = { text: string; ts: number; model?: string };
 
@@ -241,6 +248,8 @@ export type AdminUser = {
 export type SendChatBody = {
   message: string;
   mode: ChatMode;
+  /** Mode tugas agent (gaya kerja) — default STANDARD. */
+  agentMode?: AgentMode;
   modelId?: string;
   sessionId?: string;
   editFrom?: number;
@@ -300,12 +309,21 @@ export const presignChatUpload = (
   size: number
 ) => apiFetch<{ uploadUrl: string; key: string; headers: Record<string, string> }>("POST", "/uploads/presign", token, { name, contentType, size });
 
-// ----- translate EN -> ID (v3.4) -----
+// ---------------- normalisasi payload (hardening tipe) ----------------
 
-export const translateText = (token: string, text: string, sessionId?: string) =>
-  apiFetch<{ status: string; translation?: string; message?: string }>(
-    "POST", "/translate", token, { text, sessionId }
-  );
+/** Pastikan nilai adalah array; parse bila string JSON (kompat data lama DDB). */
+export function asArray<T>(v: unknown): T[] {
+  if (Array.isArray(v)) return v as T[];
+  if (typeof v === "string" && v.startsWith("[")) {
+    try {
+      const p = JSON.parse(v);
+      return Array.isArray(p) ? (p as T[]) : [];
+    } catch {
+      return [];
+    }
+  }
+  return [];
+}
 
 // ----- dokumentasi editable (v3.4) -----
 

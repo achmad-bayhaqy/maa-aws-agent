@@ -3,10 +3,10 @@
 import { useMemo, useState } from 'react';
 import {
   Check, ChevronDown, ChevronLeft, ChevronRight, Clapperboard, Copy, FileText,
-  Globe, Image as ImageIcon, Languages, Loader2, Paperclip, Pencil, RefreshCcw, X,
+  Globe, Image as ImageIcon, Loader2, Paperclip, Pencil, RefreshCcw, X,
 } from 'lucide-react';
 import type { Attachment, AutoRoute, ChatMessage, MessageAtt } from '@/lib/maa';
-import { fmtBytes, fmtClock } from '@/lib/maa';
+import { asArray, fmtBytes, fmtClock } from '@/lib/maa';
 import { Markdown } from './markdown';
 
 function useCopy(notify: (msg: string) => void) {
@@ -122,18 +122,19 @@ function UserBubble({
 /* --------------------------- lampiran pesan user --------------------------- */
 
 function UserAttChips({ atts }: { atts?: MessageAtt[] }) {
-  if (!atts?.length) return null;
+  const items = asArray<MessageAtt>(atts);
+  if (!items.length) return null;
   return (
     <div className="mt-1 flex flex-wrap justify-end gap-1">
-      {atts.map((a, i) => (
+      {items.map((a, i) => (
         <span
           key={i}
           className="flex max-w-[200px] items-center gap-1 rounded-full border border-[var(--line-soft)] bg-[var(--surface)] px-2 py-0.5 text-[10px] text-[var(--muted-fg)]"
-          title={a.name}
+          title={a?.name || 'lampiran'}
         >
           <Paperclip className="h-2.5 w-2.5 shrink-0" />
-          <span className="truncate">{a.name}</span>
-          {!!a.size && <span className="shrink-0 font-mono">{fmtBytes(a.size)}</span>}
+          <span className="truncate">{a?.name || 'file'}</span>
+          {!!a?.size && <span className="shrink-0 font-mono">{fmtBytes(a.size)}</span>}
         </span>
       ))}
     </div>
@@ -143,7 +144,7 @@ function UserAttChips({ atts }: { atts?: MessageAtt[] }) {
 /* ------------------------ artefak agent (deck/webapp) ------------------------ */
 
 function ArtifactCards({ atts }: { atts?: MessageAtt[] }) {
-  const arts = (atts || []).filter((a) => a.kind === 'deck' || a.kind === 'webapp');
+  const arts = asArray<MessageAtt>(atts).filter((a) => a && (a.kind === 'deck' || a.kind === 'webapp'));
   if (!arts.length) return null;
   return (
     <div className="mt-2 flex flex-wrap gap-2">
@@ -195,50 +196,27 @@ function ArtifactCards({ atts }: { atts?: MessageAtt[] }) {
   );
 }
 
-/* ------------- bubble asisten (versioning + copy + translate + meta) ------------- */
+/* ---------------- bubble asisten (versioning + copy + meta) ---------------- */
 
 function AssistantBubble({
   msg,
   isLast,
   notify,
   routeChip,
-  onTranslate,
 }: {
   msg: ChatMessage;
   isLast: boolean;
   notify: (msg: string) => void;
   routeChip?: React.ReactNode;
-  onTranslate?: (text: string) => Promise<string>;
 }) {
   const copy = useCopy(notify);
-  const [translating, setTranslating] = useState(false);
-  const [translated, setTranslated] = useState<string | null>(null);
-  const [transOpen, setTransOpen] = useState(true);
-  const [transErr, setTransErr] = useState(false);
-
-  const doTranslate = async () => {
-    if (translated || translating || !onTranslate) return;
-    setTranslating(true);
-    setTransErr(false);
-    try {
-      const tr = await onTranslate(msg.text.slice(0, 12000));
-      setTranslated(tr);
-      setTransOpen(true);
-    } catch {
-      setTransErr(true);
-      notify('Terjemahan gagal - coba lagi');
-    } finally {
-      setTranslating(false);
-    }
-  };
-
 
   // Kandidat versi: versions[] (lama) + teks aktif (terbaru). Dedupe bila
   // server sudah memasukkan teks aktif sebagai elemen terakhir versions.
   const candidates = useMemo(() => {
-    const list: { text: string; ts: number; model?: string }[] = (msg.versions || []).map((v) => ({
-      text: v.text, ts: v.ts, model: v.model,
-    }));
+    const list: { text: string; ts: number; model?: string }[] = asArray<{ text: string; ts: number; model?: string }>(msg.versions)
+      .filter((v) => v && typeof v.text === 'string')
+      .map((v) => ({ text: v.text, ts: v.ts, model: v.model }));
     if (!list.length || list[list.length - 1].text !== msg.text) {
       list.push({ text: msg.text, ts: msg.ts, model: msg.model });
     }
@@ -255,37 +233,6 @@ function AssistantBubble({
       <div className="flex w-full max-w-[min(680px,85%)] flex-col items-start gap-1">
         <div className="w-full rounded-[10px] border border-[var(--line-soft)] bg-[var(--surface)] px-3.5 py-2.5 shadow-[var(--shadow-soft)]">
           <Markdown text={active.text} />
-          {/* hasil terjemahan EN -> ID */}
-          {translated && transOpen && (
-            <div className="mt-3 rounded-lg border border-[var(--line-soft)] bg-[var(--bg)] p-3">
-              <div className="mb-1.5 flex items-center justify-between gap-2">
-                <span className="flex items-center gap-1 text-[10px] font-semibold uppercase tracking-wider text-[var(--muted-fg)]">
-                  <Languages className="h-3 w-3" style={{ color: 'var(--accent)' }} />
-                  Terjemahan Bahasa Indonesia
-                </span>
-                <button
-                  type="button"
-                  aria-label="Tutup terjemahan"
-                  onClick={() => setTransOpen(false)}
-                  className="rounded p-0.5 text-[var(--muted-fg)] hover:bg-[var(--muted-bg)] hover:text-[var(--ink)]"
-                >
-                  <X className="h-3 w-3" />
-                </button>
-              </div>
-              <div className="text-[13.5px] leading-relaxed text-[var(--ink)]">
-                <Markdown text={translated} />
-              </div>
-            </div>
-          )}
-          {translated && !transOpen && (
-            <button
-              type="button"
-              onClick={() => setTransOpen(true)}
-              className="mt-2 flex items-center gap-1 text-[10.5px] text-[var(--muted-fg)] hover:text-[var(--ink)]"
-            >
-              <ChevronDown className="h-3 w-3" /> Tampilkan terjemahan
-            </button>
-          )}
         </div>
         <ArtifactCards atts={msg.atts} />
         <div className="flex flex-wrap items-center gap-1.5 pl-0.5 text-[10px] text-[var(--muted-fg)]">
@@ -315,11 +262,13 @@ function AssistantBubble({
               </button>
             </span>
           )}
-          {active.model && (
+          {/* chip model: hanya utk pesan LAMA — jawaban terakhir sudah
+              ditunjukkan oleh routeChip (mencegah info model dobel) */}
+          {active.model && !isLast && (
             <span className="max-w-[220px] truncate rounded-full border border-[var(--line-soft)] bg-[var(--bg)] px-1.5 py-px font-mono text-[9.5px]">
               {active.model}
             </span>
-          )}
+ )}
           <button
             type="button"
             onClick={() => copy(active.text)}
@@ -329,24 +278,6 @@ function AssistantBubble({
           >
             <Copy className="h-3 w-3" />
           </button>
-          {onTranslate && (
-            <button
-              type="button"
-              onClick={() => void doTranslate()}
-              disabled={translating}
-              aria-label="Terjemahkan ke Bahasa Indonesia"
-              title="Terjemahkan EN → ID"
-              className="flex items-center gap-0.5 rounded p-1 hover:bg-[var(--muted-bg)] hover:text-[var(--ink)] disabled:opacity-50"
-            >
-              {translating ? (
-                <Loader2 className="h-3 w-3 animate-spin" />
-              ) : (
-                <Languages className="h-3 w-3" />
-              )}
-              <span className="text-[9.5px] font-medium">EN→ID</span>
-            </button>
-          )}
-          {transErr && <span className="text-[9.5px] text-[var(--danger)]">translate gagal</span>}
         </div>
         {isLast && routeChip}
       </div>
@@ -418,7 +349,6 @@ export function MessageList({
   autoRoute,
   showSkeleton,
   onRegenerate,
-  onTranslate,
 }: {
   messages: ChatMessage[];
   processing: boolean;
@@ -429,12 +359,12 @@ export function MessageList({
   autoRoute?: AutoRoute | null;
   showSkeleton?: boolean;
   onRegenerate?: () => void;
-  onTranslate?: (text: string) => Promise<string>;
 }) {
+  const msgs = asArray<ChatMessage>(messages);
   const lastAssistant = useMemo(() => {
-    for (let i = messages.length - 1; i >= 0; i--) if (messages[i].role === 'assistant') return i;
+    for (let i = msgs.length - 1; i >= 0; i--) if (msgs[i]?.role === 'assistant') return i;
     return -1;
-  }, [messages]);
+  }, [msgs]);
 
   const routeChip = (() => {
     if (!autoRoute) return null;
@@ -452,17 +382,16 @@ export function MessageList({
 
   return (
     <div className="space-y-4">
-      {messages.map((m, i) =>
-        m.role === 'user' ? (
+      {msgs.map((m, i) =>
+        m?.role === 'user' ? (
           <UserBubble key={`${m.ts}-${i}`} msg={m} index={i} onResendEdit={onResendEdit} notify={notify} />
         ) : (
           <AssistantBubble
-            key={`${m.ts}-${i}`}
+            key={`${m?.ts}-${i}`}
             msg={m}
             isLast={i === lastAssistant}
             notify={notify}
             routeChip={i === lastAssistant ? routeChip : undefined}
-            onTranslate={onTranslate}
           />
         )
       )}

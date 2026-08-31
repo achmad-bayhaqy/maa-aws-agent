@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""MAA AWS Agent - Edge Lambda v3.4 (thin SigV4 proxy ke AgentCore Runtime).
-v3.4: upload lampiran chat (multi-file, besar), translate EN->ID, dokumentasi
-editable (superadmin, markdown), admin set-password/resend-invite, todos,
-mode LONG/FULLSTACK/PRESENTATION, mode AUTO/FAST/DEEP/MANUAL, edit+versions."""
+"""MAA AWS Agent - Edge Lambda v3.4.2 (thin SigV4 proxy ke AgentCore Runtime).
+v3.4.2: pemisahan mode MODEL (AUTO/FAST/DEEP/MANUAL) vs mode TUGAS agent
+(STANDARD/LONG/FULLSTACK/PRESENTATION/TODO/MULTI), userRole utk bypass
+guardrail superadmin, sanitasi atts (kompat data lama string JSON)."""
 import json
 import os
 import time
@@ -80,6 +80,69 @@ def is_superadmin(cl):
     return cl.get("role") == "superadmin"
 
 
+# mode model (routing) - v3.4.2: hanya 4
+MODEL_MODES = ("AUTO", "FAST", "DEEP", "MANUAL")
+# mode tugas agent (gaya kerja) - terpisah dari model
+AGENT_MODES = ("STANDARD", "LONG", "FULLSTACK", "PRESENTATION", "TODO", "MULTI")
+# kompat klien lama (v3.4): mode=LONG/FULLSTACK/PRESENTATION dipetakan ke agentMode
+LEGACY_AGENT_MODES = ("LONG", "FULLSTACK", "PRESENTATION")
+
+
+def parse_modes(body):
+    """Ekstrak (mode, agentMode) dari body klien, kompat v3.4 lama."""
+    mode = body.get("mode", "AUTO")
+    agent_mode = body.get("agentMode")
+    if mode not in MODEL_MODES:
+        if mode in LEGACY_AGENT_MODES:
+            agent_mode = agent_mode or mode
+        mode = "AUTO"
+    if agent_mode not in AGENT_MODES:
+        agent_mode = "STANDARD"
+    return mode, agent_mode
+
+
+def sanitize_messages(messages):
+    """Normalisasi pesan utk UI: atts/versions wajib array (data lama runtime
+    menyimpan atts sebagai string JSON di DDB -> crash render di klien)."""
+    out = []
+    for m in messages or []:
+        if not isinstance(m, dict):
+            continue
+        mm = dict(m)
+        for f in ("atts", "versions"):
+            v = mm.get(f)
+            if isinstance(v, str):
+                try:
+                    v = json.loads(v)
+                except Exception:
+                    v = None
+            if not isinstance(v, list):
+                v = [x for x in (v or [])] if isinstance(v, list) else None
+            if v is None and f in mm:
+                mm.pop(f)
+            elif v is not None:
+                if f == "atts":
+                    v = [_att_numeric(vv) if isinstance(vv, dict) else vv for vv in v]
+                mm[f] = v
+        mm["text"] = str(mm.get("text", "") or "")
+        out.append(mm)
+    return out
+
+
+def _att_numeric(a):
+    """Konversi field numerik atts yang terbaca Decimal/str (size, slides, files)."""
+    for k in ("size", "slides", "files"):
+        v = a.get(k)
+        if isinstance(v, str) and v.isdigit():
+            a[k] = int(v)
+        elif v is not None and not isinstance(v, (int, float)):
+            try:
+                a[k] = int(float(v))
+            except Exception:
+                a.pop(k, None)
+    return a
+
+
 def resp(code, body):
     return {"statusCode": code,
             "headers": {"Content-Type": "application/json",
@@ -122,9 +185,7 @@ def handler(event, context):
                 return resp(400, {"error": "message kosong"})
             if len(message) > 6000:
                 return resp(400, {"error": "message terlalu panjang (max 6000)"})
-            mode = body.get("mode", "AUTO")
-            if mode not in ("AUTO", "FAST", "DEEP", "MANUAL", "LONG", "FULLSTACK", "PRESENTATION"):
-                mode = "AUTO"
+            mode, agent_mode = parse_modes(body)
             # lampiran chat (v3.4): key harus di bawah uploads/{userId}/
             atts = []
             for a in (body.get("attachments") or [])[:8]:
@@ -163,7 +224,8 @@ def handler(event, context):
                                                    ":u": str(now_ms())})
                     payload = {"type": "chat", "sessionId": sid, "userId": cl["userId"],
                                "username": cl["username"], "message": message,
-                               "mode": mode, "modelId": body.get("modelId"),
+                               "mode": mode, "agentMode": agent_mode,
+                               "userRole": cl["role"], "modelId": body.get("modelId"),
                                "editFrom": int(edit_from), "attachments": atts}
                 else:
                     # PESAN LANJUTAN di sesi yang sama: tambahkan pesan user
@@ -180,7 +242,9 @@ def handler(event, context):
                                                    ":m": msgs, ":u": str(now_ms())})
                     payload = {"type": "chat", "sessionId": sid, "userId": cl["userId"],
                                "username": cl["username"], "message": message,
-                               "mode": mode, "modelId": body.get("modelId"), "attachments": atts}
+                               "mode": mode, "agentMode": agent_mode,
+                               "userRole": cl["role"], "modelId": body.get("modelId"),
+                               "attachments": atts}
             else:
                 sid = f"chat-{uuid.uuid4().hex}"
                 um = {"role": "user", "text": message, "ts": now_ms()}
@@ -197,7 +261,8 @@ def handler(event, context):
                 })
                 payload = {"type": "chat", "sessionId": sid, "userId": cl["userId"],
                            "username": cl["username"], "message": message,
-                           "mode": mode, "modelId": body.get("modelId"), "attachments": atts}
+                           "mode": mode, "agentMode": agent_mode,
+                           "userRole": cl["role"], "modelId": body.get("modelId"), "attachments": atts}
             lam.invoke(FunctionName=context.function_name,
                        InvocationType="Event",
                        Payload=json.dumps({"_async": "chat", "runtimePayload": payload,
@@ -268,7 +333,7 @@ def handler(event, context):
                               "clarify": clarify,
                               "todos": todos,
                               "title": rec.get("title"),
-                              "messages": rec.get("messages", []),
+                              "messages": sanitize_messages(rec.get("messages", [])),
                               "pendingConfirmation": pending})
 
         if path == "/chat/trace" and method == "GET":

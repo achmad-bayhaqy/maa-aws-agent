@@ -47,6 +47,10 @@ TRACE_LOG_GROUP = os.environ.get("TRACE_LOG_GROUP", "/maa/agent/trace")
 
 FAST_MODEL = "amazon.nova-micro-v1:0"
 DEEP_MODEL = "openai.gpt-oss-120b-1:0"
+VISION_MODEL = "amazon.nova-lite-v1:0"   # fallback utk lampiran gambar
+# pola modelId yang TIDAK mendukung input gambar (text-only)
+TEXT_ONLY_PAT = ("micro", "gpt-oss", "deepseek", "qwen3-coder", "qwen2.5-coder",
+                 "kimi-k2", "minimax-m2", "glm", "grok")
 
 cfg = BotoConfig(retries={"max_attempts": 3, "mode": "standard"}, read_timeout=280)
 _client_cache = {}
@@ -136,7 +140,18 @@ def _msg_ddb(m):
     if m.get("edited"):
         inner["edited"] = {"BOOL": True}
     if m.get("atts"):
-        inner["atts"] = {"S": json.dumps(m["atts"], ensure_ascii=False)[:20000]}
+        # v3.4.2: simpan sebagai LIST native (bukan string JSON) agar
+        # DocumentClient di edge membacanya kembali sebagai array —
+        # akar bug crash UI saat upload gambar telah diperbaiki.
+        inner["atts"] = {"L": [{"M": {
+            "name": {"S": str(a.get("name", ""))[:160]},
+            "kind": {"S": str(a.get("kind", "file"))[:32]},
+            **({"key": {"S": str(a["key"])[:400]}} if a.get("key") else {}),
+            **({"url": {"S": str(a["url"])[:1500]}} if a.get("url") else {}),
+            **({"size": {"N": str(int(a["size"]))}} if str(a.get("size", "")).strip().lstrip("-").isdigit() else {}),
+            **({"slides": {"N": str(int(a["slides"]))}} if str(a.get("slides", "")).strip().lstrip("-").isdigit() else {}),
+            **({"files": {"N": str(int(a["files"]))}} if str(a.get("files", "")).strip().lstrip("-").isdigit() else {}),
+        }} for a in m["atts"] if isinstance(a, dict)][:12]}
     if m.get("versions"):
         inner["versions"] = {"L": [{"M": {"text": {"S": v["text"][:12000]},
                                           "ts": {"N": str(v.get("ts", now_ms()))},
@@ -152,8 +167,22 @@ def _ddb_msg(m):
     if m["M"].get("edited", {}).get("BOOL"):
         out["edited"] = True
     if "atts" in m["M"]:
+        att = m["M"]["atts"]
         try:
-            out["atts"] = json.loads(m["M"]["atts"]["S"])
+            if "S" in att:  # format lama (string JSON)
+                out["atts"] = json.loads(att["S"])
+            elif "L" in att:  # format v3.4.2 (list native)
+                out["atts"] = []
+                for it in att["L"]:
+                    mm = it.get("M", {})
+                    rec_ = {k: (v.get("S") or v.get("N", "")) for k, v in mm.items() if isinstance(v, dict)}
+                    if rec_.get("size", "").isdigit():
+                        rec_["size"] = int(rec_["size"])
+                    if rec_.get("slides", "").isdigit():
+                        rec_["slides"] = int(rec_["slides"])
+                    if rec_.get("files", "").isdigit():
+                        rec_["files"] = int(rec_["files"])
+                    out["atts"].append(rec_)
         except Exception:
             pass
     if "versions" in m["M"]:
@@ -1155,6 +1184,12 @@ IDENTITAS & TUGAS
 - Anda merancang, mendeploy, memantau, mendiagnosis, mengoptimalkan biaya, dan menghancurkan infrastruktur AWS via perintah bahasa alami.
 - Jawab SELALU dalam bahasa yang dipakai pengguna (default: Bahasa Indonesia). Ringkas, profesional, penuh data nyata — jangan berteori kalau bisa memanggil tool.
 
+PENGETAHUAN & KAPABILITAS (WAJIB dipahami)
+- Pengetahuan dasar Anda dimutakhirkan sampai HARI INI. Untuk hal yang bisa berubah (harga, versi, rilis, berita, kondisi terkini) JANGAN bilang "tidak tahu / cutoff" — panggil web_search, lalu web_fetch bila perlu membaca halamannya. Jawaban Anda dianggap terkini oleh pengguna.
+- Kapabilitas Anda: browsing web real-time (web_search + web_fetch), code interpreter (Python/matplotlib untuk analisis data & chart), generate gambar (Nova Canvas), memori jangka panjang lintas sesi (AgentCore Memory), multi-agent (subagent_run: researcher/analyst/architect/coder/reviewer/ops), todo list live (task_plan), membuat deck presentasi (generate_presentation) dan web app (deploy_web_app), serta operasi penuh AWS: EC2, EKS, RDS, S3, VPC, Lambda, DynamoDB, CloudWatch, Cost Explorer, CloudFormation.
+- Bila pengguna bertanya "kamu bisa apa" atau meminta daftar kemampuan: jawab ringkas dengan daftar kapabilitas di atas (bahasa pengguna) — JANGAN menolak atau bertanya balik.
+- Bila Anda menemukan update AWS penting (resource/service baru, perubahan harga, deprecation), simpan ringkasannya ke Knowledge Base via kb_upload_doc lalu kb_sync agar pengetahuan internal tim selalu mutakhir.
+
 DISIPLIN TOOL
 - Status/monitoring/list: aws_list_resources atau aws_get_metrics — jangan menebak.
 - Prosedur internal/kebijakan korporat/best practice engineering: kb_search DULU.
@@ -1204,11 +1239,13 @@ FORMAT RESPONS
 - Sertakan gambar dengan markdown ![alt](url) bila generate_image/code_interpreter menghasilkan gambar."""
 
 
-# addendum prompt per mode khusus (v3.4)
+# addendum prompt per mode TUGAS agent (v3.4.2 — terpisah dari mode model)
 MODE_PROMPTS = {
     "LONG": "\n\nMODE LONG-RUNNING TASK: Pengguna memberi pekerjaan besar/berdurasi panjang. Bekerja sistematis: task_plan dulu, eksekusi bertahap dengan tool, self-healing bila gagal, perbarui todo setiap kemajuan, lalu laporkan hasil akhir lengkap + langkah lanjutan.",
     "FULLSTACK": "\n\nMODE FULL-STACK: Pengguna ingin aplikasi dibangun. Rancang arsitektur singkat, tulis aplikasi web lengkap (SPA self-contained: HTML+CSS+JS inline, desain modern, responsif, data realistis), uji logika via code_interpreter bila perlu, lalu deploy_web_app. Sertakan URL preview dan daftar fitur di jawaban.",
     "PRESENTATION": "\n\nMODE PRESENTATION: Pengguna ingin materi presentasi. Susun deck 5-12 slide dengan struktur naratif (konteks -> isi -> data -> rekomendasi), bullet ringkas per slide, lalu panggil generate_presentation. Deck tampil otomatis di chat; ringkas isi deck di jawaban.",
+    "TODO": "\n\nMODE TODO LIST: Pecah permintaan pengguna menjadi langkah-langkah jelas dan panggil task_plan PERTAMA. Kerjakan langkah demi langkah, update status tiap langkah (in_progress -> completed), dan tampilkan progres akhir.",
+    "MULTI": "\n\nMODE MULTI-AGENT: Wajib delegasikan pekerjaan via subagent_run ke 2-4 peran spesialis yang relevan (researcher/analyst/architect/coder/reviewer/ops), jalankan bertahap, lalu SINTESIS temuan semua subagent menjadi satu jawaban final yang kohesif. Sebutkan singkat peran mana yang berkontribusi.",
 }
 
 
@@ -1232,30 +1269,27 @@ def route_auto(message, history_len=0):
     return FAST_MODEL, "pertanyaan ringkas/operasional - nova micro cukup + prompt caching hemat"
 
 
-def route_model(mode, model_id):
-    """Return (model_id, inference_cfg, extra_fields, use_cache)."""
-    if mode == "FAST":
+def route_model(mode, model_id, agent_mode="STANDARD"):
+    """Return (model_id, inference_cfg, extra_fields, use_cache).
+    mode = routing model (AUTO/FAST/DEEP/MANUAL); agent_mode hanya memengaruhi
+    budget token utk pekerjaan berat."""
+    heavy = agent_mode != "STANDARD"
+    if mode == "FAST" and not heavy:
         return FAST_MODEL, {"maxTokens": 900, "temperature": 0.2, "topP": 0.9}, None, True
-    if mode == "DEEP":
-        return DEEP_MODEL, {"maxTokens": 9000, "temperature": 0.3, "topP": 0.9}, \
-            {"reasoning_effort": "high"}, False
-    if mode == "LONG":
-        return DEEP_MODEL, {"maxTokens": 16000, "temperature": 0.3, "topP": 0.9}, \
-            {"reasoning_effort": "high"}, False
-    if mode in ("FULLSTACK", "PRESENTATION"):
-        return DEEP_MODEL, {"maxTokens": 12000, "temperature": 0.35, "topP": 0.9}, \
+    if mode == "DEEP" or (mode == "FAST" and heavy):
+        return DEEP_MODEL, {"maxTokens": 9000 if not heavy else 12000, "temperature": 0.3, "topP": 0.9}, \
             {"reasoning_effort": "high"}, False
     if mode == "MANUAL":
         mid = model_id or FAST_MODEL
         meta = model_meta(mid) or {}
         extra = {"reasoning_effort": "high"} if meta.get("reasoning") and "gpt-oss" in mid else None
-        return mid, {"maxTokens": 6000, "temperature": 0.4, "topP": 0.9}, extra, \
+        return mid, {"maxTokens": 12000 if heavy else 6000, "temperature": 0.4, "topP": 0.9}, extra, \
             bool(meta.get("cacheSupported"))
     return FAST_MODEL, {"maxTokens": 900, "temperature": 0.2, "topP": 0.9}, None, True
 
 
-LOOP_LIMITS = {"AUTO": 8, "FAST": 5, "DEEP": 10, "MANUAL": 8,
-               "LONG": 24, "FULLSTACK": 16, "PRESENTATION": 16}
+# LOOP_LIMITS kini berdasarkan mode TUGAS agent (bukan mode model)
+LOOP_LIMITS = {"STANDARD": 8, "LONG": 24, "FULLSTACK": 16, "PRESENTATION": 16, "TODO": 10, "MULTI": 14}
 
 # ---- lampiran chat (v3.4) ----
 ATT_MAX_PER_FILE = 24_000        # maksimal karakter teks per file ke konteks
@@ -1266,8 +1300,8 @@ TEXT_EXTS = {"txt", "md", "csv", "json", "log", "yaml", "yml", "xml", "html",
              "sh", "sql", "ini", "conf", "toml", "env", "tsv"}
 
 
-def call_converse(model_id, messages, inference, extra, use_cache, with_tools=True, with_guardrail=True, mode=None):
-    system_text = SYSTEM_PROMPT + MODE_PROMPTS.get(mode or "", "")
+def call_converse(model_id, messages, inference, extra, use_cache, with_tools=True, with_guardrail=True, agent_mode="STANDARD"):
+    system_text = SYSTEM_PROMPT + MODE_PROMPTS.get(agent_mode or "", "")
     system = [{"text": system_text}]
     if use_cache:
         system.append({"cachePoint": {"type": "default"}})
@@ -1372,8 +1406,14 @@ def handle_chat(payload):
     username = payload.get("username", "user")
     message = payload["message"].strip()
     mode = payload.get("mode", "AUTO")
-    if mode not in ("AUTO", "FAST", "DEEP", "MANUAL", "LONG", "FULLSTACK", "PRESENTATION"):
+    if mode not in ("AUTO", "FAST", "DEEP", "MANUAL"):
         mode = "AUTO"
+    # v3.4.2: mode tugas agent terpisah dari mode model
+    agent_mode = payload.get("agentMode", "STANDARD")
+    if agent_mode not in ("STANDARD", "LONG", "FULLSTACK", "PRESENTATION", "TODO", "MULTI"):
+        agent_mode = "STANDARD"
+    # v3.4.2: guardrail hanya utk level di bawah superadmin
+    guardrail_bypass = str(payload.get("userRole", "user")).lower() == "superadmin"
     model_id = payload.get("modelId")
     edit_from = payload.get("editFrom")
     raw_attachments = payload.get("attachments") or []
@@ -1462,17 +1502,38 @@ def handle_chat(payload):
         model, reason = route_auto(message, len(messages_db))
         auto_route = {"chosen": "DEEP" if model == DEEP_MODEL else "FAST", "model": model, "reason": reason}
         mode_eff = auto_route["chosen"]
-        inf, extra, cache = route_model(mode_eff, model)[1], route_model(mode_eff, model)[2], route_model(mode_eff, model)[3]
+        if agent_mode != "STANDARD" and model == FAST_MODEL:
+            # pekerjaan agent berat butuh reasoning: naikkan ke model DEEP
+            model = DEEP_MODEL
+            auto_route["chosen"] = "DEEP"
+            auto_route["model"] = model
+            auto_route["reason"] = f"mode tugas {agent_mode} butuh reasoning: " + reason
+        rm = route_model(mode_eff if model == FAST_MODEL else "DEEP", model, agent_mode)
+        inf, extra, cache = rm[1], rm[2], rm[3]
     else:
-        model, inf, extra, cache = route_model(mode, model_id)
+        model, inf, extra, cache = route_model(mode, model_id, agent_mode)
         if mode == "MANUAL":
             meta = model_meta(model) or {}
             if not meta.get("toolCompatible"):
                 put_trace(sid, "thinking", f"Model {model} tanpa tool support - mode teks-only", model=model)
 
-    put_trace(sid, "thinking", f"Mode {mode} -> model {model}"
+    put_trace(sid, "thinking", f"Mode {mode}" + (f" · tugas {agent_mode}" if agent_mode != "STANDARD" else "")
+              + f" -> model {model}"
               + (f" ({extra['reasoning_effort']})" if extra and isinstance(extra, dict) and "reasoning_effort" in (extra or {}) else "")
               + (" | prompt caching ON" if cache else ""), model=model)
+    if guardrail_bypass:
+        put_trace(sid, "guardrail", "Guardrail DILEWATI - pengguna superadmin (kebijakan: guardrail hanya utk level di bawahnya)")
+
+    # v3.4.2: lampiran gambar butuh model vision — text-only otomatis dialihkan
+    if att_blocks and any("image" in b for b in att_blocks) and \
+            any(p in (model or "").lower() for p in TEXT_ONLY_PAT):
+        put_trace(sid, "thinking", f"Model {model} text-only + ada gambar -> alihkan ke {VISION_MODEL}", model=model)
+        model = VISION_MODEL
+        rm2 = route_model("FAST" if agent_mode == "STANDARD" else "DEEP", model, agent_mode)
+        inf, extra, cache = rm2[1], rm2[2], rm2[3]
+        if auto_route:
+            auto_route.update(chosen="VISION", model=model,
+                              reason="lampiran gambar butuh model vision (nova-lite)")
 
     used_model = model
     final_text = ""
@@ -1480,18 +1541,29 @@ def handle_chat(payload):
     tools_disabled = False
     guardrail_hit = False
     try:
-        max_iter = LOOP_LIMITS.get(mode, 8)
+        max_iter = LOOP_LIMITS.get(agent_mode, 8)
         for iteration in range(max_iter):
             with_tools = not tools_disabled
             try:
-                resp = call_converse(model, conv, inf, extra, cache, with_tools=with_tools, mode=mode)
+                resp = call_converse(model, conv, inf, extra, cache, with_tools=with_tools,
+                                     with_guardrail=not guardrail_bypass, agent_mode=agent_mode)
             except Exception as e:
                 emsg = str(e)
                 if with_tools and ("toolConfig" in emsg or "tool" in emsg.lower()
                                    or "ValidationException" in type(e).__name__):
                     put_trace(sid, "error", f"Model tak mendukung tools: {emsg[:200]} - retry teks-only", model=model)
                     tools_disabled = True
-                    resp = call_converse(model, conv, inf, extra, cache, with_tools=False, mode=mode)
+                    resp = call_converse(model, conv, inf, extra, cache, with_tools=False,
+                                         with_guardrail=not guardrail_bypass, agent_mode=agent_mode)
+                elif "image" in emsg.lower() or "gambar" in emsg.lower():
+                    # v3.4.2: model ternyata tak support gambar -> fallback vision sekali
+                    put_trace(sid, "error", f"{model} tak support gambar -> fallback {VISION_MODEL}", model=model)
+                    model = VISION_MODEL
+                    used_model = model
+                    rm3 = route_model("FAST" if agent_mode == "STANDARD" else "DEEP", model, agent_mode)
+                    inf, extra, cache = rm3[1], rm3[2], rm3[3]
+                    resp = call_converse(model, conv, inf, extra, cache, with_tools=with_tools,
+                                         with_guardrail=not guardrail_bypass, agent_mode=agent_mode)
                 else:
                     raise
             stop = resp["stopReason"]
@@ -1523,7 +1595,7 @@ def handle_chat(payload):
                     syn_inf = dict(inf)
                     syn_inf["maxTokens"] = min(int(syn_inf.get("maxTokens", 4000) or 4000), 6000)
                     syn = call_converse(model, sconv, syn_inf, extra, False,
-                                        with_tools=False, with_guardrail=False, mode=mode)
+                                        with_tools=False, with_guardrail=False, agent_mode=agent_mode)
                     sout = syn.get("output", {}).get("message", {})
                     cand = "".join(c.get("text", "") for c in sout.get("content", [])
                                    if "text" in c).strip()
@@ -1613,6 +1685,9 @@ def handle_chat(payload):
                     put_trace(sid, "thinking", f"[cot] {chunk[:700]}", model=model)
                 final_text = re.sub(r"<thinking>.*?</thinking>", "", final_text, flags=re.S).strip()
                 final_text = re.sub(r"</?response>", "", final_text).strip()
+            # v3.4.2: buang tag <thinking> liar (tanpa pasangan) agar tak tampil di UI
+            if "<thinking>" in final_text or "</thinking>" in final_text:
+                final_text = re.sub(r"</?thinking>", "", final_text).strip()
             break
 
         if not final_text:
@@ -1628,15 +1703,18 @@ def handle_chat(payload):
                 syn = None
                 try:
                     syn = call_converse(model, sconv, syn_inf, extra, False,
-                                        with_tools=False, with_guardrail=True, mode=mode)
+                                        with_tools=False, with_guardrail=not guardrail_bypass, agent_mode=agent_mode)
                 except Exception:
                     syn = call_converse(model, sconv, syn_inf, extra, False,
-                                        with_tools=False, with_guardrail=False, mode=mode)
+                                        with_tools=False, with_guardrail=False, agent_mode=agent_mode)
                 if syn and syn.get("output", {}).get("message"):
                     sout = syn["output"]["message"]
                     final_text = "".join(c.get("text", "") for c in sout["content"] if "text" in c).strip()
             except Exception as se:
                 put_trace(sid, "error", f"synthesis gagal: {str(se)[:200]}", model=model)
+            # v3.4.2: bersihkan tag thinking/response liar dari hasil synthesis
+            final_text = re.sub(r"<thinking>.*?</thinking>", "", final_text, flags=re.S).strip()
+            final_text = re.sub(r"</?thinking>|</?response>", "", final_text).strip()
             if not final_text:
                 if guardrail_hit:
                     final_text = ("Respons ditahan oleh Guardrail keamanan. Coba rumuskan permintaan secara berbeda; "

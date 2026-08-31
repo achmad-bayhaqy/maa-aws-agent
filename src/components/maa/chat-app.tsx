@@ -2,8 +2,8 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
-  Activity, ChevronDown, LogOut, Menu, MessageSquarePlus, PanelRightClose,
-  PanelRightOpen, RefreshCcw, ShieldCheck, Sparkles, X,
+  Activity, Boxes, ChevronDown, Clapperboard, Globe, History, LogOut, Menu, MessageSquarePlus,
+  PanelRightClose, PanelRightOpen, RefreshCcw, ShieldCheck, TerminalSquare, Users, X,
 } from 'lucide-react';
 import {
   DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuLabel,
@@ -14,8 +14,8 @@ import { useToast } from '@/hooks/use-toast';
 import {
   CONFIG, deleteSession, getModels, getStatus, getSessions, getTrace, loadLastSession,
   presignChatUpload, revokeToken, saveLastSession, sendChat, sessionIdFromPath, signOutAll,
-  stripClarifyBlock, translateText, type Attachment, type AutoRoute, type ChatMessage,
-  type ChatMode, type ChatStatus, type MeInfo, type MaaModel, type SessionRow,
+  stripClarifyBlock, asArray, type Attachment, type AgentMode, type AutoRoute, type ChatMessage,
+  type ChatMode, type ChatStatus, type MeInfo, type MessageAtt, type MaaModel, type SessionRow,
   type Tokens, type TodoItem, type TraceEvent,
 } from '@/lib/maa';
 import { Logo, LogoWordmark } from './logo';
@@ -29,13 +29,35 @@ import { AdminDrawer, DocsDrawer, KbDrawer } from './drawers';
 import { ThemeDialog, ThemeSwitcher } from './theme-switcher';
 import { initTheme, type MaaTheme } from './theme';
 
-const SUGGESTIONS = ['List EC2', 'Analisis biaya 30 hari', 'Buat VPC bernama staging', 'Apa runbook insiden database?'];
+const SUGGESTIONS: { text: string; icon: 'globe' | 'code' | 'users' | 'aws' | 'deck' | 'memory' }[] = [
+  { text: 'Informasi selalu terkini — browsing web real-time', icon: 'globe' },
+  { text: 'Code Interpreter — analisis data, chart, Python', icon: 'code' },
+  { text: 'Multi-agent + todo list live untuk tugas besar', icon: 'users' },
+  { text: 'Operasi AWS penuh: EC2 · EKS · RDS · S3 · VPC', icon: 'aws' },
+  { text: 'Deck presentasi & web app otomatis', icon: 'deck' },
+  { text: 'Memori lintas sesi — agent mengingat konteks Anda', icon: 'memory' },
+];
 
 type LastAction = { kind: 'send'; text: string } | { kind: 'edit'; text: string; editFrom: number } | { kind: 'regenerate' } | null;
 
-/** Normalisasi status: ekstrak blok [[CLARIFY]] dari pesan terakhir. */
+/** Normalisasi status: sanitasi tipe + ekstrak blok [[CLARIFY]] dari pesan terakhir. */
 function normalizeStatus(st: ChatStatus): ChatStatus {
-  const msgs: ChatMessage[] = [...(st.messages || [])];
+  // hardening: pastikan messages & atts/versions selalu array tipe benar
+  // (bug v3.4: atts tersimpan sbg string JSON di DDB -> crash render)
+  const raw = Array.isArray(st.messages) ? st.messages : [];
+  const msgs: ChatMessage[] = raw.map((m) => {
+    if (!m || typeof m !== 'object') return { role: 'user', text: String(m ?? ''), ts: 0 };
+    const mm = m as ChatMessage;
+    const atts = asArray<MessageAtt>(mm.atts);
+    const versions = asArray<{ text: string; ts: number; model?: string }>(mm.versions)
+      .filter((v) => v && typeof v.text === 'string');
+    return {
+      ...mm,
+      text: typeof mm.text === 'string' ? mm.text : '',
+      ...(atts.length ? { atts } : {}),
+      ...(versions.length ? { versions } : {}),
+    };
+  });
   let clarify = st.clarify ?? null;
   if (!clarify && msgs.length) {
     for (let i = msgs.length - 1; i >= 0; i--) {
@@ -89,6 +111,7 @@ export function ChatApp({
   const [models, setModels] = useState<MaaModel[]>([]);
   const [autoDefaults, setAutoDefaults] = useState<{ fast: string; deep: string } | undefined>(undefined);
   const [mode, setMode] = useState<ChatMode>('AUTO');
+  const [agentMode, setAgentMode] = useState<AgentMode>('STANDARD');
   const [manualModel, setManualModel] = useState('');
   const [loadingSession, setLoadingSession] = useState(false);
   const [processing, setProcessing] = useState(false);
@@ -318,19 +341,6 @@ export function ChatApp({
     [notify, token]
   );
 
-  // ---------- translate EN -> ID ----------
-
-  const handleTranslate = useCallback(
-    async (text: string): Promise<string> => {
-      const r = await translateText(token, text, activeId || undefined);
-      if (r.status !== 'ok' || !r.translation) {
-        throw new Error(r.message || 'translate gagal');
-      }
-      return r.translation;
-    },
-    [activeId, token]
-  );
-
   // ---------- kirim / edit ----------
 
   const doSend = useCallback(
@@ -365,7 +375,7 @@ export function ChatApp({
               },
             ],
           });
-          const r = await sendChat(token, { message: text, mode, modelId, attachments: atts });
+          const r = await sendChat(token, { message: text, mode, agentMode, modelId, attachments: atts });
           if (run !== runIdRef.current) return;
           setActiveId(r.sessionId);
           window.history.pushState({ sid: r.sessionId }, '', `/c/${r.sessionId}`);
@@ -374,7 +384,7 @@ export function ChatApp({
         } else {
           const sid = activeId;
           await sendChat(token, {
-            message: text, mode, modelId, sessionId: sid,
+            message: text, mode, agentMode, modelId, sessionId: sid,
             ...(atts.length ? { attachments: atts } : {}),
             ...(editFrom !== undefined ? { editFrom } : {}),
           });
@@ -389,7 +399,7 @@ export function ChatApp({
         setErrorTop(`Gagal mengirim: ${(e as Error).message}`);
       }
     },
-    [activeId, manualModel, me?.userId, mode, notify, processing, startPolling, token, uploads]
+    [activeId, agentMode, manualModel, me?.userId, mode, notify, processing, startPolling, token, uploads]
   );
 
   // ---------- regenerasi jawaban terakhir ----------
@@ -405,7 +415,7 @@ export function ChatApp({
       setErrorTop(null);
       try {
         await sendChat(token, {
-          message: '', mode,
+          message: '', mode, agentMode,
           modelId: mode === 'MANUAL' && manualModel ? manualModel : undefined,
           sessionId: activeId, regenerate: true,
         });
@@ -417,7 +427,7 @@ export function ChatApp({
         setErrorTop(`Gagal regenerate: ${(e as Error).message}`);
       }
     },
-    [activeId, manualModel, mode, notify, processing, setErrorTop, startPolling, token]
+    [activeId, agentMode, manualModel, mode, notify, processing, setErrorTop, startPolling, token]
   );
 
   const retryLast = useCallback(() => {
@@ -620,6 +630,7 @@ export function ChatApp({
         {/* mode aktif kecil di header (desktop) */}
         <span className="hidden rounded-full border border-[var(--line-soft)] px-2.5 py-1 font-mono text-[10px] font-semibold text-[var(--muted-fg)] md:inline">
           {mode}
+          {agentMode !== 'STANDARD' && <span style={{ color: 'var(--accent)' }}> · {agentMode}</span>}
         </span>
 
         <ThemeSwitcher theme={theme} onChange={setTheme} />
@@ -742,21 +753,27 @@ export function ChatApp({
                   <h2 className="text-[20px] font-bold tracking-tight text-[var(--ink)]">
                     Halo, {me?.username || username}
                   </h2>
-                  <p className="mt-1.5 max-w-[420px] text-[13px] leading-relaxed text-[var(--muted-fg)]">
-                    Insinyur AWS otonom Anda. Tanyakan apa saja — dari listing resource sampai
-                    operasi destruktif (dengan konfirmasi ganda).
+                  <p className="mt-1.5 max-w-[460px] text-[13px] leading-relaxed text-[var(--muted-fg)]">
+                    Insinyur AWS otonom dengan pengetahuan terkini sampai hari ini — browsing web,
+                    code interpreter, multi-agent, dan operasi penuh AWS. Operasi destruktif selalu
+                    lewat konfirmasi ganda.
                   </p>
-                  <div className="mt-6 flex flex-wrap items-center justify-center gap-2">
+                  <div className="mt-6 flex max-w-[560px] flex-wrap items-center justify-center gap-2">
                     {SUGGESTIONS.map((s) => (
-                      <button
-                        key={s}
-                        type="button"
-                        onClick={() => void doSend(s)}
-                        className="maa-btn-secondary flex items-center gap-1.5 px-3.5 py-2 text-[12px]"
+                      <span
+                        key={s.text}
+                        className="flex items-center gap-1.5 rounded-full border border-[var(--line-soft)] bg-[var(--surface)] px-3 py-1.5 text-[11.5px] text-[var(--muted-fg)]"
                       >
-                        <Sparkles className="h-3.5 w-3.5" style={{ color: 'var(--accent)' }} />
-                        {s}
-                      </button>
+                        <span style={{ color: 'var(--accent)' }}>
+                          {s.icon === 'globe' && <Globe className="h-3.5 w-3.5" />}
+                          {s.icon === 'code' && <TerminalSquare className="h-3.5 w-3.5" />}
+                          {s.icon === 'users' && <Users className="h-3.5 w-3.5" />}
+                          {s.icon === 'aws' && <Boxes className="h-3.5 w-3.5" />}
+                          {s.icon === 'deck' && <Clapperboard className="h-3.5 w-3.5" />}
+                          {s.icon === 'memory' && <History className="h-3.5 w-3.5" />}
+                        </span>
+                        {s.text}
+                      </span>
                     ))}
                   </div>
                   {mode === 'MANUAL' && !manualModel && (
@@ -774,7 +791,6 @@ export function ChatApp({
                     onResendEdit={(idx, text) => void doSend(text, idx)}
                     notify={notify}
                     onRegenerate={activeId ? () => void doRegenerate() : undefined}
-                    onTranslate={handleTranslate}
                     clarifySlot={
                     clarify && !processing ? (
                       <div className="animate-msg-in mt-1 w-full max-w-[min(680px,85%)] rounded-[10px] border border-[var(--accent)] bg-[var(--accent-soft)] p-3.5">
@@ -811,6 +827,8 @@ export function ChatApp({
               <Composer
                 mode={mode}
                 onModeChange={setMode}
+                agentMode={agentMode}
+                onAgentModeChange={setAgentMode}
                 manualModel={manualModel}
                 onManualModelChange={setManualModel}
                 models={models}
@@ -821,11 +839,6 @@ export function ChatApp({
                 onRemoveUpload={removeUpload}
                 disabled={loadingSession}
                 busy={processing}
-                hint={
-                  mode === 'AUTO' && autoDefaults
-                    ? `AUTO memilih model otomatis · cepat: ${autoDefaults.fast} · dalam: ${autoDefaults.deep}`
-                    : null
-                }
               />
             </div>
           </div>
