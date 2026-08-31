@@ -9,6 +9,7 @@
 
 - [Ringkasan](#-ringkasan)
 - [Akses Demo](#-akses-demo)
+- [Tampilan Aplikasi](#-tampilan-aplikasi)
 - [Yang Baru di v3.4.3](#-yang-baru-di-v343)
 - [Yang Baru di v3.4.2](#-yang-baru-di-v342)
 - [Yang Baru di v3.4](#-yang-baru-di-v34)
@@ -20,6 +21,19 @@
 - [Keamanan](#-keamanan)
 - [Biaya](#-biaya)
 
+
+## 🖼️ Tampilan Aplikasi
+
+Tema **Redline** (merah-hitam), mobile-first, dengan **Live Trace** yang memperlihatkan
+seluruh trajektori agen secara real-time.
+
+| Chat + Live Trace (desktop) | Mode Manual — pilih sendiri dari katalog model |
+|---|---|
+| ![Chat + Live Trace](screenshots/chat-livetrace.png) | ![Mode Manual](screenshots/mode-manual.png) |
+| **Chat inspeksi EC2** dengan chip nilai ter-format | **Konfirmasi destruktif 2 tahap** — string konfirmasi harus diketik dua kali |
+| ![Chat EC2](screenshots/chat-ec2.png) | ![Konfirmasi destruktif](screenshots/konfirmasi-destruktif.png) |
+| **Live Trace di mobile** — setiap event tool terlihat | |
+| ![Live Trace mobile](screenshots/livetrace-mobile.png) | |
 
 ## 🔗 Yang Baru di v3.4.3
 
