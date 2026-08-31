@@ -88,7 +88,7 @@ me-rewrite path tanpa ekstensi (termasuk `/c/<sessionId>`) → `/index.html` sta
 
 ```bash
 # preflight CORS
-curl -X OPTIONS $API_URL/me -H "Origin: https://main.d3m7p7m7eyo6tj.amplifyapp.com" \
+curl -X OPTIONS $API_URL/me -H "Origin: https://main.dnhise495bdci.amplifyapp.com" \
      -H "Access-Control-Request-Method: GET" -D - -o /dev/null   # 200 + ACAO
 # login + chat ringkas
 python3 aws/test_e2e_v3.py

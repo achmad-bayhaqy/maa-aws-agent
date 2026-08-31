@@ -102,10 +102,10 @@ ok = lambda label, cond, extra="": print(f"{'PASS' if cond else 'FAIL'} {label} 
 # 1) login + TOTP
 a = cognito("InitiateAuth", {"AuthFlow": "USER_PASSWORD_AUTH",
                              "AuthParameters": {"USERNAME": cr["username"], "PASSWORD": cr["password"]},
-                             "ClientId": cr["client_id"]})
+                             "ClientId": cr.get("client_id") or cr["app_client_id"]})
 if a.get("ChallengeName") == "SOFTWARE_TOKEN_MFA":
     a = cognito("RespondToAuthChallenge", {
-        "ClientId": cr["client_id"], "ChallengeName": "SOFTWARE_TOKEN_MFA",
+        "ClientId": cr.get("client_id") or cr["app_client_id"], "ChallengeName": "SOFTWARE_TOKEN_MFA",
         "Session": a["Session"],
         "ChallengeResponses": {"USERNAME": cr["username"],
                                "SOFTWARE_TOKEN_MFA_CODE": totp(cr["totp_secret"])}})

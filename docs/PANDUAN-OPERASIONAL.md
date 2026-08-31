@@ -7,7 +7,7 @@
 
 | Item | Nilai |
 |---|---|
-| **URL Aplikasi (HP)** | https://main.d3m7p7m7eyo6tj.amplifyapp.com |
+| **URL Aplikasi (HP)** | https://main.dnhise495bdci.amplifyapp.com |
 | **Username** | `architect` |
 | **Password** | ``<lihat aws/maa-user-credentials.json — tidak di-commit>`` |
 | **Region** | us-east-1 |
@@ -20,7 +20,7 @@ masukkan secret key secara manual. Secret tersimpan di
 ## 🏗️ Arsitektur Terpasang
 
 ```
-[Browser HP] ──TLS──► [Amplify Hosting d3m7p7m7eyo6tj]
+[Browser HP] ──TLS──► [Amplify Hosting dnhise495bdci]
    │                        │ Cognito MFA TOTP (WAF 100 req/5m)
    ▼                        ▼
 [API Gateway REST bklw93lic3] ◄── WAF 2000 req/5m + AWS Managed Rules
@@ -108,6 +108,6 @@ Dropdown kini: pencarian, tergrup per provider (Amazon, Z.ai, OpenAI-OS, Qwen, M
 - Semua serverless; idle = Rp0 kecuali WAF (~$6/bln).
 
 ### URL & kredensial (tidak berubah)
-- Aplikasi: https://main.d3m7p7m7eyo6tj.amplifyapp.com
+- Aplikasi: https://main.dnhise495bdci.amplifyapp.com
 - API: https://bklw93lic3.execute-api.us-east-1.amazonaws.com/v1
 - User: `architect` / ``<lihat aws/maa-user-credentials.json — tidak di-commit>`` + TOTP (secret: aws/maa-user-credentials.json, QR: MAA-TOTP-QR.png)

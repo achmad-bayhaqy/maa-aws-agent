@@ -531,8 +531,18 @@ def _tags(resource_type, name, extra=None):
     return {"ResourceType": resource_type, "Tags": tags}
 
 
+_S3V4_CLIENT = None
+
+
 def _presign(bucket, key, ttl=86400):
-    return get_client("s3").generate_presigned_url(
+    """Presigned GET SigV4 (WAJIB s3v4 - default SigV2 dengan session token
+    ditolak S3 403; lihat pelajaran v3.4.1)."""
+    global _S3V4_CLIENT
+    if _S3V4_CLIENT is None:
+        _S3V4_CLIENT = boto3.client("s3", region_name=REGION,
+                                    config=BotoConfig(signature_version="s3v4",
+                                                      retries={"max_attempts": 3, "mode": "standard"}))
+    return _S3V4_CLIENT.generate_presigned_url(
         "get_object", Params={"Bucket": bucket, "Key": key}, ExpiresIn=ttl)
 
 
@@ -760,7 +770,8 @@ def exec_tool(name, args, sid=None, attachments=None):
                                                      "cfgScale": 7.0, "seed": int(time.time()) % 2147483647}})
         img = None
         last = ""
-        for mid in ("amazon.nova-canvas-v1:0", "us.amazon.nova-canvas-v1:0"):
+        for mid in ("amazon.nova-canvas-v1:0", "us.amazon.nova-canvas-v1:0",
+                    "amazon.nova-2-canvas-v1:0", "stability.stable-image-core-v1:0"):
             try:
                 r = get_client("bedrock-runtime").invoke_model(modelId=mid, contentType="application/json",
                                                 accept="application/json", body=body)
@@ -773,7 +784,12 @@ def exec_tool(name, args, sid=None, attachments=None):
                 last = str(e)
                 continue
         if not img:
-            return {"status": "error", "message": f"nova canvas gagal: {last[:200]}"}
+            return {"status": "error", "message": f"nova canvas gagal: {last[:200]}",
+                    "note": ("Generate gambar belum tersedia di akun AWS ini (akses model image "
+                             "belum diaktifkan/di-deprecated). Jelaskan ke user dengan ramah bahwa "
+                             "fitur gambar sedang tidak tersedia di akun ini, dan tawarkan alternatif "
+                             "(mis. deskripsi visual terperinci, diagram via code interpreter, atau "
+                             "deck/artefak lain). Jangan mengarang URL gambar.")}
         key = f"gen/canvas-{uuid.uuid4().hex}.png"
         get_client("s3").put_object(Bucket=ART_BUCKET, Key=key, Body=__import__("base64").b64decode(img),
                       ServerSideEncryption="AES256", ContentType="image/png")

@@ -430,14 +430,61 @@ try:
 except Exception:
     pass
 docs = [
-    (PDF_PATH, "docs/MAA-Runbook-Incident-Response-v2.pdf", "application/pdf"),
-    (XLSX_PATH, "docs/MAA-Asset-Inventory.xlsx",
+    (PDF_PATH, "assets/MAA-Runbook-Incident-Response-v2.pdf", "application/pdf"),
+    (XLSX_PATH, "assets/MAA-Asset-Inventory.xlsx",
      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
-    (PNG_PATH, "docs/MAA-Arsitektur-Demo.png", "image/png"),
+    (PNG_PATH, "assets/MAA-Arsitektur-Demo.png", "image/png"),
 ]
 for local, key, ct in docs:
     s3.upload_file(local, KB_BUCKET, key, ExtraArgs={
         "ServerSideEncryption": "aws:kms", "SSEKMSKeyId": KMS_ID, "ContentType": ct})
+    log(f"  s3://{KB_BUCKET}/{key}")
+
+# ---- KB docs: markdown ringkas (metadata kecil, aman utk S3 Vectors 2048B
+# filterable-metadata limit; dokumen binary di assets/ tidak di-ingesti)
+KB_MD = {
+    "docs/kb/Kapabilitas-Agent-MAA.md": """# Kapabilitas Agent MAA
+
+MAA adalah agen operasi cloud otonom di atas AWS Bedrock AgentCore.
+
+- Pengetahuan terkini sampai hari ini: jawaban memakai informasi terbaru; untuk
+  topik yang cepat berubah (harga, versi, rilis) wajib memakai web_search.
+- Kapabilitas utama: browsing web real-time, code interpreter (hitung/eksekusi
+  kode + menghasilkan file), generate gambar (Nova Canvas), slide deck
+  presentasi, preview full-stack web app, todo list live, multi-agent
+  (subagent peran spesialis), memori lintas sesi.
+- Operasi AWS: inspeksi EC2/S3/RDS/VPC/IAM/Cost, provisioning IaC, dan operasi
+  destruktif dengan konfirmasi dua tahap.
+- Keamanan: MFA TOTP wajib, WAF, KMS at-rest, prinsip zero-trust, guardrail
+  (superadmin bebas guardrail).
+""",
+    "docs/kb/Runbook-Ringkas.md": """# Runbook Ringkas Incident Response
+
+1. Deteksi: periksa CloudWatch alarm/metric, identifikasi resource & dampak.
+2. Triase: kumpulkan fakta (status instance, log, metric 5-15 menit terakhir).
+3. Mitigasi cepat: restart service/instance, isolate via security group,
+   scale-out bila tekanan tinggi.
+4. Komunikasi: sampaikan status, ETA, dan langkah mitigasi ke stakeholder.
+5. Recovery: verifikasi kesehatan (health check, error rate kembali normal).
+6. Post-incident: catat timeline, root cause, action item pencegahan.
+Catatan: operasi destruktif (terminate/delete) selalu butuh konfirmasi
+dua tahap di UI MAA sebelum dieksekusi.
+""",
+    "docs/kb/Inventaris-Inti.md": """# Inventaris Inti Akun
+
+- VPC demo: subnet publik utk aplikasi demo (2 instance EC2 t3.micro,
+  nama maa-demo-app-01/02, peran maa-demo-instance-role + SSM).
+- Storage: bucket KB docs (terenkripsi KMS), bucket artefak (gambar/deck/app),
+  bucket S3 Vectors utk knowledge base.
+- Database & tabel: DynamoDB sessions/traces/confirmations (TTL aktif).
+- Keamanan: Cognito User Pool (TOTP wajib), API Gateway + edge Lambda + WAF,
+  KMS master key maa-agent-key.
+""",
+}
+for key, body in KB_MD.items():
+    s3.put_object(Bucket=KB_BUCKET, Key=key, Body=body.encode(),
+                  ServerSideEncryption="aws:kms", SSEKMSKeyId=KMS_ID,
+                  ContentType="text/markdown")
     log(f"  s3://{KB_BUCKET}/{key}")
 
 # force re-ingest each run

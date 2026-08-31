@@ -15,8 +15,8 @@ sys.path.insert(0, "/home/z/my-project/aws")
 from lib_common import ACCOUNT_ID, REGION, log, load_state, save_state
 
 st = load_state()
-SRC = "/home/z/my-project"
-BUILD = "/home/z/my-project/aws/amplify-build"
+SRC = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # root repo (di atas aws/)
+BUILD = os.path.join(SRC, "aws", "amplify-build")
 API_URL = st["api_url"]
 
 # ---------------------------------------------------------------- 1. build dir

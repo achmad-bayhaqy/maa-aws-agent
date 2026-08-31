@@ -7,7 +7,7 @@ pola desain, dan keputusan penting yang diambil selama implementasi.
 
 | Komponen | Service AWS | ID Produksi | Peran |
 |---|---|---|---|
-| Frontend | Amplify Hosting | `d3m7p7m7eyo6tj` | Next.js static export, mobile-first |
+| Frontend | Amplify Hosting | `dnhise495bdci` | Next.js static export, mobile-first |
 | Identity | Cognito User Pool | `us-east-1_l76zCTRHQ` | Login + TOTP MFA wajib + grup superadmin |
 | API Edge | API Gateway REST | `bklw93lic3` (stage `v1`) | Router HTTP + Cognito authorizer + throttling 40/80 |
 | WAF | WAFv2 | `maa-agent-api-waf` | Rate limit 2000/5m + Managed Rules |

@@ -100,7 +100,7 @@ Tiga mode kecerdasan dipisahkan sesuai karakter pertanyaan:
 
 | Item | Nilai |
 |---|---|
-| **URL Aplikasi** | https://main.d3m7p7m7eyo6tj.amplifyapp.com |
+| **URL Aplikasi** | https://main.dnhise495bdci.amplifyapp.com |
 | **Region** | us-east-1 |
 | **Kredensial demo** | `aws/maa-user-credentials.json` (tidak di-commit; minta ke admin) |
 

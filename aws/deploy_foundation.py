@@ -112,6 +112,9 @@ def ensure_bucket(name, versioned=False, cors=False, tls_kms_policy=False):
                     "Resource": f"arn:aws:s3:::{name}/*",
                     "Condition": {
                         "StringNotEquals": {"s3:x-amz-server-side-encryption": "aws:kms"},
+                        # Bedrock KB validasi write dgn PutObject tanpa header KMS;
+                        # role servis MAA dikecualikan (tetap wajib TLS).
+                        "ArnNotLike": {"aws:PrincipalArn": f"arn:aws:iam::{ACCT}:role/maa-agent-*"},
                     },
                 },
             ],
@@ -421,7 +424,8 @@ kb_policy = {
     "Version": "2012-10-17",
     "Statement": [
         {"Sid": "S3Read", "Effect": "Allow",
-         "Action": ["s3:GetObject", "s3:ListBucket", "s3:GetBucketLocation"],
+         "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject",
+                    "s3:ListBucket", "s3:GetBucketLocation"],
          "Resource": [f"arn:aws:s3:::{KB_BUCKET}", f"arn:aws:s3:::{KB_BUCKET}/*"]},
         {"Sid": "EmbedModel", "Effect": "Allow",
          "Action": ["bedrock:InvokeModel"],

@@ -119,8 +119,10 @@ save_state(st)
 
 # ================================================================ 2. katalog 88 model
 log("2/9 Katalog model lengkap (dari chat_models.txt + probe tool-compat)...")
-CATALOG_SRC = "/home/z/my-project/scripts/chat_models.txt"
-PROBE = "/home/z/my-project/aws/probe_result.json"
+CATALOG_SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "scripts", "chat_models.txt")
+if not os.path.exists(CATALOG_SRC):
+    CATALOG_SRC = "/home/z/my-project/scripts/chat_models.txt"
+PROBE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "probe_result.json")
 FRIENDLY = {
     "amazon.nova-micro-v1:0": "Nova Micro", "amazon.nova-lite-v1:0": "Nova Lite",
     "amazon.nova-pro-v1:0": "Nova Pro", "amazon.nova-premier-v1:0": "Nova Premier",
@@ -219,6 +221,8 @@ log(f"  katalog {len(models)} model -> s3://{art}/models/allowed-chat-models.jso
 log("3/9 IAM roles...")
 # runtime role (update policy: + memory, CI, browser, gateway, logs, canvas)
 rt_arn = st.get("runtime_role_arn") or ensure_role(RT_ROLE, svc_trust("bedrock-agentcore.amazonaws.com"), "MAA runtime")
+st["runtime_role_arn"] = rt_arn
+save_state(st)
 rt_policy = {
     "Version": "2012-10-17",
     "Statement": [
@@ -229,7 +233,8 @@ rt_policy = {
                          f"arn:aws:logs:{REGION}:{ACCOUNT_ID}:log-group:/aws/bedrock-agentcore/*"]},
         {"Sid": "BedrockModels", "Effect": "Allow",
          "Action": ["bedrock:InvokeModel", "bedrock:InvokeModelWithResponseStream",
-                    "bedrock:Converse", "bedrock:ConverseStream"],
+                    "bedrock:Converse", "bedrock:ConverseStream", "bedrock:ApplyGuardrail",
+                    "bedrock:GetGuardrail"],
          "Resource": BEDROCK_INVOKE_RES + ["*"]},
         {"Sid": "BedrockKB", "Effect": "Allow", "Action": ["bedrock:Retrieve"],
          "Resource": [f"arn:aws:bedrock:{REGION}:{ACCOUNT_ID}:knowledge-base/{st.get('kb_id', '*')}",
@@ -245,7 +250,8 @@ rt_policy = {
             "bedrock-agentcore:GetCodeInterpreterSession",
             "bedrock-agentcore:InvokeCodeInterpreter",
             "bedrock-agentcore:ListCodeInterpreterSessions"],
-         "Resource": f"arn:aws:bedrock-agentcore:{REGION}:{ACCOUNT_ID}:code-interpreter/*"},
+         "Resource": [f"arn:aws:bedrock-agentcore:{REGION}:{ACCOUNT_ID}:code-interpreter/*",
+                      f"arn:aws:bedrock-agentcore:{REGION}:{ACCOUNT_ID}:code-interpreter-custom/*"]},
         {"Sid": "AgentCoreBrowser", "Effect": "Allow", "Action": [
             "bedrock-agentcore:StartBrowserSession", "bedrock-agentcore:StopBrowserSession",
             "bedrock-agentcore:GetBrowserSession", "bedrock-agentcore:InvokeBrowser",
@@ -268,11 +274,32 @@ rt_policy = {
          "Resource": st["exec_role_arn"]},
         {"Sid": "VectorIndex", "Effect": "Allow", "Action": ["s3vectors:QueryVectors", "s3vectors:GetVectors"],
          "Resource": st["vector_index_arn"]},
+        {"Sid": "KmsUse", "Effect": "Allow",
+         "Action": ["kms:Decrypt", "kms:GenerateDataKey", "kms:DescribeKey"],
+         "Resource": st["kms_arn"]},
     ],
 }
 iam.put_role_policy(RoleName=RT_ROLE, PolicyName="maa-agent-runtime-policy",
                     PolicyDocument=json.dumps(rt_policy))
 log(f"  {RT_ROLE} policy v3 (memory+CI+browser+gateway+CW)")
+
+# exec role trust: tambahkan runtime role sebagai principal (runtime assume exec
+# utk operasi AWS 5-menit; ExternalId maa-agent-exec sudah di sisi runtime)
+try:
+    exec_role_name = st["exec_role_arn"].split("/")[-1]
+    tr = iam.get_role(RoleName=exec_role_name)["Role"]["AssumeRolePolicyDocument"]
+    prins = tr["Statement"][0]["Principal"]["AWS"]
+    if isinstance(prins, str):
+        prins = [prins]
+    if rt_arn not in prins:
+        prins.append(rt_arn)
+        tr["Statement"][0]["Principal"]["AWS"] = prins
+        iam.update_assume_role_policy(RoleName=exec_role_name, PolicyDocument=json.dumps(tr))
+        log(f"  exec role trust + runtime role OK")
+    else:
+        log("  = exec role trust sudah memuat runtime role")
+except Exception as e:
+    log(f"  exec trust warn: {str(e)[:150]}")
 
 gw_role_arn = ensure_role(GW_ROLE, svc_trust("bedrock-agentcore.amazonaws.com"), "MAA gateway")
 iam.put_role_policy(RoleName=GW_ROLE, PolicyName="maa-agent-gateway-policy", PolicyDocument=json.dumps({
@@ -280,6 +307,10 @@ iam.put_role_policy(RoleName=GW_ROLE, PolicyName="maa-agent-gateway-policy", Pol
     "Statement": [
         {"Sid": "InvokeTargets", "Effect": "Allow", "Action": ["lambda:InvokeFunction"],
          "Resource": f"arn:aws:lambda:{REGION}:{ACCOUNT_ID}:function:{GW_FN}*"},
+        {"Sid": "PolicyEngineRead", "Effect": "Allow", "Action": [
+            "bedrock-agentcore:GetPolicyEngine", "bedrock-agentcore:GetPolicy",
+            "bedrock-agentcore:ListPolicies", "bedrock-agentcore:AuthorizeAction"],
+         "Resource": f"arn:aws:bedrock-agentcore:{REGION}:{ACCOUNT_ID}:policy-engine/*"},
         {"Sid": "Logs", "Effect": "Allow", "Action": [
             "logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"],
          "Resource": f"arn:aws:logs:{REGION}:{ACCOUNT_ID}:*"},
@@ -551,6 +582,7 @@ if pe_id:
         bac.update_gateway(gatewayIdentifier=gateway_id,
                            name="maa-agent-gateway",
                            roleArn=gw_role_arn,
+                           protocolType="MCP",
                            authorizerType="AWS_IAM",
                            policyEngineConfiguration={"arn": f"arn:aws:bedrock-agentcore:{REGION}:{ACCOUNT_ID}:policy-engine/{pe_id}",
                                                       "mode": "LOG_ONLY"})
@@ -578,7 +610,6 @@ if pe_id:
                               policyEngineId=pe_id,
                               definition={"cedar": {"statement": stmt}},
                               validationMode="FAIL_ON_ANY_FINDINGS",
-                              enforcementMode="LOG_ONLY",
                               description="MAA gateway policy")
             log(f"  + cedar policy {pname}")
         except Exception as e:

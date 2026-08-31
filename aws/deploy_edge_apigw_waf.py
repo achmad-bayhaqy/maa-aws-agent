@@ -63,9 +63,10 @@ policy = {
          "Action": ["s3:ListBucket", "s3:GetBucketLocation", "s3:GetObject", "s3:PutObject",
                     "s3:DeleteObject"],
          "Resource": [f"arn:aws:s3:::{st['kb_bucket']}", f"arn:aws:s3:::{st['kb_bucket']}/*"]},
-        {"Sid": "ArtifactsRead", "Effect": "Allow",
-         "Action": ["s3:GetObject"],
-         "Resource": f"arn:aws:s3:::{st['art_bucket']}/models/*"},
+        {"Sid": "ArtifactsRW", "Effect": "Allow",
+         "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:ListBucket"],
+         "Resource": [f"arn:aws:s3:::{st['art_bucket']}",
+                      f"arn:aws:s3:::{st['art_bucket']}/*"]},
         {"Sid": "KmsForPresign", "Effect": "Allow",
          "Action": ["kms:Decrypt", "kms:GenerateDataKey", "kms:DescribeKey"],
          "Resource": st["kms_arn"]},
@@ -194,6 +195,12 @@ ROUTES = [
     ("/admin/signout", ["POST", "OPTIONS"]),
     ("/admin/users", ["GET", "POST", "DELETE", "OPTIONS"]),
     ("/admin/users/status", ["POST", "OPTIONS"]),
+    ("/admin/users/set-password", ["POST", "OPTIONS"]),
+    ("/admin/users/resend-invite", ["POST", "OPTIONS"]),
+    ("/uploads/presign", ["POST", "OPTIONS"]),
+    ("/translate", ["POST", "OPTIONS"]),
+    ("/docs/content", ["GET", "POST", "OPTIONS"]),
+    ("/docs/list", ["GET", "OPTIONS"]),
 ]
 
 # build resource map (root path is "" in API Gateway)
