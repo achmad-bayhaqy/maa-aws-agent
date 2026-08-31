@@ -536,6 +536,19 @@ def _presign(bucket, key, ttl=86400):
         "get_object", Params={"Bucket": bucket, "Key": key}, ExpiresIn=ttl)
 
 
+def _art_public_url(key):
+    """URL publik permanen utk artefak hasil generate (gen/, decks/, apps/).
+
+    Presigned URL yang ditandatangani kredensial sementara (role session)
+    MATI saat sesi kredensial berakhir (~1 jam) walau ExpiresIn lebih besar
+    (AWS memotong TTL maksimal ke umur kredensial) - inilah akar bug link
+    gambar/deck/webapp "tidak bisa dibuka". URL publik + key acak 32-hex
+    (unguessable) tidak pernah kedaluwarsa. Objek di prefix ini WAJIB disimpan
+    dengan SSE-S3 (AES256), karena objek SSE-KMS tidak bisa dibaca anonim.
+    """
+    return f"https://{ART_BUCKET}.s3.{REGION}.amazonaws.com/{key}"
+
+
 def _todos_save(sid, todos):
     """Persist todo list ke record sesi agar live tampil di UI (poling status)."""
     if not sid:
@@ -711,10 +724,10 @@ def exec_tool(name, args, sid=None, attachments=None):
                     b = c["data"]
                     if isinstance(b, str):
                         b = b.encode()
-                    key = f"gen/ci-{uuid.uuid4().hex[:8]}.png"
+                    key = f"gen/ci-{uuid.uuid4().hex}.png"
                     get_client("s3").put_object(Bucket=ART_BUCKET, Key=key, Body=b,
-                                  ServerSideEncryption="aws:kms", ContentType="image/png")
-                    url = _presign(ART_BUCKET, key)
+                                  ServerSideEncryption="AES256", ContentType="image/png")
+                    url = _art_public_url(key)
                     files.append(url)
                     if attachments is not None:
                         attachments.append({"type": "image", "url": url, "name": key.split("/")[-1]})
@@ -761,10 +774,10 @@ def exec_tool(name, args, sid=None, attachments=None):
                 continue
         if not img:
             return {"status": "error", "message": f"nova canvas gagal: {last[:200]}"}
-        key = f"gen/canvas-{uuid.uuid4().hex[:8]}.png"
+        key = f"gen/canvas-{uuid.uuid4().hex}.png"
         get_client("s3").put_object(Bucket=ART_BUCKET, Key=key, Body=__import__("base64").b64decode(img),
-                      ServerSideEncryption="aws:kms", ContentType="image/png")
-        url = _presign(ART_BUCKET, key)
+                      ServerSideEncryption="AES256", ContentType="image/png")
+        url = _art_public_url(key)
         if attachments is not None:
             attachments.append({"type": "image", "url": url, "name": key.split("/")[-1]})
         return {"status": "ok", "image": url, "prompt": prompt[:200],
@@ -860,10 +873,10 @@ def exec_tool(name, args, sid=None, attachments=None):
         if not slides:
             return {"status": "error", "message": "slides kosong"}
         html = _deck_html(title, subtitle, slides)
-        key = f"decks/{uuid.uuid4().hex[:10]}-{re.sub(r'[^a-z0-9-]', '-', title.lower())[:40]}.html"
+        key = f"decks/{uuid.uuid4().hex}-{re.sub(r'[^a-z0-9-]', '-', title.lower())[:40]}.html"
         get_client("s3").put_object(Bucket=ART_BUCKET, Key=key, Body=html.encode(),
-                      ServerSideEncryption="aws:kms", ContentType="text/html")
-        url = _presign(ART_BUCKET, key, ttl=7 * 86400)
+                      ServerSideEncryption="AES256", ContentType="text/html")
+        url = _art_public_url(key)
         if attachments is not None:
             attachments.append({"type": "deck", "url": url, "name": title, "slides": len(slides)})
         put_trace(sid or "-", "deck", f"Deck '{title}' ({len(slides)} slide) siap: {url[:120]}")
@@ -876,7 +889,7 @@ def exec_tool(name, args, sid=None, attachments=None):
         index_html = args.get("index_html", "")
         if len(index_html) < 50:
             return {"status": "error", "message": "index_html terlalu pendek"}
-        folder = f"apps/{uuid.uuid4().hex[:10]}"
+        folder = f"apps/{uuid.uuid4().hex}"
         extra = []
         for f in (args.get("files") or [])[:10]:
             p = str(f.get("path", "")).strip().lstrip("/")
@@ -884,12 +897,12 @@ def exec_tool(name, args, sid=None, attachments=None):
                 continue
             get_client("s3").put_object(Bucket=ART_BUCKET, Key=f"{folder}/{p}",
                           Body=str(f.get("content", ""))[:400000].encode(),
-                          ServerSideEncryption="aws:kms")
+                          ServerSideEncryption="AES256")
             extra.append(p)
         get_client("s3").put_object(Bucket=ART_BUCKET, Key=f"{folder}/index.html",
                       Body=index_html[:900000].encode(),
-                      ServerSideEncryption="aws:kms", ContentType="text/html")
-        url = _presign(ART_BUCKET, f"{folder}/index.html", ttl=7 * 86400)
+                      ServerSideEncryption="AES256", ContentType="text/html")
+        url = _art_public_url(f"{folder}/index.html")
         if attachments is not None:
             attachments.append({"type": "webapp", "url": url, "name": app_name, "files": 1 + len(extra)})
         put_trace(sid or "-", "webapp", f"App '{app_name}' live: {url[:120]}")

@@ -9,6 +9,7 @@
 
 - [Ringkasan](#-ringkasan)
 - [Akses Demo](#-akses-demo)
+- [Yang Baru di v3.4.3](#-yang-baru-di-v343)
 - [Yang Baru di v3.4.2](#-yang-baru-di-v342)
 - [Yang Baru di v3.4](#-yang-baru-di-v34)
 - [Fitur Utama (v3)](#-fitur-utama-v3)
@@ -19,6 +20,16 @@
 - [Keamanan](#-keamanan)
 - [Biaya](#-biaya)
 
+
+## 🔗 Yang Baru di v3.4.3
+
+**Fix: link artefak hasil generate tidak bisa dibuka.** Gambar (Nova Canvas / code
+interpreter), slide deck, dan preview web-app kini memakai **URL publik permanen**
+(key acak 32-hex, unguessable) di bucket artefak — bukan lagi presigned URL yang
+mati saat kredensial sementara runtime berakhir (~1 jam). Objek artefak disimpan
+dengan SSE-S3; upload user tetap privat (SSE-KMS + presigned). Deploy:
+`python3 aws/deploy_v343.py` (bucket policy publik terbatas + rebuild runtime +
+re-point edge; frontend tidak berubah).
 
 ## 🚀 Yang Baru di v3.4.2
 
