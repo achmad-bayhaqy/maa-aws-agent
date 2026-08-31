@@ -147,7 +147,8 @@ export type AgentMode =
   | "FULLSTACK"
   | "PRESENTATION"
   | "TODO"
-  | "MULTI";
+  | "MULTI"
+  | "RESEARCH";
 
 export type MessageVersion = { text: string; ts: number; model?: string };
 
@@ -251,6 +252,8 @@ export type SendChatBody = {
   mode: ChatMode;
   /** Mode tugas agent (gaya kerja) — default STANDARD. */
   agentMode?: AgentMode;
+  /** Skill Library yang dimuat eksplisit dari picker UI (v4.0). */
+  skill?: string;
   modelId?: string;
   sessionId?: string;
   editFrom?: number;

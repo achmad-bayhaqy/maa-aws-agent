@@ -143,6 +143,7 @@ env = {
     "GW_URL": st.get("gateway_url", ""),
     "CI_ID": st.get("ci_id", ""),
     "TRACE_LOG_GROUP": st.get("trace_log_group", "/maa/agent/trace"),
+    "SCHEDULES_TABLE": st.get("schedules_table", ""),
 }
 RUNTIME_NAME = "maa_agent_runtime"
 if st.get("agent_runtime_arn"):
@@ -152,6 +153,19 @@ if st.get("agent_runtime_arn"):
     except Exception:
         pass
     time.sleep(5)
+# v4.0: runtime dengan nama sama di akun (tidak tercatat di state) harus
+# dihapus dulu — create akan ConflictException selamanya kalau tidak.
+try:
+    for rt in bac.list_agent_runtimes()["agentRuntimes"]:
+        if rt.get("agentRuntimeName") == RUNTIME_NAME:
+            log(f"  delete runtime tak tercatat: {rt['agentRuntimeId']}")
+            try:
+                bac.delete_agent_runtime(agentRuntimeId=rt["agentRuntimeId"])
+            except Exception:
+                pass
+            time.sleep(5)
+except Exception:
+    pass
 
 resp = None
 for attempt in range(15):
@@ -170,7 +184,7 @@ for attempt in range(15):
             protocolConfiguration={"serverProtocol": "HTTP"},
             lifecycleConfiguration={"idleRuntimeSessionTimeout": 900},
             environmentVariables=env,
-            description="MAA AWS Agent v3.4.3 - durable artifact links (public gen/decks/apps, SSE-S3)",
+            description="MAA AWS Agent v4.0 - skills, KB mgmt, schedules, CI internet, svg-art fallback",
             tags={"Project": "maa-agent", "MAA": "true"},
         )
         break
@@ -209,6 +223,7 @@ lam.update_function_configuration(
         "USER_POOL_ID": st["user_pool_id"],
         "KMS_KEY_ID": st["kms_key_id"],
         "TRACE_LOG_GROUP": st.get("trace_log_group", "/maa/agent/trace"),
+        "SCHEDULES_TABLE": st.get("schedules_table", ""),
     }},
     Timeout=290,
 )

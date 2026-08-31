@@ -628,6 +628,19 @@ ci_id = st.get("ci_id")
 # v3.5: Code Interpreter WAJIB networkMode INTERNET (permintaan user: scraping
 # Python — mis. Google Play Store — harus bisa akses internet; pip install juga).
 CI_NETWORK = {"networkMode": "INTERNET"}
+# v4.0: validasi ci_id dari state — kalau sudah dihapus di akun, cari ulang
+if ci_id:
+    try:
+        bac.get_code_interpreter(codeInterpreterId=ci_id)
+    except Exception:
+        log(f"  ci_id state ({ci_id}) sudah tidak ada — cari ulang di akun")
+        ci_id = None
+if not ci_id:
+    for c in bac.list_code_interpreters(maxResults=50).get("codeInterpreterSummaries",
+                                                          bac.list_code_interpreters(maxResults=50).get("codeInterpreters", [])):
+        if str(c.get("name", "")).startswith("maa") or c.get("name") in ("maacodeinterpreter", "maa-code-interpreter"):
+            ci_id = c["codeInterpreterId"]
+            break
 if not ci_id:
     try:
         ci_id = bac.create_code_interpreter(
@@ -638,9 +651,11 @@ if not ci_id:
     except Exception as e:
         if "Conflict" not in str(e) and "already" not in str(e).lower():
             log(f"  CI warn: {str(e)[:150]}")
-        for c in bac.list_code_interpreters(maxResults=50).get("codeInterpreters", []):
-            if c.get("name") in ("maacodeinterpreter", "maa-code-interpreter"):
+        for c in bac.list_code_interpreters(maxResults=50).get("codeInterpreterSummaries",
+                                                              bac.list_code_interpreters(maxResults=50).get("codeInterpreters", [])):
+            if str(c.get("name", "")).startswith("maa") or c.get("name") in ("maacodeinterpreter", "maa-code-interpreter"):
                 ci_id = c["codeInterpreterId"]
+                break
 if ci_id:
     # pastikan interpreter lama tidak terjebak SANDBOX (tanpa internet)
     try:

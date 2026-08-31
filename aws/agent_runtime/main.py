@@ -44,6 +44,9 @@ MEMORY_ID = os.environ.get("MEMORY_ID", "")
 GW_URL = os.environ.get("GW_URL", "")
 CI_ID = os.environ.get("CI_ID", "")
 TRACE_LOG_GROUP = os.environ.get("TRACE_LOG_GROUP", "/maa/agent/trace")
+SCHEDULES_TABLE = os.environ.get("SCHEDULES_TABLE", "")
+KB_DOCS_PREFIX = "docs/"
+KB_SKILLS_PREFIX = "skills/"
 
 FAST_MODEL = "amazon.nova-micro-v1:0"
 DEEP_MODEL = "openai.gpt-oss-120b-1:0"
@@ -464,6 +467,20 @@ TOOLS = [
         "Buat/timpa skill baru ke library: tulis SKILL.md lengkap (frontmatter name+description + panduan teknis padat). Gunakan saat Anda menemukan pola kerja yang layak diingat permanen.",
         {"name": {"type": "string"}, "description": {"type": "string"}, "content": {"type": "string"}},
         ["name", "description", "content"]),
+    # alias kompat v4.0: skill_list/skill_load = skills_list/skills_use
+    _ts("skill_list",
+        "Daftar skill AI yang tersedia (panduan eksperti: AWS AI, riset, presentasi, dsb). Panggil saat tugas cocok dengan kategori skill.",
+        {}, []),
+    _ts("skill_load",
+        "Muat konten skill lengkap berdasarkan nama (dari skill_list), lalu IKUTI panduannya untuk mengerjakan tugas.",
+        {"name": {"type": "string"}}, ["name"]),
+    _ts("task_schedule",
+        "Kelola tugas terjadwal (berjalan otomatis tanpa user online). action: create (WAJIB sertakan prompt=instruksi lengkap; when opsional: \"2 menit\"/\"besok jam 9\"/\"2026-09-01T09:00\"; repeat: once|hourly|daily|weekly), list, delete. JANGAN eksekusi tugasnya sekarang — cukup jadwalkan. Hasil eksekusi otomatis dikirim ke sesi nanti.",
+        {"action": {"type": "string", "enum": ["create", "list", "delete"]},
+         "prompt": {"type": "string"}, "when": {"type": "string"},
+         "repeat": {"type": "string", "enum": ["once", "hourly", "daily", "weekly"]},
+         "description": {"type": "string"}, "id": {"type": "string"}},
+        ["action"]),
     _ts("iac_generate",
         "Validasi + simpan template CloudFormation YAML yang kamu susun. Kembalikan error validasi bila ada agar kamu bisa memperbaiki sendiri (self-heal) lalu panggil ulang.",
         {"stack_name": {"type": "string"}, "cloudformation_yaml": {"type": "string"}},
@@ -480,11 +497,11 @@ TOOLS = [
         {"url": {"type": "string"}, "js": {"type": "boolean"}, "max_chars": {"type": "integer"}},
         ["url"]),
     _ts("generate_image",
-        "Generate gambar via Amazon Nova Canvas (prompt deskriptif, gaya bebas). Hasil tampil di chat.",
+        "Generate gambar dari prompt deskriptif. Mesin: Nova Canvas bila tersedia, otomatis fallback ke AI SVG-art (vektor) sehingga SELALU menghasilkan gambar. Hasil tampil di chat.",
         {"prompt": {"type": "string"}, "size": {"type": "string", "enum": ["1024x1024", "1280x768", "768x1280"]}},
         ["prompt"]),
     _ts("code_interpreter",
-        "Jalankan kode Python di sandbox AgentCore Code Interpreter: analisis data, scraping web (requests/urllib), perhitungan, chart matplotlib (PNG tampil di chat). Sandbox punya akses internet — pip install & scraping boleh.",
+        "Jalankan kode Python di sandbox AgentCore Code Interpreter: analisis data, perhitungan, chart matplotlib (PNG tampil di chat), DAN web scraping (internet tersedia: requests + BeautifulSoup, selenium tidak tersedia). Untuk scraping: pakai requests dengan User-Agent browser, tangani retry/timeout, pip install diperbolehkan.",
         {"code": {"type": "string"}}, ["code"]),
     _ts("aws_delete_resource",
         "HAPUS resource permanen: ec2 (terminate), s3 (bucket), dynamodb (table), rds, cloudformation (stack). TIDAK PERNAH dieksekusi langsung - sistem memicu protokol konfirmasi ganda.",
@@ -528,7 +545,7 @@ TOOLS = [
 DESTRUCTIVE_TYPES = {"ec2", "s3", "dynamodb", "rds", "cloudformation"}
 GATEWAY_TOOLS = {"web_search", "web_fetch"}
 SUBAGENT_TOOLS = {"web_search", "web_fetch", "kb_search", "kb_read_doc", "code_interpreter",
-                  "skills_list", "skills_use",
+                  "skills_list", "skills_use", "skill_list", "skill_load",
                   "aws_list_resources", "aws_get_metrics", "aws_cost_analysis",
                   "aws_logs_inspect", "generate_image"}
 SUBAGENT_ROLES = {
@@ -714,9 +731,10 @@ def _deck_html(title, subtitle, slides):
 
 
 # ---------------------------------------------------------------- tool executor
-def exec_tool(name, args, sid=None, attachments=None):
+def exec_tool(name, args, sid=None, attachments=None, user_id=None, username=None):
     """Jalankan tool. AWS ops pakai sesi STS single-use; web tools via Gateway;
     CI/Canvas/KB native. Return dict (JSON-safe)."""
+    user_id_arg = user_id or str(args.get("userId", "")) or "unknown"
     # ---- KB search (runtime role, read-only) ----
     if name == "kb_search":
         q = args.get("query", "")
@@ -795,26 +813,33 @@ def exec_tool(name, args, sid=None, attachments=None):
             return {"status": "error", "message": "key tidak valid (harus di bawah docs/)"}
         try:
             obj = get_client("s3").get_object(Bucket=KB_BUCKET, Key=key)
-            content = obj["Body"].read().decode("utf-8", "ignore")[:30000]
-            return {"status": "ok", "key": key, "content": content,
-                    "truncated": obj["ContentLength"] > 30000}
+            body = obj["Body"].read()
+            try:
+                txt = body.decode("utf-8")
+            except UnicodeDecodeError:
+                return {"status": "ok", "key": key, "binary": True, "size": len(body),
+                        "note": "File biner (PDF/gambar). Ringkas metadata saja; lihat kb_list_docs."}
+            return {"status": "ok", "key": key, "size": len(body), "content": txt[:30000],
+                    "truncated": len(txt) > 30000}
         except Exception as e:
             return {"status": "error", "message": str(e)[:200]}
 
-    if name == "kb_edit_doc":
-        key = args.get("key", "")
-        content = args.get("content", "")
-        if not key.startswith("docs/") or ".." in key:
-            return {"status": "error", "message": "key tidak valid (harus di bawah docs/)"}
+    if name in ("kb_edit_doc", "kb_write_doc"):
+        key = str(args.get("key", "")).strip()
+        content = str(args.get("content", ""))
+        if not key.startswith(KB_DOCS_PREFIX) or ".." in key or not "." in key.split("/")[-1]:
+            return {"status": "error", "message": "key harus berformat docs/nama-file.md (lihat kb_list_docs)"}
         if len(content) < 30:
             return {"status": "error", "message": "konten terlalu pendek (min 30 karakter)"}
         s3c = get_client("s3")
         try:
             s3c.head_object(Bucket=KB_BUCKET, Key=key)
         except Exception:
-            return {"status": "error", "message": f"dokumen tidak ditemukan: {key} (cek kb_list_docs)"}
-        s3c.put_object(Bucket=KB_BUCKET, Key=key, Body=content[:30000].encode(),
-                       ServerSideEncryption="aws:kms", ContentType="text/markdown")
+            if name == "kb_edit_doc":
+                return {"status": "error", "message": f"dokumen tidak ditemukan: {key} (cek kb_list_docs)"}
+            # kb_write_doc boleh membuat dokumen baru
+        s3c.put_object(Bucket=KB_BUCKET, Key=key, Body=content[:200000].encode(),
+                       ServerSideEncryption="aws:kms", ContentType="text/markdown; charset=utf-8")
         job_status = ""
         try:
             ba = get_client("bedrock-agent")
@@ -843,7 +868,7 @@ def exec_tool(name, args, sid=None, attachments=None):
                 "note": "Dokumen dihapus & re-index dimulai. Dokumen hilang permanen."}
 
     # ---- Skills library (v3.5: Agent Skills ala Claude, progressive disclosure) ----
-    if name == "skills_list":
+    if name in ("skills_list", "skill_list"):
         try:
             items = skills_list_cached()
             return {"status": "ok", "count": len(items), "skills": items,
@@ -851,12 +876,13 @@ def exec_tool(name, args, sid=None, attachments=None):
         except Exception as e:
             return {"status": "error", "message": str(e)[:200]}
 
-    if name == "skills_use":
+    if name in ("skills_use", "skill_load"):
         slug = _skill_slug(args.get("name", ""))
         if not slug:
             return {"status": "error", "message": "nama skill kosong"}
         try:
             key = f"{SKILLS_PREFIX}{slug}/SKILL.md"
+            key = str(args.get("key", "")) if args.get("key", "") else key
             obj = get_client("s3").get_object(Bucket=ART_BUCKET, Key=key)
             body = obj["Body"].read().decode("utf-8", "ignore")
             return {"status": "ok", "name": slug, "skill_md": body[:22000],
@@ -886,6 +912,85 @@ def exec_tool(name, args, sid=None, attachments=None):
         return {"status": "ok", "key": key, "name": slug,
                 "note": "Skill tersimpan permanen di library. Ia otomatis muncul di skills_list."}
 
+    # ---- v4.0: Tugas Terjadwal (scheduled tasks ala ChatGPT Tasks) ----
+    if name == "task_schedule":
+        if not SCHEDULES_TABLE:
+            return {"status": "error", "message": "scheduler belum dikonfigurasi"}
+        act = str(args.get("action", "create"))
+        ddb = get_client("dynamodb")
+        if act == "create":
+            prompt = str(args.get("prompt") or args.get("description") or "").strip()
+            when = str(args.get("when", "")).strip()   # one-shot: "2026-09-01T09:00" (WIB) / "besok jam 9" / "2 menit"
+            repeat = str(args.get("repeat", "once"))   # once | daily | weekly | hourly
+            if not prompt:
+                return {"status": "error", "message": "prompt kosong — masukkan instruksi tugas yang mau dijadwalkan"}
+            import datetime as _dt
+            now = _dt.datetime.now(_dt.timezone(_dt.timedelta(hours=7)))
+            nxt = None
+            # 1) relasi: "N menit|minute|min" / "N jam|hour" / "N hari|day"
+            rel = re.search(r"(\d+)\s*(menit|minute|min|jam|hour|hari|day)", when.lower())
+            if rel:
+                n = int(rel.group(1))
+                unit = rel.group(2)
+                if unit in ("menit", "minute", "min"):
+                    nxt = now + _dt.timedelta(minutes=n)
+                elif unit in ("jam", "hour"):
+                    nxt = now + _dt.timedelta(hours=n)
+                else:
+                    nxt = now + _dt.timedelta(days=n)
+            # 2) absolut: "YYYY-MM-DDTHH:MM"
+            if nxt is None and when:
+                try:
+                    m = re.search(r"(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})", when)
+                    if m:
+                        nxt = _dt.datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)),
+                                           int(m.group(4)), int(m.group(5)), tzinfo=now.tzinfo)
+                except Exception:
+                    pass
+            # 3) jam peluru: "jam 9" / "pukul 14.30" / "at 9:00"
+            if nxt is None:
+                hh = re.search(r"jam (\d{1,2})[:.]?(\d{2})?|pukul (\d{1,2})[:.]?(\d{2})?|at (\d{1,2})[:.]?(\d{2})?", when.lower())
+                if hh:
+                    g = [x for x in hh.groups() if x is not None]
+                    h_, m_ = int(g[0]), int(g[1]) if len(g) > 1 else 0
+                    nxt = now.replace(hour=h_ % 24, minute=m_, second=0, microsecond=0)
+                    if nxt <= now:
+                        nxt += _dt.timedelta(days=1)
+            if repeat == "daily":
+                if nxt is None or nxt <= now:
+                    nxt = now + _dt.timedelta(days=1)
+            elif repeat == "weekly":
+                if nxt is None or nxt <= now:
+                    nxt = now + _dt.timedelta(weeks=1)
+            elif repeat == "hourly":
+                nxt = now + _dt.timedelta(hours=1)
+            if nxt is None:
+                nxt = now + _dt.timedelta(hours=1)
+            sch_id = f"sch-{uuid.uuid4().hex[:10]}"
+            ddb.put_item(TableName=SCHEDULES_TABLE, Item={
+                "id": {"S": sch_id}, "userId": {"S": user_id_arg},
+                "username": {"S": str(username or args.get("username", "user"))},
+                "sessionId": {"S": str(args.get("sessionId", sid or ""))[:64]},
+                "prompt": {"S": prompt[:2000]}, "repeat": {"S": repeat[:16]},
+                "nextRunAt": {"N": str(int(nxt.timestamp() * 1000))},
+                "enabled": {"BOOL": True}, "runs": {"N": "0"},
+                "createdAt": {"N": str(now_ms())},
+                "description": {"S": str(args.get("description", ""))[:200]}})
+            return {"status": "ok", "id": sch_id, "nextRun": nxt.isoformat(), "repeat": repeat,
+                    "note": "Tugas terjadwal dibuat. Hasilnya otomatis muncul sebagai pesan agent di sesi."}
+        if act == "list":
+            r = ddb.scan(TableName=SCHEDULES_TABLE,
+                         FilterExpression="userId = :u", ExpressionAttributeValues={":u": {"S": user_id_arg}})
+            items = [{"id": i.get("id", {}).get("S", ""), "prompt": i.get("prompt", {}).get("S", "")[:120],
+                      "repeat": i.get("repeat", {}).get("S", ""),
+                      "nextRunAt": i.get("nextRunAt", {}).get("N", ""),
+                      "enabled": i.get("enabled", {}).get("BOOL", False)} for i in r.get("Items", [])]
+            return {"status": "ok", "count": len(items), "schedules": items}
+        if act == "delete":
+            ddb.delete_item(TableName=SCHEDULES_TABLE, Key={"id": {"S": str(args.get("id", ""))}})
+            return {"status": "ok", "deleted": str(args.get("id", ""))}
+        return {"status": "error", "message": f"action {act} tidak dikenal (create|list|delete)"}
+
     # ---- Web tools via AgentCore Gateway (MCP) ----
     if name in GATEWAY_TOOLS:
         try:
@@ -905,13 +1010,17 @@ def exec_tool(name, args, sid=None, attachments=None):
         if not code.strip():
             return {"status": "error", "message": "code kosong"}
         sess_r = bac.start_code_interpreter_session(codeInterpreterIdentifier=CI_ID,
-                                                    sessionTimeoutSeconds=180)
+                                                    sessionTimeoutSeconds=600)
         csession = sess_r["sessionId"]
         try:
             inv = bac.invoke_code_interpreter(
                 codeInterpreterIdentifier=CI_ID, sessionId=csession,
-                name="executeCode", arguments={"code": code})
-            result = inv.get("stream", {}).get("result", {})
+                name="executeCode", arguments={"code": code, "language": "python"})
+            # API baru: jawaban berupa EventStream; kumpulkan event hasil terakhir
+            result = {}
+            for ev in inv.get("stream", []):
+                if isinstance(ev, dict) and "result" in ev:
+                    result = ev["result"] or {}
             structured = result.get("structuredContent", {}) or {}
             out = {"status": "ok", "stdout": (structured.get("stdout") or "")[:6000],
                    "stderr": (structured.get("stderr") or "")[:2000],
@@ -974,12 +1083,47 @@ def exec_tool(name, args, sid=None, attachments=None):
                 last = str(e)
                 continue
         if not img:
-            return {"status": "error", "message": f"nova canvas gagal: {last[:200]}",
-                    "note": ("Generate gambar belum tersedia di akun AWS ini (akses model image "
-                             "belum diaktifkan/di-deprecated). Jelaskan ke user dengan ramah bahwa "
-                             "fitur gambar sedang tidak tersedia di akun ini, dan tawarkan alternatif "
-                             "(mis. deskripsi visual terperinci, diagram via code interpreter, atau "
-                             "deck/artefak lain). Jangan mengarang URL gambar.")}
+            # ---- Fallback v4.0: AI SVG-art (selalu tersedia) ----
+            # Model T2I tidak aktif di akun ini? Agent menggambar sendiri via LLM:
+            # SVG vektor (gradien, bentuk, komposisi) yang tampil bagus di browser.
+            try:
+                put_trace(sid or "-", "image_gen", "T2I model tidak tersedia -> fallback AI SVG-art")
+                svg_prompt = (
+                    "Buat SATU gambar ilustrasi vektor SVG untuk prompt berikut.\n"
+                    f"PROMPT: {prompt[:600]}\n\n"
+                    "ATURAN WAJIB:\n"
+                    "1. Keluarkan HANYA kode SVG, tanpa penjelasan, tanpa blok kode markdown.\n"
+                    "2. Mulai dengan <svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 1024 1024\">.\n"
+                    "3. Gunakan gradien (<linearGradient>/<radialGradient>), bentuk kaya, detail, "
+                    "komposisi artistik profesional. Gambar harus terlihat PENUH (bukan polos).\n"
+                    "4. Tanpa teks panjang di dalam gambar (maks 2-3 kata label bila perlu).\n"
+                    "5. Tanpa referensi eksternal (tanpa <image href>, tanpa font kustom).\n"
+                    "6. Untuk lanskap/portrait gunakan viewBox 1280x768 atau 768x1280 sesuai dimensi.\n"
+                    f"7. Dimensi diminta: {w}x{h}.\n")
+                sr = get_client("bedrock-runtime").converse(
+                    modelId=DEEP_MODEL,
+                    messages=[{"role": "user", "content": [{"text": svg_prompt}]}],
+                    system=[{"text": "Anda ilustrator vektor ahli. Output HANYA SVG valid."}],
+                    inferenceConfig={"maxTokens": 9000, "temperature": 0.7, "topP": 0.95})
+                svg = "".join(c.get("text", "") for c in sr["output"]["message"]["content"] if "text" in c)
+                msvg = re.search(r"<svg[\s\S]*?</svg>", svg)
+                if not msvg or len(msvg.group(0)) < 120:
+                    raise ValueError("model tidak menghasilkan SVG valid")
+                svg_txt = msvg.group(0)
+                key = f"gen/art-{uuid.uuid4().hex}.svg"
+                get_client("s3").put_object(Bucket=ART_BUCKET, Key=key, Body=svg_txt.encode(),
+                                            ServerSideEncryption="AES256", ContentType="image/svg+xml")
+                url = _art_public_url(key)
+                if attachments is not None:
+                    attachments.append({"type": "image", "url": url, "name": key.split("/")[-1]})
+                return {"status": "ok", "image": url, "prompt": prompt[:200], "engine": "svg-art",
+                        "note": ("Gambar dibuat via AI SVG-art (mesin vektor; model raster tidak aktif "
+                                 "di akun ini). Sertakan di jawaban dengan markdown ![gambar](" + url + ") "
+                                 "dan sebutkan singkat bahwa formatnya vektor SVG.")}
+            except Exception as es:
+                return {"status": "error", "message": f"nova canvas gagal: {last[:160]}; svg-art: {str(es)[:160]}",
+                        "note": ("Kedua mesin gambar gagal. Jelaskan dengan ramah dan tawarkan "
+                                 "alternatif (deskripsi visual, diagram code_interpreter). Jangan mengarang URL.")}
         key = f"gen/canvas-{uuid.uuid4().hex}.png"
         get_client("s3").put_object(Bucket=ART_BUCKET, Key=key, Body=__import__("base64").b64decode(img),
                       ServerSideEncryption="AES256", ContentType="image/png")
@@ -1405,7 +1549,7 @@ IDENTITAS & TUGAS
 
 PENGETAHUAN & KAPABILITAS (WAJIB dipahami)
 - Pengetahuan dasar Anda dimutakhirkan sampai HARI INI. Untuk hal yang bisa berubah (harga, versi, rilis, berita, kondisi terkini) JANGAN bilang "tidak tahu / cutoff" — panggil web_search, lalu web_fetch bila perlu membaca halamannya. Jawaban Anda dianggap terkini oleh pengguna.
-- Kapabilitas Anda: browsing web real-time (web_search + web_fetch), code interpreter (Python/matplotlib + akses internet utk scraping/pip install), generate gambar (Nova Canvas), memori jangka panjang lintas sesi (AgentCore Memory), skill library (skills_list/skills_use — panduan ahli per domain), multi-agent (subagent_run), todo list live (task_plan), deck presentasi (generate_presentation), web app (deploy_web_app), serta operasi penuh AWS: EC2, EKS, RDS, S3, VPC, Lambda, DynamoDB, CloudWatch, Cost Explorer, CloudFormation.
+- Kapabilitas Anda: browsing web real-time (web_search + web_fetch), code interpreter (Python/matplotlib untuk analisis data & chart, DAN web scraping — internet tersedia, pakai requests+bs4 dengan User-Agent browser), generate gambar (Nova Canvas, otomatis fallback AI SVG-art vektor sehingga selalu menghasilkan gambar), memori jangka panjang lintas sesi (AgentCore Memory), SKILLS eksperti (skills_list/skill_list + skills_use/skill_load — muat dan ikuti skill yang relevan; skills_save untuk menyimpan pola kerja baru), multi-agent (subagent_run), todo list live (task_plan), tugas terjadwal otomatis (task_schedule — create/list/delete, hasil terkirim ke sesi), manajemen Knowledge Base penuh via perintah (kb_list_docs/kb_read_doc/kb_edit_doc/kb_delete_doc/kb_sync), membuat deck presentasi (generate_presentation) dan web app (deploy_web_app), serta operasi penuh AWS: EC2, EKS, RDS, S3, VPC, Lambda, DynamoDB, CloudWatch, Cost Explorer, CloudFormation.
 - Bila pengguna bertanya "kamu bisa apa" atau meminta daftar kemampuan: jawab ringkas dengan daftar kapabilitas di atas (bahasa pengguna) — JANGAN menolak atau bertanya balik.
 - Bila Anda menemukan update AWS penting (resource/service baru, perubahan harga, deprecation), simpan ringkasannya ke Knowledge Base via kb_upload_doc lalu kb_sync agar pengetahuan internal tim selalu mutakhir.
 
@@ -1473,6 +1617,7 @@ MODE_PROMPTS = {
     "PRESENTATION": "\n\nMODE PRESENTATION: Pengguna ingin materi presentasi. Susun deck 5-12 slide dengan struktur naratif (konteks -> isi -> data -> rekomendasi), bullet ringkas per slide, lalu panggil generate_presentation. Deck tampil otomatis di chat; ringkas isi deck di jawaban.",
     "TODO": "\n\nMODE TODO LIST: Pecah permintaan pengguna menjadi langkah-langkah jelas dan panggil task_plan PERTAMA. Kerjakan langkah demi langkah, update status tiap langkah (in_progress -> completed), dan tampilkan progres akhir.",
     "MULTI": "\n\nMODE MULTI-AGENT: Wajib delegasikan pekerjaan via subagent_run ke 2-4 peran spesialis yang relevan (researcher/analyst/architect/coder/reviewer/ops), jalankan bertahap, lalu SINTESIS temuan semua subagent menjadi satu jawaban final yang kohesif. Sebutkan singkat peran mana yang berkontribusi.",
+    "RESEARCH": "\n\nMODE DEEP RESEARCH: Pengguna meminta riset mendalam/komprehensif. Lakukan riset berlapis: task_plan dulu (sub-topik), web_search + web_fetch dari BANYAK sumber berbeda (min 4-8 sumber), gunakan subagent_run(researcher) untuk sub-topik paralel, ekstraksi data via code_interpreter bila perlu. Sintesis menjadi LAPORAN RISET terstruktur (ringkasan eksekutif, temuan dengan angka & sitasi URL, analisis, rekomendasi, tabel/perbandingan bila relevan). Sebutkan daftar sumber di akhir.",
 }
 
 
@@ -1516,7 +1661,7 @@ def route_model(mode, model_id, agent_mode="STANDARD"):
 
 
 # LOOP_LIMITS kini berdasarkan mode TUGAS agent (bukan mode model)
-LOOP_LIMITS = {"STANDARD": 8, "LONG": 24, "FULLSTACK": 16, "PRESENTATION": 16, "TODO": 10, "MULTI": 14}
+LOOP_LIMITS = {"STANDARD": 8, "LONG": 24, "FULLSTACK": 16, "PRESENTATION": 16, "TODO": 10, "MULTI": 14, "RESEARCH": 18}
 
 # ---- lampiran chat (v3.4) ----
 ATT_MAX_PER_FILE = 24_000        # maksimal karakter teks per file ke konteks
@@ -1527,8 +1672,10 @@ TEXT_EXTS = {"txt", "md", "csv", "json", "log", "yaml", "yml", "xml", "html",
              "sh", "sql", "ini", "conf", "toml", "env", "tsv"}
 
 
-def call_converse(model_id, messages, inference, extra, use_cache, with_tools=True, with_guardrail=True, agent_mode="STANDARD"):
+def call_converse(model_id, messages, inference, extra, use_cache, with_tools=True, with_guardrail=True, agent_mode="STANDARD", system_extra=""):
     system_text = SYSTEM_PROMPT + MODE_PROMPTS.get(agent_mode or "", "")
+    if system_extra:
+        system_text += "\n\n" + system_extra
     system = [{"text": system_text}]
     if use_cache:
         system.append({"cachePoint": {"type": "default"}})
@@ -1637,8 +1784,22 @@ def handle_chat(payload):
         mode = "AUTO"
     # v3.4.2: mode tugas agent terpisah dari mode model
     agent_mode = payload.get("agentMode", "STANDARD")
-    if agent_mode not in ("STANDARD", "LONG", "FULLSTACK", "PRESENTATION", "TODO", "MULTI"):
+    if agent_mode not in ("STANDARD", "LONG", "FULLSTACK", "PRESENTATION", "TODO", "MULTI", "RESEARCH"):
         agent_mode = "STANDARD"
+    # v4.0: skill eksplisit dari picker UI (mis. "anthropic-docx") -> muat konten skill
+    skill_extra = ""
+    skill_name = str(payload.get("skill", "") or "").strip()[:60]
+    if skill_name:
+        try:
+            sk = exec_tool("skills_use", {"name": skill_name}, user_id=user_id, username=username)
+            if sk.get("status") == "ok":
+                skill_extra = (f"[SKILL AKTIF: {skill_name}]\n{sk['skill_md'][:20000]}\n[/SKILL]\n"
+                               "IKUTI panduan skill di atas selama mengerjakan permintaan pengguna.")
+                put_trace(sid, "skill_load", f"Skill '{skill_name}' dimuat ({len(sk['skill_md'])} char)")
+            else:
+                put_trace(sid, "error", f"Skill '{skill_name}' gagal dimuat: {sk.get('message', '')[:120]}")
+        except Exception as se:
+            put_trace(sid, "error", f"skill load exception: {str(se)[:150]}")
     # v3.4.2: guardrail hanya utk level di bawah superadmin
     guardrail_bypass = str(payload.get("userRole", "user")).lower() == "superadmin"
     model_id = payload.get("modelId")
@@ -1773,7 +1934,8 @@ def handle_chat(payload):
             with_tools = not tools_disabled
             try:
                 resp = call_converse(model, conv, inf, extra, cache, with_tools=with_tools,
-                                     with_guardrail=not guardrail_bypass, agent_mode=agent_mode)
+                                     with_guardrail=not guardrail_bypass, agent_mode=agent_mode,
+                                         system_extra=skill_extra)
             except Exception as e:
                 emsg = str(e)
                 if with_tools and ("toolConfig" in emsg or "tool" in emsg.lower()
@@ -1781,7 +1943,8 @@ def handle_chat(payload):
                     put_trace(sid, "error", f"Model tak mendukung tools: {emsg[:200]} - retry teks-only", model=model)
                     tools_disabled = True
                     resp = call_converse(model, conv, inf, extra, cache, with_tools=False,
-                                         with_guardrail=not guardrail_bypass, agent_mode=agent_mode)
+                                         with_guardrail=not guardrail_bypass, agent_mode=agent_mode,
+                                         system_extra=skill_extra)
                 elif "image" in emsg.lower() or "gambar" in emsg.lower():
                     # v3.4.2: model ternyata tak support gambar -> fallback vision sekali
                     put_trace(sid, "error", f"{model} tak support gambar -> fallback {VISION_MODEL}", model=model)
@@ -1790,7 +1953,8 @@ def handle_chat(payload):
                     rm3 = route_model("FAST" if agent_mode == "STANDARD" else "DEEP", model, agent_mode)
                     inf, extra, cache = rm3[1], rm3[2], rm3[3]
                     resp = call_converse(model, conv, inf, extra, cache, with_tools=with_tools,
-                                         with_guardrail=not guardrail_bypass, agent_mode=agent_mode)
+                                         with_guardrail=not guardrail_bypass, agent_mode=agent_mode,
+                                         system_extra=skill_extra)
                 else:
                     raise
             stop = resp["stopReason"]
@@ -1869,7 +2033,8 @@ def handle_chat(payload):
                     else:
                         try:
                             t0 = time.time()
-                            result = exec_tool(tname, targs, sid=sid, attachments=attachments)
+                            result = exec_tool(tname, targs, sid=sid, attachments=attachments,
+                                               user_id=user_id, username=username)
                             dt = time.time() - t0
                             put_trace(sid, "tool_result",
                                       f"{tname} ({dt:.1f}s) -> {json.dumps(result, ensure_ascii=False)[:1000]}", model=model)

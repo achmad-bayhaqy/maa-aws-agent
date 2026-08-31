@@ -37,12 +37,12 @@
   "gateway_arn": "arn:aws:bedrock-agentcore:us-east-1:715841354009:gateway/maa-agent-gateway-5lxtizrspo",
   "gateway_target_id": "SBFSMQQKRO",
   "policy_engine_id": "maa_agent_policy_engine-my3q_aj5ay",
-  "ci_id": "maacodeinterpreter-z0bO1bl59p",
+  "ci_id": "maa_code_interpreter_9edf10-yvesUbrskO",
   "evaluator_id": "maa_helpfulness-4YXW7CBNUY",
   "online_eval_id": "maa_agent_online_eval-giXDCf4kPm",
   "runtime_role_arn": "arn:aws:iam::715841354009:role/maa-agent-runtime-role",
-  "agent_runtime_arn": "arn:aws:bedrock-agentcore:us-east-1:715841354009:runtime/maa_agent_runtime-Rei0DkHQl3",
-  "agent_runtime_id": "maa_agent_runtime-Rei0DkHQl3",
+  "agent_runtime_arn": "arn:aws:bedrock-agentcore:us-east-1:715841354009:runtime/maa_agent_runtime-zgAUGI9lNO",
+  "agent_runtime_id": "maa_agent_runtime-zgAUGI9lNO",
   "api_id": "ooo147978h",
   "api_url": "https://ooo147978h.execute-api.us-east-1.amazonaws.com/v1",
   "amplify_app_id": "dnhise495bdci",
@@ -51,5 +51,6 @@
   "demo_instances": [
     "i-0fef7e92b371918c2",
     "i-029d1f842cdd6e0d3"
-  ]
+  ],
+  "schedules_table": "maa-agent-schedules"
 }

@@ -55,7 +55,8 @@ policy = {
                     "dynamodb:Query", "dynamodb:Scan"],
          "Resource": [f"arn:aws:dynamodb:{REGION}:{ACCOUNT_ID}:table/{st['sessions_table']}",
                       f"arn:aws:dynamodb:{REGION}:{ACCOUNT_ID}:table/{st['sessions_table']}/index/*",
-                      f"arn:aws:dynamodb:{REGION}:{ACCOUNT_ID}:table/{st['confirm_table']}"]},
+                      f"arn:aws:dynamodb:{REGION}:{ACCOUNT_ID}:table/{st['confirm_table']}",
+                     f"arn:aws:dynamodb:{REGION}:{ACCOUNT_ID}:table/{st.get('schedules_table', 'maa-agent-schedules')}"]},
         {"Sid": "TraceLogs", "Effect": "Allow",
          "Action": ["logs:GetLogEvents", "logs:DescribeLogStreams"],
          "Resource": f"arn:aws:logs:{REGION}:{ACCOUNT_ID}:log-group:/maa/agent/trace:*"},
@@ -104,6 +105,7 @@ env = {
     "KMS_KEY_ID": st["kms_key_id"],
     "CONF_TABLE": st["confirm_table"],
     "TRACE_LOG_GROUP": st.get("trace_log_group", "/maa/agent/trace"),
+    "SCHEDULES_TABLE": st.get("schedules_table", ""),
 }
 try:
     fn = lam.get_function(FunctionName=EDGE_FN)
@@ -199,6 +201,9 @@ ROUTES = [
     # v3.5: Skills Library (Agent Skills)
     ("/skills/list", ["GET", "OPTIONS"]),
     ("/skills/get", ["GET", "OPTIONS"]),
+    # v4.0: buka file + alias konten KB
+    ("/files/view", ["GET", "OPTIONS"]),
+    ("/kb/content", ["GET", "POST", "OPTIONS"]),
     # situs dokumentasi
     ("/docs/list", ["GET", "OPTIONS"]),
     ("/docs/content", ["GET", "POST", "OPTIONS"]),

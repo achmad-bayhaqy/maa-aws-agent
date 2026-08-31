@@ -2,10 +2,10 @@
 
 import { useEffect, useRef, useState } from 'react';
 import {
-  ArrowUp, Brain, Check, Clapperboard, Code2, Gauge, ListTodo, Loader2,
+  ArrowUp, BookOpen, Brain, Check, Clapperboard, Code2, Gauge, ListTodo, Loader2,
   Paperclip, Route, SlidersHorizontal, Sparkles, Timer, Users, X, Zap,
 } from 'lucide-react';
-import type { AgentMode, ChatMode, MaaModel } from '@/lib/maa';
+import type { AgentMode, ChatMode, MaaModel, MaaSkill } from '@/lib/maa';
 import { fmtBytes } from '@/lib/maa';
 import { ModelPicker } from './model-picker';
 
@@ -25,6 +25,7 @@ const AGENT_MODES: { id: AgentMode; label: string; icon: React.ReactNode; desc: 
   { id: 'PRESENTATION', label: 'Presentasi', icon: <Clapperboard className="h-4 w-4" />, desc: 'Susun slide deck profesional otomatis' },
   { id: 'TODO', label: 'Todo List', icon: <ListTodo className="h-4 w-4" />, desc: 'Rencana langkah tampil sebagai checklist live yang diperbarui agent' },
   { id: 'MULTI', label: 'Multi-Agent', icon: <Users className="h-4 w-4" />, desc: 'Delegasi ke subagent spesialis (riset, arsitek, coder, reviewer) lalu sintesis' },
+  { id: 'RESEARCH', label: 'Riset Mendalam', icon: <BookOpen className="h-4 w-4" />, desc: 'Riset berlapis multi-sumber (4-8 sumber + subagent paralel) jadi laporan lengkap dengan sitasi' },
 ];
 
 const MAX_H = 5 * 24 + 16; // ±5 baris
@@ -54,6 +55,9 @@ export function Composer({
   onRemoveUpload,
   disabled,
   busy,
+  skills = [],
+  activeSkill,
+  onSkillChange,
   placeholder = 'Tanya apa saja tentang AWS Anda…',
 }: {
   mode: ChatMode;
@@ -70,13 +74,18 @@ export function Composer({
   onRemoveUpload?: (key: string) => void;
   disabled?: boolean;
   busy?: boolean;
+  skills?: MaaSkill[];
+  activeSkill?: string;
+  onSkillChange?: (name: string) => void;
   placeholder?: string;
 }) {
   const [text, setText] = useState('');
   const [agentOpen, setAgentOpen] = useState(false);
+  const [skillOpen, setSkillOpen] = useState(false);
   const taRef = useRef<HTMLTextAreaElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
   const agentRef = useRef<HTMLDivElement>(null);
+  const skillRef = useRef<HTMLDivElement>(null);
 
   // auto-grow
   useEffect(() => {
@@ -95,6 +104,16 @@ export function Composer({
     document.addEventListener('mousedown', onDoc);
     return () => document.removeEventListener('mousedown', onDoc);
   }, [agentOpen]);
+
+  // tutup popover skill saat klik di luar
+  useEffect(() => {
+    if (!skillOpen) return;
+    const onDoc = (e: MouseEvent) => {
+      if (skillRef.current && !skillRef.current.contains(e.target as Node)) setSkillOpen(false);
+    };
+    document.addEventListener('mousedown', onDoc);
+    return () => document.removeEventListener('mousedown', onDoc);
+  }, [skillOpen]);
 
   const uploadsReady = (uploads || []).filter((u) => !u.error && u.progress >= 100);
   const uploadingNow = (uploads || []).some((u) => u.progress < 100 && !u.error);
@@ -159,6 +178,89 @@ export function Composer({
             disabled={disabled}
             autoDefaults={autoDefaults}
           />
+        )}
+
+        {/* v4.0: picker Skill Library — muat panduan ahli ke konteks agent */}
+        {skills.length > 0 && (
+          <div className="relative" ref={skillRef}>
+            <button
+              type="button"
+              disabled={disabled}
+              onClick={() => setSkillOpen((v) => !v)}
+              aria-haspopup="listbox"
+              aria-expanded={skillOpen}
+              title="Skill Library — muat panduan ahli ke konteks agent"
+              className={`flex h-8 items-center gap-1.5 rounded-full border px-3 text-[11.5px] font-semibold transition-colors disabled:opacity-50 ${
+                activeSkill
+                  ? 'border-[var(--accent)] text-[var(--accent)]'
+                  : 'border-[var(--line-soft)] bg-[var(--bg)] text-[var(--muted-fg)] hover:border-[var(--line)] hover:text-[var(--ink)]'
+              }`}
+            >
+              <BookOpen className="h-3.5 w-3.5" />
+              {activeSkill ? `Skill: ${activeSkill}` : 'Skill'}
+              <Zap className="h-3 w-3 opacity-60" />
+            </button>
+            {skillOpen && (
+              <div
+                role="listbox"
+                aria-label="Skill Library"
+                className="maa-panel absolute bottom-10 left-0 z-40 max-h-[320px] w-[320px] overflow-y-auto p-1.5 shadow-[var(--shadow-soft)]"
+              >
+                <p className="px-2.5 py-1.5 text-[10px] font-semibold uppercase tracking-widest text-[var(--muted-fg)]">
+                  Skill Library ({skills.length})
+                </p>
+                <button
+                  type="button"
+                  role="option"
+                  aria-selected={!activeSkill}
+                  onClick={() => {
+                    onSkillChange?.('');
+                    setSkillOpen(false);
+                  }}
+                  className={`flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-left text-[12.5px] font-semibold transition-colors hover:bg-[var(--muted-bg)] ${
+                    !activeSkill ? 'bg-[var(--accent-soft)]' : ''
+                  }`}
+                >
+                  <X className="h-3.5 w-3.5" style={{ color: 'var(--muted-fg)' }} />
+                  Tanpa skill (default)
+                </button>
+                {skills.map((s) => {
+                  const active = s.folder === activeSkill;
+                  return (
+                    <button
+                      key={s.key}
+                      type="button"
+                      role="option"
+                      aria-selected={active}
+                      onClick={() => {
+                        onSkillChange?.(s.folder);
+                        setSkillOpen(false);
+                      }}
+                      className={`flex w-full items-start gap-2.5 rounded-lg px-2.5 py-2 text-left transition-colors hover:bg-[var(--muted-bg)] ${
+                        active ? 'bg-[var(--accent-soft)]' : ''
+                      }`}
+                    >
+                      <BookOpen className="mt-0.5 h-3.5 w-3.5 shrink-0" style={{ color: active ? 'var(--accent)' : 'var(--muted-fg)' }} />
+                      <span className="min-w-0 flex-1">
+                        <span className="flex items-center gap-1.5 text-[12.5px] font-semibold text-[var(--ink)]">
+                          {s.name}
+                          {active && <Check className="h-3 w-3" style={{ color: 'var(--accent)' }} />}
+                        </span>
+                        {s.description && (
+                          <span className="mt-0.5 block truncate text-[10.5px] leading-snug text-[var(--muted-fg)]">
+                            {s.description}
+                          </span>
+                        )}
+                      </span>
+                    </button>
+                  );
+                })}
+                <p className="mt-1 border-t border-[var(--line-soft)] px-2.5 py-1.5 text-[9.5px] leading-relaxed text-[var(--muted-fg)]">
+                  Skill dimuat penuh ke konteks agent sebagai panduan wajib selama mengerjakan permintaan ini.
+                </p>
+              </div>
+            )}
+          </div>
         )}
 
         {/* mode tugas agent: dropdown ringkas ala toolbar */}

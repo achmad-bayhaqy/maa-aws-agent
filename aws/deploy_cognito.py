@@ -105,7 +105,7 @@ try:
     )
     log(f"+ user '{USERNAME}' created")
 except Exception as e:
-    if "UserExistsException" in str(e):
+    if "UsernameExistsException" in str(e) or "UserExistsException" in str(e):
         log(f"= user '{USERNAME}' exists")
     else:
         raise

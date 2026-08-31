@@ -2,7 +2,10 @@
 """MAA AWS Agent - Edge Lambda v3.5 (thin SigV4 proxy ke AgentCore Runtime).
 v3.5: Management User penuh (rename display-name, ganti role), editor dokumen
 KB (buka/edit dari UI), daftar Skills Library, kelengkapan admin users
-(preferred_username). Kompat penuh kontrak v3.4.x."""
+(preferred_username). Kompat penuh kontrak v3.4.x.
+v4.0 merge: Tugas Terjadwal (tick worker EventBridge), /files/view (buka
+file upload/artefak), /kb/content alias + dukungan skills/, RESEARCH mode,
+skill picker passthrough, auto re-index pasca delete."""
 import json
 import os
 import time
@@ -21,6 +24,7 @@ USER_POOL_ID = os.environ["USER_POOL_ID"]
 KMS_KEY_ID = os.environ["KMS_KEY_ID"]
 CONF_TABLE = os.environ["CONF_TABLE"]
 TRACE_LOG_GROUP = os.environ.get("TRACE_LOG_GROUP", "/maa/agent/trace")
+SCHEDULES_TABLE = os.environ.get("SCHEDULES_TABLE", "")
 
 cfg = Config(retries={"max_attempts": 2, "mode": "standard"}, read_timeout=280)
 lam = boto3.client("lambda", region_name=REGION, config=cfg)
@@ -83,7 +87,7 @@ def is_superadmin(cl):
 # mode model (routing) - v3.4.2: hanya 4
 MODEL_MODES = ("AUTO", "FAST", "DEEP", "MANUAL")
 # mode tugas agent (gaya kerja) - terpisah dari model
-AGENT_MODES = ("STANDARD", "LONG", "FULLSTACK", "PRESENTATION", "TODO", "MULTI")
+AGENT_MODES = ("STANDARD", "LONG", "FULLSTACK", "PRESENTATION", "TODO", "MULTI", "RESEARCH")
 # kompat klien lama (v3.4): mode=LONG/FULLSTACK/PRESENTATION dipetakan ke agentMode
 LEGACY_AGENT_MODES = ("LONG", "FULLSTACK", "PRESENTATION")
 
@@ -150,6 +154,15 @@ def resp(code, body):
                         "Access-Control-Allow-Headers": "Authorization,Content-Type",
                         "Access-Control-Allow-Methods": "GET,POST,DELETE,OPTIONS"},
             "body": json.dumps(body, ensure_ascii=False, default=str)}
+
+
+def resp_redirect(location):
+    """302 redirect utk /files/view (presigned URL / URL publik S3)."""
+    return {"statusCode": 302,
+            "headers": {"Location": location,
+                        "Content-Type": "text/plain",
+                        "Access-Control-Allow-Origin": "*"},
+            "body": ""}
 
 
 def handler(event, context):
@@ -243,7 +256,7 @@ def handler(event, context):
                     payload = {"type": "chat", "sessionId": sid, "userId": cl["userId"],
                                "username": cl["username"], "message": message,
                                "mode": mode, "agentMode": agent_mode,
-                               "userRole": cl["role"], "modelId": body.get("modelId"),
+                               "userRole": cl["role"], "modelId": body.get("modelId"), "skill": body.get("skill"),
                                "attachments": atts}
             else:
                 sid = f"chat-{uuid.uuid4().hex}"
@@ -262,7 +275,7 @@ def handler(event, context):
                 payload = {"type": "chat", "sessionId": sid, "userId": cl["userId"],
                            "username": cl["username"], "message": message,
                            "mode": mode, "agentMode": agent_mode,
-                           "userRole": cl["role"], "modelId": body.get("modelId"), "attachments": atts}
+                           "userRole": cl["role"], "modelId": body.get("modelId"), "skill": body.get("skill"), "attachments": atts}
             lam.invoke(FunctionName=context.function_name,
                        InvocationType="Event",
                        Payload=json.dumps({"_async": "chat", "runtimePayload": payload,
@@ -424,7 +437,17 @@ def handler(event, context):
             if not key.startswith("docs/"):
                 return resp(400, {"error": "key harus di bawah docs/"})
             s3.delete_object(Bucket=KB_BUCKET, Key=key)
-            return resp(200, {"deleted": key})
+            # v4.0: re-index otomatis setelah delete (bukan lagi manual sync)
+            job = {"jobId": "", "status": "skipped"}
+            try:
+                ba = boto3.client("bedrock-agent", region_name=REGION, config=cfg)
+                ds = ba.list_data_sources(knowledgeBaseId=KB_ID)["dataSourceSummaries"]
+                j = ba.start_ingestion_job(knowledgeBaseId=KB_ID, dataSourceId=ds[0]["dataSourceId"],
+                                           description=f"UI delete: {key[:50]}")
+                job = {"jobId": j["ingestionJob"]["ingestionJobId"], "status": j["ingestionJob"]["status"]}
+            except Exception:
+                pass
+            return resp(200, {"deleted": key, "ingestion": job})
 
         # ---------------- KB doc content (v3.5: buka & edit dokumen KB dari UI) ----------------
         if path == "/kb/doc" and method == "GET":
@@ -464,6 +487,51 @@ def handler(event, context):
             except Exception as e:
                 job_status = f"tersimpan, re-index tertunda: {str(e)[:80]}"
             return resp(200, {"saved": True, "key": key, "ingestion": job_status})
+
+        # ---------------- v4.0 alias: /kb/content (kompat klien v4; dukung skills/) ----------------
+        if path == "/kb/content" and method == "GET":
+            key = qs.get("key", "")
+            if (not key.startswith("docs/") and not key.startswith("skills/")) or ".." in key:
+                return resp(400, {"error": "key harus di bawah docs/ atau skills/"})
+            try:
+                obj = s3.get_object(Bucket=KB_BUCKET, Key=key)
+                raw = obj["Body"].read()
+                ct = obj.get("ContentType", "")
+                if ct.startswith("text/") or key.endswith((".md", ".txt", ".csv", ".json", ".yaml", ".yml")):
+                    try:
+                        return resp(200, {"key": key, "kind": "text", "content": raw.decode("utf-8")[:200000],
+                                          "updated": str(obj.get("LastModified", ""))})
+                    except UnicodeDecodeError:
+                        pass
+                url = s3v4.generate_presigned_url("get_object", Params={"Bucket": KB_BUCKET, "Key": key},
+                                                  ExpiresIn=300)
+                return resp(200, {"key": key, "kind": "binary", "contentType": ct,
+                                  "size": len(raw), "downloadUrl": url,
+                                  "updated": str(obj.get("LastModified", ""))})
+            except Exception:
+                return resp(404, {"error": "dokumen tidak ditemukan"})
+
+        if path == "/kb/content" and method == "POST":
+            body = json.loads(event.get("body") or "{}")
+            key = body.get("key", "")
+            content = str(body.get("content", ""))
+            if not key.startswith("docs/") or ".." in key or not key.endswith((".md", ".txt")):
+                return resp(400, {"error": "key harus .md/.txt di bawah docs/"})
+            if len(content) > 200_000:
+                return resp(400, {"error": "konten terlalu besar (max 200k char)"})
+            s3.put_object(Bucket=KB_BUCKET, Key=key, Body=content.encode(),
+                          ServerSideEncryption="aws:kms", SSEKMSKeyId=KMS_KEY_ID,
+                          ContentType="text/markdown; charset=utf-8")
+            job = {"jobId": "", "status": "skipped"}
+            try:
+                ba = boto3.client("bedrock-agent", region_name=REGION, config=cfg)
+                ds = ba.list_data_sources(knowledgeBaseId=KB_ID)["dataSourceSummaries"]
+                j = ba.start_ingestion_job(knowledgeBaseId=KB_ID, dataSourceId=ds[0]["dataSourceId"],
+                                           description=f"UI edit: {key[:50]}")
+                job = {"jobId": j["ingestionJob"]["ingestionJobId"], "status": j["ingestionJob"]["status"]}
+            except Exception:
+                pass
+            return resp(200, {"saved": True, "key": key, "ingestion": job})
 
         if path == "/kb/sync" and method == "POST":
             ba = boto3.client("bedrock-agent", region_name=REGION, config=cfg)
@@ -548,6 +616,23 @@ def handler(event, context):
                      "updated": str(o["LastModified"])} for o in r.get("Contents", [])]
             return resp(200, {"docs": docs})
 
+        # ---------------- v4.0: buka file upload/artefak (auth) ----------------
+        if path == "/files/view" and method == "GET":
+            key = qs.get("key", "")
+            if not key or ".." in key:
+                return resp(400, {"error": "key tidak valid"})
+            if key.startswith(("gen/", "decks/", "apps/")):
+                # artefak generate: URL publik permanen (v3.4.3)
+                return resp_redirect(f"https://{ART_BUCKET}.s3.{REGION}.amazonaws.com/{key}")
+            if key.startswith(f"uploads/{cl['userId']}/") or \
+                    (is_superadmin(cl) and key.startswith("uploads/")):
+                # upload user: presigned GET via kredensial role edge Lambda
+                url = s3v4.generate_presigned_url("get_object",
+                                                  Params={"Bucket": ART_BUCKET, "Key": key},
+                                                  ExpiresIn=300)
+                return resp_redirect(url)
+            return resp(403, {"error": "tidak berhak mengakses file ini"})
+
         # ---------------- Skills Library (v3.5) ----------------
         if path == "/skills/list" and method == "GET":
             r = s3.list_objects_v2(Bucket=ART_BUCKET, Prefix="skills/", MaxKeys=200)
@@ -602,7 +687,7 @@ def handler(event, context):
                     attrs = {a["Name"]: a["Value"] for a in u.get("Attributes", [])}
                     users.append({"username": u.get("Username", ""),
                                   "email": attrs.get("email", ""),
-                                  "name": attrs.get("preferred_username", ""),
+                                  "name": attrs.get("name", "") or attrs.get("preferred_username", ""),
                                   "status": u.get("UserStatus", ""),
                                   "enabled": u.get("Enabled", False),
                                   "created": str(u.get("UserCreateDate", "")),
@@ -704,7 +789,8 @@ def handler(event, context):
                 return resp(400, {"error": "nama tampilan wajib (1-60 karakter)"})
             cog.admin_update_user_attributes(
                 UserPoolId=USER_POOL_ID, Username=username,
-                UserAttributes=[{"Name": "preferred_username", "Value": name}])
+                UserAttributes=[{"Name": "name", "Value": name},
+                                {"Name": "preferred_username", "Value": name}])
             return resp(200, {"updated": True, "username": username, "name": name})
 
         if path == "/admin/users/role" and method == "POST":
@@ -713,13 +799,15 @@ def handler(event, context):
             body = json.loads(event.get("body") or "{}")
             username = body.get("username", "")
             role = body.get("role", "user")
-            if role not in ("user", "superadmin"):
-                return resp(400, {"error": "role harus user|superadmin"})
+            ROLES = ("user", "operator", "admin", "superadmin")
+            if role not in ROLES:
+                return resp(400, {"error": "role harus user|operator|admin|superadmin"})
             if username == cl["username"] and role != "superadmin":
                 return resp(400, {"error": "tidak bisa menurunkan role diri sendiri"})
             cog.admin_update_user_attributes(
                 UserPoolId=USER_POOL_ID, Username=username,
                 UserAttributes=[{"Name": "custom:role", "Value": role}])
+            # group superadmin = bypass guardrail + akses penuh; sinkronkan membership
             try:
                 if role == "superadmin":
                     cog.admin_add_user_to_group(UserPoolId=USER_POOL_ID,
@@ -729,8 +817,13 @@ def handler(event, context):
                                                      GroupName="superadmin", Username=username)
             except Exception:
                 pass
+            # global signout agar role baru efektif pada token berikutnya
+            try:
+                cog.admin_user_global_sign_out(UserPoolId=USER_POOL_ID, Username=username)
+            except Exception:
+                pass
             return resp(200, {"updated": True, "username": username, "role": role,
-                              "note": "Role baru berlaku pada login/token berikutnya."})
+                              "note": "Role diperbarui; user di-signout agar token baru memuat role."})
 
         if path == "/admin/signout" and method == "POST":
             cog.admin_user_global_sign_out(UserPoolId=USER_POOL_ID, Username=cl["username"])
@@ -775,6 +868,85 @@ def async_handler(event, context):
                 UpdateExpression="SET #s = :st, err = :e, updatedAt = :u",
                 ExpressionAttributeNames={"#s": "status"},
                 ExpressionAttributeValues={":st": "error", ":e": str(e)[:500], ":u": str(now_ms())})
+        return {"ok": True}
+
+    if event.get("_async") == "schedule" and SCHEDULES_TABLE:
+        # v4.0: Tugas Terjadwal — dipicu EventBridge Scheduler tiap menit.
+        # Scan tugas yang jatuh tempo, eksekusi via runtime, jadwalkan ulang.
+        now_ms_v = now_ms()
+        sched = ddb_res.Table(SCHEDULES_TABLE)
+        try:
+            r = sched.scan(FilterExpression="#n <= :now AND enabled = :t",
+                           ExpressionAttributeNames={"#n": "nextRunAt"},
+                           ExpressionAttributeValues={":now": now_ms_v, ":t": True})
+        except Exception as e:
+            print(f"[schedule] scan failed: {e}")
+            return {"ok": False}
+        for item in r.get("Items", []):
+            sid = item.get("sessionId", "") or f"chat-{uuid.uuid4().hex}"
+            uid = item.get("userId", "unknown")
+            uname = item.get("username", "user")
+            prompt = str(item.get("prompt", ""))
+            # pastikan record sesi ada (agar async chat path bisa update)
+            rec = sessions_tbl.get_item(Key={"sessionId": sid}).get("Item")
+            if not rec:
+                sessions_tbl.put_item(Item={
+                    "sessionId": sid, "userId": uid, "username": uname,
+                    "status": "processing", "mode": "AUTO", "modelId": "",
+                    "title": f"[Terjadwal] {prompt[:60]}",
+                    "messages": [{"role": "user", "text": prompt, "ts": now_ms()}],
+                    "createdAt": str(now_ms_v), "updatedAt": str(now_ms_v),
+                    "expiresAt": now_ms_v // 1000 + 30 * 86400})
+            else:
+                msgs = rec.get("messages", [])
+                msgs.append({"role": "user",
+                             "text": (f"[TUGAS TERJADWAL otomatis - EKSEKUSI SEKARANG, "
+                                      f"JANGAN jadwalkan ulang, JANGAN panggil task_schedule]\n{prompt}"),
+                             "ts": now_ms()})
+                sessions_tbl.update_item(
+                    Key={"sessionId": sid},
+                    UpdateExpression="SET #s = :st, #m = :m, updatedAt = :u",
+                    ExpressionAttributeNames={"#s": "status", "#m": "messages"},
+                    ExpressionAttributeValues={":st": "processing", ":m": msgs,
+                                               ":u": str(now_ms_v)})
+            payload = {"type": "chat", "sessionId": sid, "userId": uid,
+                       "username": uname, "message": prompt, "mode": "AUTO",
+                       "agentMode": "STANDARD", "userRole": "user",
+                       "modelId": None, "attachments": [], "skill": ""}
+            # eksekusi async (self-invoke) agar worker tick cepat selesai
+            try:
+                lam.invoke(FunctionName=context.function_name, InvocationType="Event",
+                           Payload=json.dumps({"_async": "chat", "runtimePayload": payload,
+                                               "user": {"userId": uid, "username": uname}}).encode())
+            except Exception as e:
+                print(f"[schedule] invoke failed: {e}")
+                continue
+            # jadwalkan ulang / matikan
+            repeat = item.get("repeat", "once")
+            runs = int(item.get("runs", 0) or 0) + 1
+            if repeat == "hourly":
+                nxt = now_ms_v + 3600 * 1000
+            elif repeat == "daily":
+                nxt = now_ms_v + 86400 * 1000
+            elif repeat == "weekly":
+                nxt = now_ms_v + 7 * 86400 * 1000
+            else:
+                nxt = None
+            try:
+                if nxt is None:
+                    sched.update_item(Key={"id": item["id"]},
+                                      UpdateExpression="SET runs = :r, enabled = :f, lastRunAt = :la",
+                                      ExpressionAttributeValues={
+                                          ":r": runs, ":f": False, ":la": now_ms_v})
+                else:
+                    sched.update_item(Key={"id": item["id"]},
+                                      UpdateExpression="SET runs = :r, nextRunAt = :n, lastRunAt = :la",
+                                      ExpressionAttributeValues={
+                                          ":r": runs, ":n": nxt, ":la": now_ms_v})
+            except Exception as e:
+                print(f"[schedule] reschedule failed: {e}")
+        if r.get("Items"):
+            print(f"[schedule] executed {len(r['Items'])} due task(s)")
         return {"ok": True}
     return handler(event, context)
 

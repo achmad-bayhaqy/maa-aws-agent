@@ -12,10 +12,10 @@ import {
 import { Sheet, SheetContent, SheetHeader, SheetTitle } from '@/components/ui/sheet';
 import { useToast } from '@/hooks/use-toast';
 import {
-  CONFIG, deleteSession, getModels, getStatus, getSessions, getTrace, loadLastSession,
+  CONFIG, deleteSession, getModels, getStatus, getSessions, getTrace, listSkills, loadLastSession,
   presignChatUpload, revokeToken, saveLastSession, sendChat, sessionIdFromPath, signOutAll,
   stripClarifyBlock, asArray, type Attachment, type AgentMode, type AutoRoute, type ChatMessage,
-  type ChatMode, type ChatStatus, type MeInfo, type MessageAtt, type MaaModel, type SessionRow,
+  type ChatMode, type ChatStatus, type MeInfo, type MessageAtt, type MaaModel, type MaaSkill, type SessionRow,
   type Tokens, type TodoItem, type TraceEvent,
 } from '@/lib/maa';
 import { Logo, LogoWordmark } from './logo';
@@ -115,6 +115,8 @@ export function ChatApp({
   const [mode, setMode] = useState<ChatMode>('AUTO');
   const [agentMode, setAgentMode] = useState<AgentMode>('STANDARD');
   const [manualModel, setManualModel] = useState('');
+  const [skills, setSkills] = useState<MaaSkill[]>([]);
+  const [activeSkill, setActiveSkill] = useState<string>('');
   const [loadingSession, setLoadingSession] = useState(false);
   const [processing, setProcessing] = useState(false);
   const [errorTop, setErrorTop] = useState<string | null>(null);
@@ -378,7 +380,7 @@ export function ChatApp({
               },
             ],
           });
-          const r = await sendChat(token, { message: text, mode, agentMode, modelId, attachments: atts });
+          const r = await sendChat(token, { message: text, mode, agentMode, skill: activeSkill || undefined, modelId, attachments: atts });
           if (run !== runIdRef.current) return;
           setActiveId(r.sessionId);
           window.history.pushState({ sid: r.sessionId }, '', `/c/${r.sessionId}`);
@@ -387,7 +389,7 @@ export function ChatApp({
         } else {
           const sid = activeId;
           await sendChat(token, {
-            message: text, mode, agentMode, modelId, sessionId: sid,
+            message: text, mode, agentMode, skill: activeSkill || undefined, modelId, sessionId: sid,
             ...(atts.length ? { attachments: atts } : {}),
             ...(editFrom !== undefined ? { editFrom } : {}),
           });
@@ -402,7 +404,7 @@ export function ChatApp({
         setErrorTop(`Gagal mengirim: ${(e as Error).message}`);
       }
     },
-    [activeId, agentMode, manualModel, me?.userId, mode, notify, processing, startPolling, token, uploads]
+    [activeId, activeSkill, agentMode, manualModel, me?.userId, mode, notify, processing, startPolling, token, uploads]
   );
 
   // ---------- regenerasi jawaban terakhir ----------
@@ -470,6 +472,12 @@ export function ChatApp({
         if (r.autoDefaults) setAutoDefaults(r.autoDefaults);
       } catch (e) {
         notify(`Gagal memuat katalog model: ${(e as Error).message}`);
+      }
+      try {
+        const sk = await listSkills(token);
+        setSkills(sk.skills || []);
+      } catch {
+        // skills opsional - biarkan kosong
       }
     })();
   }, [token, refreshSessions, notify]);
@@ -843,6 +851,9 @@ export function ChatApp({
                 onRemoveUpload={removeUpload}
                 disabled={loadingSession}
                 busy={processing}
+                skills={skills}
+                activeSkill={activeSkill}
+                onSkillChange={setActiveSkill}
               />
             </div>
           </div>

@@ -47,6 +47,7 @@ STEPS = [
     ("4",  "runtime_role", "deploy_runtime_role.py", "IAM role AgentCore Runtime"),
     ("5",  "agentcore",    "deploy_v3_agentcore.py", "Memory+Gateway+CI INTERNET+Evaluator"),
     ("6",  "edge_apigw",   "deploy_edge_apigw_waf.py", "Edge Lambda + API GW + WAF"),
+    ("6b", "scheduler",    "deploy_scheduler.py",    "Tugas Terjadwal: DDB + EventBridge tick"),
     ("7",  "v343",         "deploy_v343.py",         "URL publik artefak + rebuild runtime"),
     ("8",  "skills_seed",  "deploy_skills_seed.py",  "100+ skill -> Skills Library + KB"),
     ("9",  "amplify",      "deploy_amplify.py",      "Frontend build + hosting"),
@@ -118,11 +119,12 @@ def tag_audit():
             log(f"  ~ tag {label}: {str(e)[:100]}")
 
     s3 = boto3.client("s3", region_name=REGION)
-    for b in filter(None, [st.get("kb_bucket"), st.get("art_bucket"), st.get("vector_bucket")]):
-        t(f"s3:{b}", lambda b=b: s3.put_bucket_tagging(Bucket=b, TagSet=TAGS))
+    for b in filter(None, [st.get("kb_bucket"), st.get("art_bucket")]):
+        t(f"s3:{b}", lambda b=b: s3.put_bucket_tagging(Bucket=b, Tagging={"TagSet": TAGS}))
 
     ddb = boto3.client("dynamodb", region_name=REGION)
-    for tab in filter(None, [st.get("sessions_table"), st.get("traces_table"), st.get("confirm_table")]):
+    for tab in filter(None, [st.get("sessions_table"), st.get("traces_table"), st.get("confirm_table"),
+                             st.get("schedules_table")]):
         try:
             arn = ddb.describe_table(TableName=tab)["Table"]["TableArn"]
             t(f"ddb:{tab}", lambda a=arn: ddb.tag_resource(ResourceArn=a, Tags=TAGS))
@@ -131,7 +133,7 @@ def tag_audit():
 
     iam = boto3.client("iam")
     for r in filter(None, [st.get("orch_role"), st.get("exec_role"), st.get("kb_role"),
-                           st.get("runtime_role"), "maa-agent-edge-role"]):
+                           st.get("runtime_role"), "maa-agent-edge-role", "maa-scheduler-role"]):
         t(f"iam:{r}", lambda r=r: iam.tag_role(RoleName=r, Tags=[{"Key": x["Key"], "Value": x["Value"]} for x in TAGS]))
 
     lam = boto3.client("lambda", region_name=REGION)
@@ -139,13 +141,13 @@ def tag_audit():
         fns = lam.list_functions(MaxItems=100)["Functions"]
         for f in fns:
             if f["FunctionName"].startswith("maa-"):
-                t(f"lambda:{f['FunctionName']}", lambda a=f["FunctionArn"]: lam.tag_resource(ResourceArn=a, Tags=TAGS))
+                t(f"lambda:{f['FunctionName']}", lambda a=f["FunctionArn"]: lam.tag_resource(Resource=a, Tags={x["Key"]: x["Value"] for x in TAGS}))
     except Exception as e:
         log(f"  ~ lambda sweep: {str(e)[:90]}")
 
     cog = boto3.client("cognito-idp", region_name=REGION)
     if st.get("user_pool_arn"):
-        t("cognito:userpool", lambda a=st["user_pool_arn"]: cog.tag_resource(ResourceArn=a, Tags=TAGS))
+        t("cognito:userpool", lambda a=st["user_pool_arn"]: cog.tag_resource(ResourceArn=a, Tags={x["Key"]: x["Value"] for x in TAGS}))
 
     kms = boto3.client("kms", region_name=REGION)
     if st.get("kms_key_id"):
@@ -153,7 +155,7 @@ def tag_audit():
 
     apigw = boto3.client("apigateway", region_name=REGION)
     if st.get("api_id"):
-        t("apigw", lambda a=st["api_id"]: apigw.tag_resource(ResourceArn=f"arn:aws:apigateway:{REGION}::/restapis/{a}", Tags={"MAA": "true", "Project": "MAA", "ManagedBy": "maa-aws-agent"}))
+        t("apigw", lambda a=st["api_id"]: apigw.tag_resource(resourceArn=f"arn:aws:apigateway:{REGION}::/restapis/{a}", tags={x["Key"]: x["Value"] for x in TAGS}))
 
     log(f"tag audit: {ok} resource bertag MAA ({warn} warn)")
 
