@@ -172,13 +172,13 @@
 /* ---- karakter "garis hitam" ---- */
 .maa-line-card {
   border: 1px solid var(--line);
-  border-radius: 10px;
+  border-radius: var(--radius);
   box-shadow: var(--shadow-soft);
 }
 .maa-panel {
   background: var(--bg);
   border: 1px solid var(--line);
-  border-radius: 10px;
+  border-radius: var(--radius);
   box-shadow: var(--shadow-soft);
 }
 .maa-btn-primary {
@@ -214,4 +214,21 @@
   background-size: 44px 44px;
   mask-image: radial-gradient(ellipse 70% 60% at 50% 40%, black 30%, transparent 75%);
   -webkit-mask-image: radial-gradient(ellipse 70% 60% at 50% 40%, black 30%, transparent 75%);
+}
+
+/* ---- v3.5: tekstur latar (data-maa-pattern pada <html>) ---- */
+html[data-maa-pattern='grid'] body > div {
+  background-image:
+    linear-gradient(var(--accent-soft) 1px, transparent 1px),
+    linear-gradient(90deg, var(--accent-soft) 1px, transparent 1px);
+  background-size: 44px 44px;
+}
+html[data-maa-pattern='dots'] body > div {
+  background-image: radial-gradient(var(--line-soft) 1.2px, transparent 1.6px);
+  background-size: 22px 22px;
+}
+
+/* ---- v3.5: efek glow aksen (--glow di-set oleh theme.ts) ---- */
+.maa-btn-primary {
+  box-shadow: var(--glow, none);
 }

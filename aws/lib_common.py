@@ -6,9 +6,18 @@ import time
 
 import boto3
 
-STATE_PATH = "/home/z/my-project/aws/state.json"
+# v3.5: state.json dicari di samping file ini (repo-portable), atau override
+# lewat env MAA_STATE_PATH (dipakai bootstrap akun baru agar tidak menyentuh
+# state akun lama).
+STATE_PATH = os.environ.get(
+    "MAA_STATE_PATH",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "state.json"),
+)
 REGION = "us-east-1"
-PREFIX = "maa-agent"
+PREFIX = "maa-agent"   # semua resource bernama maa-agent-* (nama depan MAA)
+# Tag wajib akun baru (permintaan user): tag MAA pada semua resource.
+MAA_TAGS = [{"Key": "MAA", "Value": "true"}, {"Key": "Project", "Value": "MAA"},
+            {"Key": "ManagedBy", "Value": "maa-aws-agent"}]
 
 _session = boto3.Session(region_name=REGION)
 sts = _session.client("sts")

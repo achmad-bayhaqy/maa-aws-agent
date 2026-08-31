@@ -10,7 +10,7 @@ import zipfile
 
 import boto3
 
-sys.path.insert(0, "/home/z/my-project/aws")
+sys.path.insert(0, __import__("os").path.dirname(__import__("os").path.abspath(__file__)))
 from lib_common import ACCOUNT_ID, REGION, log, load_state, save_state
 
 st = load_state()
@@ -78,7 +78,9 @@ policy = {
          "Action": ["cognito-idp:AdminUserGlobalSignOut", "cognito-idp:ListUsers",
                     "cognito-idp:AdminGetUser", "cognito-idp:AdminCreateUser",
                     "cognito-idp:AdminDeleteUser", "cognito-idp:AdminEnableUser",
-                    "cognito-idp:AdminDisableUser", "cognito-idp:AdminUpdateUserAttributes"],
+                    "cognito-idp:AdminDisableUser", "cognito-idp:AdminUpdateUserAttributes",
+                    "cognito-idp:AdminAddUserToGroup", "cognito-idp:AdminRemoveUserFromGroup",
+                    "cognito-idp:AdminListGroupsForUser"],
          "Resource": st["user_pool_arn"]},
     ],
 }
@@ -89,7 +91,7 @@ log(f"  edge policy set")
 # ---------------------------------------------------------------- Lambda
 zbuf = io.BytesIO()
 with zipfile.ZipFile(zbuf, "w", zipfile.ZIP_DEFLATED) as z:
-    z.write("/home/z/my-project/aws/lambda_edge/handler.py", "handler.py")
+    z.write(__import__("os").path.join(__import__("os").path.dirname(__import__("os").path.abspath(__file__)), "lambda_edge", "handler.py"), "handler.py")
 env = {
     "RUNTIME_ARN": st["agent_runtime_arn"],
     "SESSIONS_TABLE": st["sessions_table"],
@@ -157,7 +159,7 @@ if not api_id:
         name=API_NAME,
         endpointConfiguration={"types": ["REGIONAL"]},
         description="MAA AWS Agent API (Cognito authorizer + WAF)",
-        tags={"Project": "maa-agent"},
+        tags={"Project": "maa-agent", "MAA": "true"},
     )
     api_id = api["id"]
     st["api_id"] = api_id
@@ -186,17 +188,32 @@ ROUTES = [
     ("/chat/confirm", ["POST", "OPTIONS"]),
     ("/chat/status", ["GET", "OPTIONS"]),
     ("/chat/trace", ["GET", "OPTIONS"]),
-    ("/chat/sessions", ["GET", "OPTIONS"]),
+    ("/chat/sessions", ["GET", "DELETE", "OPTIONS"]),
     ("/models", ["GET", "OPTIONS"]),
     ("/me", ["GET", "OPTIONS"]),
     ("/kb/docs", ["GET", "DELETE", "OPTIONS"]),
     ("/kb/presign", ["POST", "OPTIONS"]),
     ("/kb/sync", ["POST", "OPTIONS"]),
+    # v3.5: buka & edit dokumen KB dari UI
+    ("/kb/doc", ["GET", "POST", "OPTIONS"]),
+    # v3.5: Skills Library (Agent Skills)
+    ("/skills/list", ["GET", "OPTIONS"]),
+    ("/skills/get", ["GET", "OPTIONS"]),
+    # situs dokumentasi
+    ("/docs/list", ["GET", "OPTIONS"]),
+    ("/docs/content", ["GET", "POST", "OPTIONS"]),
+    # uploads & translate
+    ("/uploads/presign", ["POST", "OPTIONS"]),
+    ("/translate", ["POST", "OPTIONS"]),
+    # superadmin
     ("/admin/signout", ["POST", "OPTIONS"]),
     ("/admin/users", ["GET", "POST", "DELETE", "OPTIONS"]),
     ("/admin/users/status", ["POST", "OPTIONS"]),
     ("/admin/users/set-password", ["POST", "OPTIONS"]),
     ("/admin/users/resend-invite", ["POST", "OPTIONS"]),
+    # v3.5: Management User — rename & ganti role
+    ("/admin/users/rename", ["POST", "OPTIONS"]),
+    ("/admin/users/role", ["POST", "OPTIONS"]),
     ("/uploads/presign", ["POST", "OPTIONS"]),
     ("/translate", ["POST", "OPTIONS"]),
     ("/docs/content", ["GET", "POST", "OPTIONS"]),

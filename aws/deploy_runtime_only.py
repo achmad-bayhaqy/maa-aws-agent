@@ -100,7 +100,7 @@ for attempt in range(20):
             lifecycleConfiguration={"idleRuntimeSessionTimeout": 900},
             environmentVariables=env,
             description="MAA AWS Agent v3.4.1 - fix attachment constants + memory inject",
-            tags={"Project": "maa-agent"},
+            tags={"Project": "maa-agent", "MAA": "true"},
         )
         break
     except bac.exceptions.ConflictException:

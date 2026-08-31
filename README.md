@@ -10,6 +10,7 @@
 - [Ringkasan](#-ringkasan)
 - [Akses Demo](#-akses-demo)
 - [Tampilan Aplikasi](#-tampilan-aplikasi)
+- [Yang Baru di v3.5](#-yang-baru-di-v35)
 - [Yang Baru di v3.4.3](#-yang-baru-di-v343)
 - [Yang Baru di v3.4.2](#-yang-baru-di-v342)
 - [Yang Baru di v3.4](#-yang-baru-di-v34)
@@ -34,6 +35,20 @@ seluruh trajektori agen secara real-time.
 | ![Chat EC2](screenshots/chat-ec2.png) | ![Konfirmasi destruktif](screenshots/konfirmasi-destruktif.png) |
 | **Live Trace di mobile** — setiap event tool terlihat | |
 | ![Live Trace mobile](screenshots/livetrace-mobile.png) | |
+
+## 🔗 Yang Baru di v3.5
+
+Alignmen penuh fitur **Claude AI per 31 Agustus 2026** + 8 catatan perbaikan user.
+Matriks lengkap: [docs/CLAUDE-ALIGNMENT.md](docs/CLAUDE-ALIGNMENT.md).
+
+| Perubahan | Detail |
+|---|---|
+| **Skills Library (Agent Skills ala Claude)** | Tool `skills_list` / `skills_use` / `skills_save` — progressive disclosure (nama+deskripsi saja di konteks, isi SKILL.md dimuat on-demand). UI drawer baru "Skills Library". **104 skill resmi di-seed otomatis**: 19 dari anthropics/skills (docx, pptx, xlsx, pdf, frontend-design, mcp-builder, dll) + 85 skill AWS resmi (Well-Architected, ops, DevOps, solutions, agent-plugins). Agent bisa menyimpan skill baru sendiri (`skills_save`) — memori organisasi yang tumbuh. |
+| **KB buka/edit/hapus + update by command** | Dari chat: "buka dokumen X", "update dokumen Y", "hapus dokumen lama Z" → `kb_list_docs`/`kb_read_doc`/`kb_edit_doc`/`kb_delete_doc` + re-index otomatis. Dari UI: tombol 👁 di drawer KB membuka pratinjau Markdown + mode editor textarea, simpan langsung memicu ingestion. |
+| **Code Interpreter ONLINE (scraping Python)** | `networkMode SANDBOX → INTERNET`: requests/urllib/pip install berjalan — scraping Google Play Store & API publik kini berhasil. Fallback terdokumentasi ke `web_fetch`. |
+| **Management User** | Menu dinamai **Management User** + aksi baru per user: **Rename** (nama tampilan `preferred_username`) dan **Ganti role** (user ↔ superadmin, sinkron grup Cognito, proteksi self-demote). Endpoint `/admin/users/rename` & `/admin/users/role`. |
+| **Tema Redline Extended** | 12 preset aksen, **4 mode permukaan** (Terang / Gelap / OLED hitam pekat / Sepia kertas hangat), bentuk sudut (tajam/standar/bulat), tekstur latar (polos/grid/titik), kepadatan tampilan (padat/standar/lega), dan **efek glow aksen** — semuanya persist di localStorage. |
+| **Deploy akun baru 1-perintah** | `python3 aws/bootstrap_maa.py` — rantai 9 langkah idempotent (foundation → cognito → bedrock → runtime role → agentcore → edge+API GW → v343 → skills seed → amplify) + **tag audit**: semua resource bernama `maa-agent-*` dan bertag `MAA=true`. Code Interpreter langsung INTERNET. Route API GW kini lengkap dari awal (24 route). |
 
 ## 🔗 Yang Baru di v3.4.3
 

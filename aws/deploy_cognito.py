@@ -9,7 +9,7 @@ import time
 
 import boto3
 
-sys.path.insert(0, "/home/z/my-project/aws")
+sys.path.insert(0, __import__("os").path.dirname(__import__("os").path.abspath(__file__)))
 from lib_common import ACCOUNT_ID, REGION, log, load_state, save_state
 
 st = load_state()
@@ -117,9 +117,9 @@ log(f"+ permanent password set for '{USERNAME}'")
 
 creds = {"username": USERNAME, "password": password,
          "user_pool_id": pool_id, "app_client_id": st["app_client_id"]}
-with open("/home/z/my-project/aws/maa-user-credentials.json", "w") as f:
+with open(__import__("os").path.join(__import__("os").path.dirname(__import__("os").path.abspath(__file__)), "maa-user-credentials.json"), "w") as f:
     json.dump(creds, f, indent=2)
-log("credentials saved -> /home/z/my-project/aws/maa-user-credentials.json")
+log("credentials saved -> <aws dir>/maa-user-credentials.json")
 
 st["demo_username"] = USERNAME
 save_state(st)

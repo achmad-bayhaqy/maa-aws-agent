@@ -11,7 +11,7 @@ import zipfile
 
 import boto3
 
-sys.path.insert(0, "/home/z/my-project/aws")
+sys.path.insert(0, __import__("os").path.dirname(__import__("os").path.abspath(__file__)))
 from lib_common import ACCOUNT_ID, REGION, log, load_state, save_state
 
 st = load_state()
@@ -89,7 +89,7 @@ else:
         customRules=[{
             "source": "</^[^.]+$|\\.(?!(css|gif|ico|jpg|jpeg|js|png|txt|svg|woff|woff2|ttf|json|map|webp)$)([^.]+$)/>",
             "target": "/index.html", "status": "200"}],
-        tags={"Project": "maa-agent"},
+        tags={"Project": "maa-agent", "MAA": "true"},
     )
     app_id = app["app"]["appId"]
     st["amplify_app_id"] = app_id

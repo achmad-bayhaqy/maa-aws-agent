@@ -20,18 +20,36 @@ export AWS_SECRET_ACCESS_KEY="…"
 
 ## 1. Urutan Eksekusi
 
+### Cara cepat (rekomendasi) — akun baru / ulang deploy penuh
+
+```bash
+source scripts/awsenv.sh
+python3 aws/bootstrap_maa.py                # semua langkah + tag audit MAA
+python3 aws/bootstrap_maa.py --skip-frontend  # backend saja
+python3 aws/bootstrap_maa.py --only 5,7       # langkah tertentu
+python3 aws/bootstrap_maa.py --list           # lihat daftar langkah
+```
+
+Bootstrap idempotent: aman di-re-run bila ada langkah gagal. Saat `state.json`
+berasal dari akun lain, state lama otomatis diarsipkan ke `aws/state-<akun>.json`.
+Semua resource bernama `maa-agent-*` dan diberi **tag `MAA=true`** (audit otomatis
+di akhir: S3, DynamoDB, IAM, Lambda, Cognito, KMS, API Gateway).
+
+### Cara manual (per langkah)
+
 ```bash
 source scripts/awsenv.sh && cd aws
 python3 deploy_foundation.py      # 1  KMS, S3 ×3, DynamoDB ×3, IAM ×4
-python3 deploy_bedrock.py         # 2  Guardrail, KB (S3 Vectors), unggah dokumen
-python3 deploy_cognito.py         # 3  User pool + TOTP wajib + app client + user admin
+python3 deploy_cognito.py         # 2  User pool + TOTP wajib + app client + user admin
+python3 deploy_bedrock.py         # 3  Guardrail, KB (S3 Vectors), unggah dokumen
 python3 deploy_runtime_role.py    # 4  IAM role runtime (least privilege)
-python3 deploy_v3_agentcore.py    # 5  Memory, Gateway, Policy, Code Interpreter, Evaluations
-python3 deploy_runtime_v3.py      # 6  Zip kode agent → Runtime v3 + smoke invoke
-python3 deploy_edge_apigw_waf.py  # 7  Lambda edge, API GW (13 route), WAF, Gateway Responses
-python3 seed_demo.py              # 8  VPC demo + 2× EC2 t3.micro (stopped)
-python3 test_e2e_v3.py            # 9  Uji end-to-end (login → chat → edit → trace)
-python3 deploy_amplify.py         # 10 Build static export → Amplify Hosting
+python3 deploy_v3_agentcore.py    # 5  Memory, Gateway, Policy, Code Interpreter (INTERNET), Evaluations
+python3 deploy_edge_apigw_waf.py  # 6  Lambda edge, API GW (24 route), WAF, Gateway Responses
+python3 deploy_v343.py            # 7  URL publik artefak + rebuild runtime v3.5 + re-point edge
+python3 deploy_skills_seed.py     # 8  104 skill → Skills Library S3 + katalog ke KB
+python3 deploy_amplify.py         # 9  Build static export → Amplify Hosting
+python3 seed_demo.py              # 10 VPC demo + 2× EC2 t3.micro (stopped)
+python3 test_e2e_v3.py            # 11 Uji end-to-end (login → chat → edit → trace)
 ```
 
 Estimasi total ~15–25 menit. Script ke-N **bergantung state** dari script (N-1) —

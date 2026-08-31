@@ -25,7 +25,7 @@ import { MessageList } from './message-list';
 import { TracePanel } from './trace-panel';
 import { ConfirmModal } from './confirm-modal';
 import { TodoPanel } from './todo-panel';
-import { AdminDrawer, DocsDrawer, KbDrawer } from './drawers';
+import { AdminDrawer, DocsDrawer, KbDrawer, SkillsDrawer } from './drawers';
 import { ThemeDialog, ThemeSwitcher } from './theme-switcher';
 import { initTheme, type MaaTheme } from './theme';
 
@@ -98,7 +98,9 @@ export function ChatApp({
   const token = tokens.IdToken;
 
   // ---- tema ----
-  const [theme, setTheme] = useState<MaaTheme>({ accent: '#DC2626', dark: false });
+  const [theme, setTheme] = useState<MaaTheme>({
+    accent: '#DC2626', mode: 'light', radius: 'normal', pattern: 'none', density: 'normal', glow: false,
+  });
   useEffect(() => {
     setTheme(initTheme());
   }, []);
@@ -125,6 +127,7 @@ export function ChatApp({
   const [traceSheetOpen, setTraceSheetOpen] = useState(false); // sheet mobile
   const [traceRailOpen, setTraceRailOpen] = useState(true); // rail desktop
   const [kbOpen, setKbOpen] = useState(false);
+  const [skillsOpen, setSkillsOpen] = useState(false);
   const [docsOpen, setDocsOpen] = useState(false);
   const [adminOpen, setAdminOpen] = useState(false);
   const [themeOpen, setThemeOpen] = useState(false);
@@ -566,6 +569,7 @@ export function ChatApp({
       onNewChat={() => newChat()}
       onOpenDocs={() => { setSidebarOpen(false); setDocsOpen(true); }}
       onOpenKb={() => { setSidebarOpen(false); setKbOpen(true); }}
+      onOpenSkills={() => { setSidebarOpen(false); setSkillsOpen(true); }}
       onOpenAdmin={() => { setSidebarOpen(false); setAdminOpen(true); }}
       onOpenTheme={() => { setSidebarOpen(false); setThemeOpen(true); }}
       canAdmin={me?.role === 'superadmin'}
@@ -883,6 +887,7 @@ export function ChatApp({
       </Sheet>
 
       <KbDrawer open={kbOpen} onOpenChange={setKbOpen} token={token} notify={notify} />
+      <SkillsDrawer open={skillsOpen} onOpenChange={setSkillsOpen} token={token} notify={notify} />
       <DocsDrawer
         open={docsOpen}
         onOpenChange={setDocsOpen}

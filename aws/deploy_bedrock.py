@@ -10,7 +10,7 @@ import time
 
 import boto3
 
-sys.path.insert(0, "/home/z/my-project/aws")
+sys.path.insert(0, __import__("os").path.dirname(__import__("os").path.abspath(__file__)))
 from lib_common import ACCOUNT_ID, REGION, log, load_state, save_state, update_state
 
 st = load_state()
@@ -222,7 +222,7 @@ def gen_architecture_png(path):
 
 import tempfile
 import os
-TMP = "/home/z/my-project/aws/docs"
+TMP = __import__("os").path.join(__import__("os").path.dirname(__import__("os").path.abspath(__file__)), "docs")
 os.makedirs(TMP, exist_ok=True)
 PDF_PATH = f"{TMP}/MAA-Runbook-Incident-Response-v2.pdf"
 XLSX_PATH = f"{TMP}/MAA-Asset-Inventory.xlsx"
@@ -350,7 +350,7 @@ else:
                 "s3VectorsConfiguration": {"indexArn": st["vector_index_arn"]},
             },
             clientToken=f"maa-agent-kb-{int(time.time())}-aaaa-bbbb",
-            tags={"Project": "maa-agent"},
+            tags={"Project": "maa-agent", "MAA": "true"},
         )
         kb_id = kb["knowledgeBase"]["knowledgeBaseId"]
         st["kb_id"] = kb_id

@@ -6,7 +6,7 @@ import time
 
 import boto3
 
-sys.path.insert(0, "/home/z/my-project/aws")
+sys.path.insert(0, __import__("os").path.dirname(__import__("os").path.abspath(__file__)))
 from lib_common import REGION, log, load_state, save_state
 
 st = load_state()

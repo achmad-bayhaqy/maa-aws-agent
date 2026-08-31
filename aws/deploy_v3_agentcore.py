@@ -13,7 +13,7 @@ import zipfile
 
 import boto3
 
-sys.path.insert(0, "/home/z/my-project/aws")
+sys.path.insert(0, __import__("os").path.dirname(__import__("os").path.abspath(__file__)))
 from lib_common import ACCOUNT_ID, REGION, log, load_state, save_state
 
 st = load_state()
@@ -96,7 +96,7 @@ except Exception as e:
 created = False
 for attempt in range(6):
     try:
-        wlogs.create_log_group(logGroupName=TRACE_LG, kmsKeyId=KMS_ARN, tags={"Project": "maa-agent"})
+        wlogs.create_log_group(logGroupName=TRACE_LG, kmsKeyId=KMS_ARN, tags={"Project": "maa-agent", "MAA": "true"})
         log(f"+ {TRACE_LG} (KMS)")
         created = True
         break
@@ -109,7 +109,7 @@ for attempt in range(6):
         time.sleep(10)
 if not created:
     try:
-        wlogs.create_log_group(logGroupName=TRACE_LG, tags={"Project": "maa-agent"})
+        wlogs.create_log_group(logGroupName=TRACE_LG, tags={"Project": "maa-agent", "MAA": "true"})
         log(f"  fallback: {TRACE_LG} TANPA CMK (default encryption AWS)")
     except wlogs.exceptions.ResourceAlreadyExistsException:
         log(f"  = {TRACE_LG} exists (fallback)")
@@ -120,8 +120,6 @@ save_state(st)
 # ================================================================ 2. katalog 88 model
 log("2/9 Katalog model lengkap (dari chat_models.txt + probe tool-compat)...")
 CATALOG_SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "scripts", "chat_models.txt")
-if not os.path.exists(CATALOG_SRC):
-    CATALOG_SRC = "/home/z/my-project/scripts/chat_models.txt"
 PROBE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "probe_result.json")
 FRIENDLY = {
     "amazon.nova-micro-v1:0": "Nova Micro", "amazon.nova-lite-v1:0": "Nova Lite",
@@ -402,7 +400,7 @@ if not memory_id:
                         "description": ("Preferensi pengguna: gaya jawaban, bahasa, level detail, "
                                         "dan cara kerja yang disukai")}},
                 ],
-                tags={"Project": "maa-agent"})
+                tags={"Project": "maa-agent", "MAA": "true"})
             memory_id = r["memory"].get("memoryId") or r["memory"].get("id")
             break
         except Exception as e:
@@ -429,7 +427,7 @@ save_state(st)
 
 # ================================================================ 5. Gateway target Lambda
 log("5/9 Web tool Lambda (gateway target)...")
-ROOT = "/home/z/my-project/aws/lambda_gateway_target"
+ROOT = __import__("os").path.join(__import__("os").path.dirname(__import__("os").path.abspath(__file__)), "lambda_gateway_target")
 PKG = f"{ROOT}/pkg"
 subprocess.run([sys.executable, "-m", "pip", "install", "-q", "-t", PKG,
                 "websocket-client"], check=False)
@@ -493,7 +491,7 @@ if not gateway_id:
         protocolType="MCP",
         authorizerType="AWS_IAM",
         description="MAA AWS Agent tool gateway (web tools) - inbound IAM SigV4",
-        tags={"Project": "maa-agent"})
+        tags={"Project": "maa-agent", "MAA": "true"})
     gateway_id, gw_url = r["gatewayId"], r["gatewayUrl"]
 for i in range(40):
     s = bac.get_gateway(gatewayIdentifier=gateway_id)["status"]
@@ -619,7 +617,7 @@ save_state(st)
 # ================================================================ 8. WorkloadIdentity + Code Interpreter
 log("8/9 WorkloadIdentity + Code Interpreter...")
 try:
-    bac.create_workload_identity(name="maa-agent-runtime", tags={"Project": "maa-agent"})
+    bac.create_workload_identity(name="maa-agent-runtime", tags={"Project": "maa-agent", "MAA": "true"})
     log("  + workload identity")
 except Exception as e:
     if "Conflict" not in str(e) and "already" not in str(e).lower() and "with name" not in str(e).lower():
@@ -627,13 +625,16 @@ except Exception as e:
     else:
         log("  = workload identity sudah ada (auto-registered runtime)")
 ci_id = st.get("ci_id")
+# v3.5: Code Interpreter WAJIB networkMode INTERNET (permintaan user: scraping
+# Python — mis. Google Play Store — harus bisa akses internet; pip install juga).
+CI_NETWORK = {"networkMode": "INTERNET"}
 if not ci_id:
     try:
         ci_id = bac.create_code_interpreter(
             name="maacodeinterpreter",
-            description="Sandbox Python untuk analisis data & chart (AgentCore Code Interpreter)",
-            networkConfiguration={"networkMode": "SANDBOX"},
-            tags={"Project": "maa-agent"})["codeInterpreterId"]
+            description="Sandbox Python online: analisis data, chart, scraping web (AgentCore Code Interpreter)",
+            networkConfiguration=CI_NETWORK,
+            tags={"Project": "maa-agent", "MAA": "true"})["codeInterpreterId"]
     except Exception as e:
         if "Conflict" not in str(e) and "already" not in str(e).lower():
             log(f"  CI warn: {str(e)[:150]}")
@@ -641,8 +642,19 @@ if not ci_id:
             if c.get("name") in ("maacodeinterpreter", "maa-code-interpreter"):
                 ci_id = c["codeInterpreterId"]
 if ci_id:
+    # pastikan interpreter lama tidak terjebak SANDBOX (tanpa internet)
+    try:
+        cur = bac.get_code_interpreter(codeInterpreterId=ci_id)
+        mode = ((cur.get("codeInterpreter") or {}).get("networkConfiguration") or {}).get("networkMode", "")
+        if mode and mode != "INTERNET":
+            bac.update_code_interpreter(codeInterpreterId=ci_id, networkConfiguration=CI_NETWORK)
+            log(f"  CI networkMode {mode} -> INTERNET (fitur scraping aktif)")
+    except Exception as e:
+        if "update" in str(e).lower() or "not supported" in str(e).lower():
+            log(f"  CI update warn: {str(e)[:120]}")
+if ci_id:
     st["ci_id"] = ci_id
-    log(f"  code interpreter: {ci_id}")
+    log(f"  code interpreter: {ci_id} (INTERNET)")
 save_state(st)
 
 # ================================================================ 9. Evaluator + Online Evaluation
@@ -666,7 +678,7 @@ if not evaluator_id:
                 "modelConfig": {"bedrockEvaluatorModelConfig": {
                     "modelId": "amazon.nova-micro-v1:0",
                     "inferenceConfig": {"maxTokens": 800, "temperature": 0.0}}}}},
-            tags={"Project": "maa-agent"})
+            tags={"Project": "maa-agent", "MAA": "true"})
         evaluator_id = r["evaluatorId"]
         log(f"  + evaluator {evaluator_id}")
     except Exception as e:
@@ -687,7 +699,7 @@ if evaluator_id:
                 evaluators=[{"evaluatorId": evaluator_id}],
                 evaluationExecutionRoleArn=eval_role_arn,
                 enableOnCreate=True,
-                tags={"Project": "maa-agent"})
+                tags={"Project": "maa-agent", "MAA": "true"})
             oe_id = r.get("onlineEvaluationConfigId") or r.get("onlineEvaluationConfig", {}).get("onlineEvaluationConfigId")
             log(f"  + online eval config {oe_id}")
         except Exception as e:

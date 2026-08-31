@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""MAA AWS Agent - Edge Lambda v3.4.2 (thin SigV4 proxy ke AgentCore Runtime).
-v3.4.2: pemisahan mode MODEL (AUTO/FAST/DEEP/MANUAL) vs mode TUGAS agent
-(STANDARD/LONG/FULLSTACK/PRESENTATION/TODO/MULTI), userRole utk bypass
-guardrail superadmin, sanitasi atts (kompat data lama string JSON)."""
+"""MAA AWS Agent - Edge Lambda v3.5 (thin SigV4 proxy ke AgentCore Runtime).
+v3.5: Management User penuh (rename display-name, ganti role), editor dokumen
+KB (buka/edit dari UI), daftar Skills Library, kelengkapan admin users
+(preferred_username). Kompat penuh kontrak v3.4.x."""
 import json
 import os
 import time
@@ -426,6 +426,45 @@ def handler(event, context):
             s3.delete_object(Bucket=KB_BUCKET, Key=key)
             return resp(200, {"deleted": key})
 
+        # ---------------- KB doc content (v3.5: buka & edit dokumen KB dari UI) ----------------
+        if path == "/kb/doc" and method == "GET":
+            key = qs.get("key", "")
+            if not key.startswith("docs/") or ".." in key:
+                return resp(400, {"error": "key tidak valid (harus di bawah docs/)"})
+            try:
+                obj = s3.get_object(Bucket=KB_BUCKET, Key=key)
+                return resp(200, {"key": key, "content": obj["Body"].read().decode("utf-8", "ignore")[:30000],
+                                  "updated": str(obj.get("LastModified", ""))})
+            except Exception:
+                return resp(404, {"error": "dokumen tidak ditemukan"})
+
+        if path == "/kb/doc" and method == "POST":
+            body = json.loads(event.get("body") or "{}")
+            key = body.get("key", "")
+            content = body.get("content", "")
+            if not key.startswith("docs/") or ".." in key:
+                return resp(400, {"error": "key tidak valid (harus di bawah docs/)"})
+            if len(content) > 30_000:
+                return resp(400, {"error": "konten terlalu besar (max 30k char)"})
+            try:
+                s3.head_object(Bucket=KB_BUCKET, Key=key)
+            except Exception:
+                return resp(404, {"error": "dokumen tidak ditemukan"})
+            s3.put_object(Bucket=KB_BUCKET, Key=key, Body=content.encode("utf-8"),
+                          ServerSideEncryption="aws:kms", SSEKMSKeyId=KMS_KEY_ID,
+                          ContentType="text/markdown; charset=utf-8")
+            job_status = ""
+            try:
+                ba = boto3.client("bedrock-agent", region_name=REGION, config=cfg)
+                ds = ba.list_data_sources(knowledgeBaseId=KB_ID)["dataSourceSummaries"]
+                job = ba.start_ingestion_job(knowledgeBaseId=KB_ID,
+                                             dataSourceId=ds[0]["dataSourceId"],
+                                             description=f"UI edit: {key.split('/')[-1][:40]}")
+                job_status = job["ingestionJob"]["status"]
+            except Exception as e:
+                job_status = f"tersimpan, re-index tertunda: {str(e)[:80]}"
+            return resp(200, {"saved": True, "key": key, "ingestion": job_status})
+
         if path == "/kb/sync" and method == "POST":
             ba = boto3.client("bedrock-agent", region_name=REGION, config=cfg)
             ds = ba.list_data_sources(knowledgeBaseId=KB_ID)["dataSourceSummaries"]
@@ -509,6 +548,48 @@ def handler(event, context):
                      "updated": str(o["LastModified"])} for o in r.get("Contents", [])]
             return resp(200, {"docs": docs})
 
+        # ---------------- Skills Library (v3.5) ----------------
+        if path == "/skills/list" and method == "GET":
+            r = s3.list_objects_v2(Bucket=ART_BUCKET, Prefix="skills/", MaxKeys=200)
+            skills = []
+            for o in r.get("Contents", []):
+                k = o["Key"]
+                if not k.endswith("SKILL.md"):
+                    continue
+                folder = k[len("skills/"):].split("/")[0]
+                fm_name, desc = folder, ""
+                try:
+                    head = s3.get_object(Bucket=ART_BUCKET, Key=k)["Body"].read()[:4096].decode("utf-8", "ignore")
+                    import re as _re2
+                    mm = _re2.match(r"\s*---\s*\n(.*?)\n\s*---", head, _re2.DOTALL)
+                    if mm:
+                        for line in mm.group(1).splitlines():
+                            lm = _re2.match(r"^(name|description)\s*:\s*(.*)$", line.strip())
+                            if lm:
+                                v = lm.group(2).strip().strip('"').strip("'")
+                                if lm.group(1) == "name":
+                                    fm_name = v
+                                else:
+                                    desc = v
+                except Exception:
+                    pass
+                skills.append({"name": fm_name, "folder": folder, "key": k,
+                               "description": desc[:400], "size": o["Size"],
+                               "updated": str(o.get("LastModified", ""))})
+            skills.sort(key=lambda x: x["name"].lower())
+            return resp(200, {"skills": skills})
+
+        if path == "/skills/get" and method == "GET":
+            key = qs.get("key", "")
+            if not key.startswith("skills/") or not key.endswith("SKILL.md") or ".." in key:
+                return resp(400, {"error": "key tidak valid (harus skills/<nama>/SKILL.md)"})
+            try:
+                obj = s3.get_object(Bucket=ART_BUCKET, Key=key)
+                return resp(200, {"key": key, "content": obj["Body"].read().decode("utf-8", "ignore")[:60000],
+                                  "updated": str(obj.get("LastModified", ""))})
+            except Exception:
+                return resp(404, {"error": "skill tidak ditemukan"})
+
         # ---------------- superadmin ----------------
         if path == "/admin/users" and method == "GET":
             if not is_superadmin(cl):
@@ -521,6 +602,7 @@ def handler(event, context):
                     attrs = {a["Name"]: a["Value"] for a in u.get("Attributes", [])}
                     users.append({"username": u.get("Username", ""),
                                   "email": attrs.get("email", ""),
+                                  "name": attrs.get("preferred_username", ""),
                                   "status": u.get("UserStatus", ""),
                                   "enabled": u.get("Enabled", False),
                                   "created": str(u.get("UserCreateDate", "")),
@@ -608,6 +690,47 @@ def handler(event, context):
                 return resp(400, {"error": "tidak bisa menghapus diri sendiri"})
             cog.admin_delete_user(UserPoolId=USER_POOL_ID, Username=username)
             return resp(200, {"deleted": True, "username": username})
+
+        # ---------------- Management User v3.5: rename & ganti role ----------------
+        if path == "/admin/users/rename" and method == "POST":
+            if not is_superadmin(cl):
+                return resp(403, {"error": "khusus superadmin"})
+            body = json.loads(event.get("body") or "{}")
+            username = body.get("username", "")
+            name = (body.get("name") or "").strip()
+            if not username:
+                return resp(400, {"error": "username wajib"})
+            if not name or len(name) > 60:
+                return resp(400, {"error": "nama tampilan wajib (1-60 karakter)"})
+            cog.admin_update_user_attributes(
+                UserPoolId=USER_POOL_ID, Username=username,
+                UserAttributes=[{"Name": "preferred_username", "Value": name}])
+            return resp(200, {"updated": True, "username": username, "name": name})
+
+        if path == "/admin/users/role" and method == "POST":
+            if not is_superadmin(cl):
+                return resp(403, {"error": "khusus superadmin"})
+            body = json.loads(event.get("body") or "{}")
+            username = body.get("username", "")
+            role = body.get("role", "user")
+            if role not in ("user", "superadmin"):
+                return resp(400, {"error": "role harus user|superadmin"})
+            if username == cl["username"] and role != "superadmin":
+                return resp(400, {"error": "tidak bisa menurunkan role diri sendiri"})
+            cog.admin_update_user_attributes(
+                UserPoolId=USER_POOL_ID, Username=username,
+                UserAttributes=[{"Name": "custom:role", "Value": role}])
+            try:
+                if role == "superadmin":
+                    cog.admin_add_user_to_group(UserPoolId=USER_POOL_ID,
+                                                GroupName="superadmin", Username=username)
+                else:
+                    cog.admin_remove_user_from_group(UserPoolId=USER_POOL_ID,
+                                                     GroupName="superadmin", Username=username)
+            except Exception:
+                pass
+            return resp(200, {"updated": True, "username": username, "role": role,
+                              "note": "Role baru berlaku pada login/token berikutnya."})
 
         if path == "/admin/signout" and method == "POST":
             cog.admin_user_global_sign_out(UserPoolId=USER_POOL_ID, Username=cl["username"])

@@ -237,6 +237,7 @@ export type MeInfo = {
 export type AdminUser = {
   username: string;
   email?: string;
+  name?: string; // preferred_username (nama tampilan, v3.5)
   status?: "CONFIRMED" | "FORCE_CHANGE_PASSWORD" | "UNCONFIRMED" | string;
   enabled?: boolean;
   created?: string;
@@ -296,6 +297,23 @@ export const presignUpload = (token: string, name: string, contentType: string) 
 
 export const deleteKbDoc = (token: string, key: string) =>
   apiFetch<{ deleted: boolean }>("DELETE", "/kb/docs", token, undefined, { key });
+
+/** Buka isi dokumen KB (v3.5 — read/edit dari UI). */
+export const getKbDocContent = (token: string, key: string) =>
+  apiFetch<{ key: string; content: string; updated?: string }>("GET", "/kb/doc", token, undefined, { key });
+
+/** Simpan hasil edit dokumen KB (v3.5) — re-index otomatis di sisi server. */
+export const saveKbDocContent = (token: string, key: string, content: string) =>
+  apiFetch<{ saved: boolean; key: string; ingestion?: string }>("POST", "/kb/doc", token, { key, content });
+
+/** Daftar Skills Library terpasang (v3.5). */
+export type MaaSkill = { name: string; folder: string; key: string; description?: string; size: number; updated?: string };
+export const listSkills = (token: string) =>
+  apiFetch<{ skills: MaaSkill[] }>("GET", "/skills/list", token);
+
+/** Buka isi SKILL.md satu skill (v3.5). */
+export const getSkillContent = (token: string, key: string) =>
+  apiFetch<{ key: string; content: string; updated?: string }>("GET", "/skills/get", token, undefined, { key });
 
 export const syncKb = (token: string) =>
   apiFetch<{ jobId: string; status: string }>("POST", "/kb/sync", token);
@@ -357,6 +375,14 @@ export const adminResendInvite = (token: string, username: string) =>
 
 export const adminDeleteUser = (token: string, username: string) =>
   apiFetch<{ deleted: boolean }>("DELETE", "/admin/users", token, undefined, { username });
+
+/** Management User v3.5: ganti nama tampilan (rename). */
+export const adminRenameUser = (token: string, username: string, name: string) =>
+  apiFetch<{ updated: boolean; username: string; name: string }>("POST", "/admin/users/rename", token, { username, name });
+
+/** Management User v3.5: ganti role (user <-> superadmin). */
+export const adminSetUserRole = (token: string, username: string, role: "user" | "superadmin") =>
+  apiFetch<{ updated: boolean; username: string; role: string }>("POST", "/admin/users/role", token, { username, role });
 
 export const signOutAll = (token: string) => apiFetch<{ signedOut: boolean }>("POST", "/admin/signout", token);
 

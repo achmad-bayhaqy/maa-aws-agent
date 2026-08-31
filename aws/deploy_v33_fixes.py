@@ -8,7 +8,7 @@ import zipfile
 
 import boto3
 
-sys.path.insert(0, "/home/z/my-project/aws")
+sys.path.insert(0, __import__("os").path.dirname(__import__("os").path.abspath(__file__)))
 from lib_common import log, load_state, save_state  # noqa: E402
 
 REGION = "us-east-1"
@@ -43,7 +43,7 @@ log(f"stage v1 redeployed: {dep['id']}")
 # ---------------------------------------------------------------- 2. Edge lambda
 zbuf = io.BytesIO()
 with zipfile.ZipFile(zbuf, "w", zipfile.ZIP_DEFLATED) as z:
-    z.write("/home/z/my-project/aws/lambda_edge/handler.py", "handler.py")
+    z.write(__import__("os").path.join(__import__("os").path.dirname(__import__("os").path.abspath(__file__)), "lambda_edge", "handler.py"), "handler.py")
 lam.update_function_code(FunctionName="maa-agent-edge", ZipFile=zbuf.getvalue())
 while lam.get_function_configuration(FunctionName="maa-agent-edge")["LastUpdateStatus"] == "InProgress":
     time.sleep(2)

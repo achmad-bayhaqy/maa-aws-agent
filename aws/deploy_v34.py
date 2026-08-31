@@ -186,7 +186,7 @@ for attempt in range(15):
             lifecycleConfiguration={"idleRuntimeSessionTimeout": 900},
             environmentVariables=env,
             description="MAA AWS Agent v3.4 - todo/subagent/deck/webapp/upload/translate/final-synthesis",
-            tags={"Project": "maa-agent"},
+            tags={"Project": "maa-agent", "MAA": "true"},
         )
         break
     except bac.exceptions.ConflictException:

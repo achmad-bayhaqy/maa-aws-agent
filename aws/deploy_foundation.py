@@ -9,7 +9,7 @@ import time
 
 import boto3
 
-sys.path.insert(0, "/home/z/my-project/aws")
+sys.path.insert(0, __import__("os").path.dirname(__import__("os").path.abspath(__file__)))
 from lib_common import ACCOUNT_ID, REGION, log, load_state, save_state, try_call, update_state
 
 st = load_state()
@@ -36,7 +36,7 @@ if st.get("kms_key_id"):
 else:
     key = kms.create_key(
         Description="MAA AWS Agent - master key (AES-256 at rest)",
-        Tags=[{"TagKey": "Project", "TagValue": "maa-agent"}],
+        Tags=[{"TagKey": "Project", "TagValue": "maa-agent"}, {"TagKey": "MAA", "TagValue": "true"}],
     )
     key_id = key["KeyMetadata"]["KeyId"]
     st["kms_key_id"] = key_id

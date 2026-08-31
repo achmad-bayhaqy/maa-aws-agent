@@ -3,8 +3,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   AtSign, Check, ChevronDown, ClipboardCopy, CloudUpload, Database, Edit3, Eye,
-  FileText, KeyRound, Loader2, Lock, LogIn, Mail, RefreshCw, Save, Search,
-  ShieldCheck, Trash2, UserPlus, Users, X,
+  FileText, KeyRound, Loader2, Lock, LogIn, Mail, PencilLine, RefreshCw, Save, Search,
+  ShieldCheck, Sparkles, Trash2, UserPlus, UserCog, Users, X,
 } from 'lucide-react';
 import {
   Sheet, SheetContent, SheetHeader, SheetTitle, SheetDescription,
@@ -15,11 +15,13 @@ import {
 } from '@/components/ui/alert-dialog';
 import { Switch } from '@/components/ui/switch';
 import {
-  adminDeleteUser, adminInviteUser, adminListUsers, adminResendInvite,
-  adminSetPassword, adminSetUserStatus, deleteKbDoc, fmtBytes, getDocContent,
-  listKbDocs, listSiteDocs, presignUpload, relTime, saveDocContent, syncKb,
+  adminDeleteUser, adminInviteUser, adminListUsers, adminRenameUser,
+  adminResendInvite, adminSetPassword, adminSetUserRole, adminSetUserStatus,
+  deleteKbDoc, fmtBytes, getDocContent, getKbDocContent, getSkillContent,
+  listKbDocs, listSiteDocs, listSkills, presignUpload, relTime, saveDocContent,
+  saveKbDocContent, syncKb,
 } from '@/lib/maa';
-import type { AdminUser } from '@/lib/maa';
+import type { AdminUser, MaaSkill } from '@/lib/maa';
 import { DocsContent } from './docs-content';
 import { Markdown } from './markdown';
 
@@ -88,6 +90,47 @@ export function KbDrawer({
   const [dragOver, setDragOver] = useState(false);
   const [delTarget, setDelTarget] = useState<KbDoc | null>(null);
   const fileRef = useRef<HTMLInputElement>(null);
+  // v3.5: buka & edit isi dokumen (read/edit/delete dari UI + auto re-index)
+  const [viewKey, setViewKey] = useState<string | null>(null);
+  const [viewName, setViewName] = useState('');
+  const [viewContent, setViewContent] = useState('');
+  const [viewDraft, setViewDraft] = useState('');
+  const [viewLoading, setViewLoading] = useState(false);
+  const [viewEditing, setViewEditing] = useState(false);
+  const [viewSaving, setViewSaving] = useState(false);
+
+  const openDoc = async (d: KbDoc) => {
+    setViewKey(d.key);
+    setViewName(d.name || d.key);
+    setViewEditing(false);
+    setViewLoading(true);
+    try {
+      const r = await getKbDocContent(token, d.key);
+      setViewContent(r.content || '');
+      setViewDraft(r.content || '');
+    } catch (e) {
+      notify(`Gagal membuka dokumen: ${(e as Error).message}`);
+      setViewKey(null);
+    } finally {
+      setViewLoading(false);
+    }
+  };
+
+  const saveDoc = async () => {
+    if (!viewKey) return;
+    setViewSaving(true);
+    try {
+      const r = await saveKbDocContent(token, viewKey, viewDraft);
+      setViewContent(viewDraft);
+      setViewEditing(false);
+      notify(`Dokumen tersimpan & re-index ${r.ingestion ? `(${r.ingestion})` : 'dimulai'}`, true);
+      await refresh();
+    } catch (e) {
+      notify(`Simpan gagal: ${(e as Error).message}`);
+    } finally {
+      setViewSaving(false);
+    }
+  };
 
   const refresh = useCallback(async () => {
     setLoading(true);
@@ -151,6 +194,7 @@ export function KbDrawer({
   const doDelete = async (d: KbDoc) => {
     try {
       await deleteKbDoc(token, d.key);
+      if (viewKey === d.key) setViewKey(null);
       notify(`"${d.name}" dihapus. Jalankan sinkronisasi untuk memperbarui indeks.`, true);
       await refresh();
     } catch (e) {
@@ -171,6 +215,77 @@ export function KbDrawer({
         </SheetHeader>
 
         <div className="nice-scroll min-h-0 flex-1 overflow-y-auto p-5">
+          {viewKey ? (
+            /* ---------- v3.5: pembuka/editor dokumen KB ---------- */
+            <div className="animate-pop space-y-3">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <button
+                  type="button"
+                  onClick={() => setViewKey(null)}
+                  className="maa-btn-ghost flex items-center gap-1 px-2 py-1.5 text-[11.5px] font-medium"
+                >
+                  <X className="h-3.5 w-3.5" /> Kembali ke daftar
+                </button>
+                {viewEditing ? (
+                  <div className="flex items-center gap-1.5">
+                    <button
+                      type="button"
+                      onClick={() => setViewDraft(viewContent)}
+                      disabled={viewSaving}
+                      className="maa-btn-ghost px-2 py-1.5 text-[11.5px] font-medium disabled:opacity-50"
+                    >
+                      Batalkan
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => void saveDoc()}
+                      disabled={viewSaving || viewDraft === viewContent}
+                      className="maa-btn-primary flex items-center gap-1.5 px-3 py-1.5 text-[11.5px] disabled:opacity-50"
+                    >
+                      {viewSaving ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Save className="h-3.5 w-3.5" />}
+                      Simpan & re-index
+                    </button>
+                  </div>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={() => setViewEditing(true)}
+                    className="maa-btn-secondary flex items-center gap-1.5 px-3 py-1.5 text-[11.5px]"
+                  >
+                    <Edit3 className="h-3.5 w-3.5" /> Edit isi
+                  </button>
+                )}
+              </div>
+
+              <div className="border-b border-[var(--line-soft)] pb-2">
+                <p className="truncate text-[13.5px] font-bold text-[var(--ink)]">{viewName}</p>
+                <p className="text-[10.5px] text-[var(--muted-fg)]">
+                  {viewEditing ? 'Mode edit — simpan akan memicu re-index KB otomatis' : 'Pratinjau isi dokumen Knowledge Base'}
+                </p>
+              </div>
+
+              {viewLoading ? (
+                <div className="space-y-2">
+                  <div className="skeleton-line h-4 w-3/4 rounded" />
+                  <div className="skeleton-line h-4 rounded" />
+                  <div className="skeleton-line h-4 w-5/6 rounded" />
+                </div>
+              ) : viewEditing ? (
+                <textarea
+                  value={viewDraft}
+                  onChange={(e) => setViewDraft(e.target.value)}
+                  spellCheck={false}
+                  className="h-[62vh] w-full resize-y rounded-[10px] border border-[var(--line-soft)] bg-[var(--bg)] p-3 font-mono text-[12px] leading-relaxed text-[var(--ink)] outline-none focus:border-[var(--accent)]"
+                  aria-label="Editor isi dokumen KB"
+                />
+              ) : (
+                <div className="rounded-[10px] border border-[var(--line-soft)] bg-[var(--surface)] p-4">
+                  <Markdown text={viewContent || '_(kosong)_'} />
+                </div>
+              )}
+            </div>
+          ) : (
+          <>
           {/* area unggah drag&drop */}
           <div
             onDragOver={(e) => { e.preventDefault(); setDragOver(true); }}
@@ -253,6 +368,15 @@ export function KbDrawer({
                       {d.updated ? ` · ${relTime(d.updated)}` : ''}
                     </p>
                   </div>
+                  <button
+                    type="button"
+                    aria-label={`Buka ${d.name || d.key}`}
+                    title="Buka / edit isi dokumen"
+                    onClick={() => void openDoc(d)}
+                    className="rounded-md p-1.5 text-[var(--muted-fg)] transition-colors hover:bg-[var(--accent-soft)] hover:text-[var(--accent)]"
+                  >
+                    <Eye className="h-3.5 w-3.5" />
+                  </button>
                   <ConfirmAction
                     title="Hapus dokumen?"
                     description={`"${d.name || d.key}" akan dihapus dari Knowledge Base. Jalankan sync setelahnya.`}
@@ -274,8 +398,171 @@ export function KbDrawer({
           )}
 
           <p className="mt-4 rounded-[10px] border border-[var(--line-soft)] bg-[var(--accent-soft)] px-3 py-2.5 text-[11.5px] leading-relaxed text-[var(--ink)]">
-            💡 Agent juga bisa memperbarui KB sendiri — cukup minta di chat, mis. “ringkas dokumen X dan tambahkan ke KB”.
+            💡 Agent juga bisa membuka/mengubah/menghapus dokumen lewat perintah chat — cukup minta, mis. “buka dokumen X”, “update dokumen Y ganti versi”, atau “hapus dokumen lama tentang Z”.
           </p>
+          </>
+          )}
+        </div>
+      </SheetContent>
+    </Sheet>
+  );
+}
+
+/* --------------------------- Skills drawer (v3.5) --------------------------- */
+
+export function SkillsDrawer({
+  open, onOpenChange, token, notify,
+}: {
+  open: boolean;
+  onOpenChange: (v: boolean) => void;
+  token: string;
+  notify: (msg: string, ok?: boolean) => void;
+}) {
+  const [skills, setSkills] = useState<MaaSkill[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [openKey, setOpenKey] = useState<string | null>(null);
+  const [openName, setOpenName] = useState('');
+  const [content, setContent] = useState('');
+  const [contentLoading, setContentLoading] = useState(false);
+  const [query, setQuery] = useState('');
+
+  const refresh = useCallback(async () => {
+    setLoading(true);
+    try {
+      const r = await listSkills(token);
+      setSkills(r.skills || []);
+    } catch (e) {
+      notify(`Gagal memuat skills: ${(e as Error).message}`);
+    } finally {
+      setLoading(false);
+    }
+  }, [token, notify]);
+
+  useEffect(() => {
+    if (open) {
+      refresh();
+      setOpenKey(null);
+    }
+  }, [open, refresh]);
+
+  const viewSkill = async (s: MaaSkill) => {
+    setOpenKey(s.key);
+    setOpenName(s.name || s.folder);
+    setContentLoading(true);
+    try {
+      const r = await getSkillContent(token, s.key);
+      setContent(r.content || '');
+    } catch (e) {
+      notify(`Gagal membuka skill: ${(e as Error).message}`);
+      setOpenKey(null);
+    } finally {
+      setContentLoading(false);
+    }
+  };
+
+  const filtered = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    if (!q) return skills;
+    return skills.filter(
+      (s) => s.name.toLowerCase().includes(q) || (s.description || '').toLowerCase().includes(q)
+    );
+  }, [skills, query]);
+
+  return (
+    <Sheet open={open} onOpenChange={onOpenChange}>
+      <SheetContent side="right" className="w-full max-w-md gap-0 p-0">
+        <SheetHeader className="border-b border-[var(--line)] px-5 py-4">
+          <SheetTitle className="flex items-center gap-2 text-[14px] font-bold text-[var(--ink)]">
+            <Sparkles className="h-4 w-4" style={{ color: 'var(--accent)' }} /> Skills Library
+          </SheetTitle>
+          <SheetDescription className="text-[11.5px] text-[var(--muted-fg)]">
+            Panduan eksekusi ahli (format Agent Skills) yang dimuat agent saat tugas cocok.
+          </SheetDescription>
+        </SheetHeader>
+
+        <div className="nice-scroll min-h-0 flex-1 overflow-y-auto p-5">
+          {openKey ? (
+            <div className="animate-pop space-y-3">
+              <div className="flex items-center justify-between gap-2">
+                <button
+                  type="button"
+                  onClick={() => setOpenKey(null)}
+                  className="maa-btn-ghost flex items-center gap-1 px-2 py-1.5 text-[11.5px] font-medium"
+                >
+                  <X className="h-3.5 w-3.5" /> Kembali
+                </button>
+                <span className="font-mono text-[10px] text-[var(--muted-fg)]">SKILL.md</span>
+              </div>
+              <p className="border-b border-[var(--line-soft)] pb-2 text-[13.5px] font-bold text-[var(--ink)]">{openName}</p>
+              {contentLoading ? (
+                <div className="space-y-2">
+                  <div className="skeleton-line h-4 w-3/4 rounded" />
+                  <div className="skeleton-line h-4 rounded" />
+                  <div className="skeleton-line h-4 w-5/6 rounded" />
+                </div>
+              ) : (
+                <div className="rounded-[10px] border border-[var(--line-soft)] bg-[var(--surface)] p-4">
+                  <Markdown text={content || '_(kosong)_'} />
+                </div>
+              )}
+            </div>
+          ) : (
+            <>
+              <div className="relative mb-3">
+                <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-[var(--muted-fg)]" />
+                <input
+                  value={query}
+                  onChange={(e) => setQuery(e.target.value)}
+                  placeholder="Cari skill…"
+                  className="h-9 w-full rounded-lg border border-[var(--line-soft)] bg-[var(--bg)] pl-8 pr-3 text-[12.5px] text-[var(--ink)] outline-none focus:border-[var(--accent)]"
+                  aria-label="Cari skill"
+                />
+              </div>
+
+              {loading ? (
+                <div className="space-y-2">
+                  <div className="skeleton-line h-12 rounded-[10px]" />
+                  <div className="skeleton-line h-12 rounded-[10px]" />
+                  <div className="skeleton-line h-12 rounded-[10px]" />
+                </div>
+              ) : filtered.length === 0 ? (
+                <div className="rounded-[10px] border border-[var(--line-soft)] bg-[var(--surface)] p-6 text-center">
+                  <Sparkles className="mx-auto mb-2 h-6 w-6 text-[var(--muted-fg)]" />
+                  <p className="text-[12.5px] font-medium text-[var(--ink)]">Belum ada skill terpasang</p>
+                  <p className="text-[11px] leading-relaxed text-[var(--muted-fg)]">
+                    Skill inti di-seed otomatis saat deployment. Anda juga bisa minta agent menyimpan skill baru via chat (“simpan pola kerja ini sebagai skill”).
+                  </p>
+                </div>
+              ) : (
+                <ul className="space-y-2">
+                  {filtered.map((s) => (
+                    <li key={s.key}>
+                      <button
+                        type="button"
+                        onClick={() => void viewSkill(s)}
+                        className="w-full rounded-[10px] border border-[var(--line-soft)] bg-[var(--surface)] px-3 py-2.5 text-left transition-colors hover:border-[var(--accent)]"
+                      >
+                        <span className="flex items-center gap-2">
+                          <Sparkles className="h-3.5 w-3.5 shrink-0" style={{ color: 'var(--accent)' }} />
+                          <span className="min-w-0 flex-1 truncate text-[12.5px] font-medium text-[var(--ink)]">{s.name}</span>
+                          <span className="shrink-0 font-mono text-[9.5px] text-[var(--muted-fg)]">{fmtBytes(s.size)}</span>
+                        </span>
+                        {s.description && (
+                          <span className="mt-1 block line-clamp-2 text-[11px] leading-relaxed text-[var(--muted-fg)]">
+                            {s.description}
+                          </span>
+                        )}
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+              )}
+
+              <p className="mt-4 rounded-[10px] border border-[var(--line-soft)] bg-[var(--accent-soft)] px-3 py-2.5 text-[11.5px] leading-relaxed text-[var(--ink)]">
+                💡 Agent memuat skill otomatis saat tugas cocok (progressive disclosure). Minta agent menyimpan pola kerja baru: “simpan ini sebagai skill”.
+              </p>
+            </>
+          )}
         </div>
       </SheetContent>
     </Sheet>
@@ -664,6 +951,44 @@ export function AdminDrawer({
     }
   };
 
+  // ---- Management User v3.5: rename & ganti role ----
+  const [renameUser, setRenameUser] = useState<AdminUser | null>(null);
+  const [renameValue, setRenameValue] = useState('');
+  const [renameBusy, setRenameBusy] = useState(false);
+
+  const submitRename = async () => {
+    if (!renameUser) return;
+    const name = renameValue.trim();
+    if (!name) {
+      notify('Nama tampilan tidak boleh kosong');
+      return;
+    }
+    setRenameBusy(true);
+    try {
+      await adminRenameUser(token, renameUser.username, name);
+      setUsers((prev) => prev.map((x) => (x.username === renameUser.username ? { ...x, name } : x)));
+      notify(`Nama ${renameUser.username} diubah menjadi "${name}"`, true);
+      setRenameUser(null);
+    } catch (e) {
+      notify(`Rename gagal: ${(e as Error).message}`);
+    } finally {
+      setRenameBusy(false);
+    }
+  };
+
+  const doSetRole = async (u: AdminUser, role: 'user' | 'superadmin') => {
+    setBusyUser(u.username);
+    try {
+      await adminSetUserRole(token, u.username, role);
+      setUsers((prev) => prev.map((x) => (x.username === u.username ? { ...x, role } : x)));
+      notify(`Role ${u.username} → ${role}. Berlaku pada login/token berikutnya.`, true);
+    } catch (e) {
+      notify(`Gagal ganti role: ${(e as Error).message}`);
+    } finally {
+      setBusyUser('');
+    }
+  };
+
   const statCards = [
     { label: 'Total', value: stats.total, icon: <Users className="h-3.5 w-3.5" /> },
     { label: 'Aktif', value: stats.active, icon: <Check className="h-3.5 w-3.5" /> },
@@ -767,7 +1092,7 @@ export function AdminDrawer({
                           )}
                         </p>
                         <p className="truncate text-[11px] text-[var(--muted-fg)]">
-                          {u.email || '—'}
+                          {u.name ? `${u.name} · ` : ''}{u.email || '—'}
                           {u.created ? ` · dibuat ${relTime(u.created)}` : ''}
                         </p>
                       </div>
@@ -781,6 +1106,34 @@ export function AdminDrawer({
                       </label>
                     </div>
                     <div className="mt-2 flex flex-wrap items-center gap-1.5 border-t border-[var(--line-soft)] pt-2">
+                      <button
+                        type="button"
+                        onClick={() => { setRenameUser(u); setRenameValue(u.name || ''); }}
+                        className="maa-btn-ghost flex items-center gap-1 px-2 py-1 text-[10.5px] font-medium"
+                        title="Ganti nama tampilan user"
+                      >
+                        <PencilLine className="h-3 w-3" /> Rename
+                      </button>
+                      <ConfirmAction
+                        title={u.role === 'superadmin' ? 'Jadikan user biasa?' : 'Jadikan superadmin?'}
+                        description={
+                          u.role === 'superadmin'
+                            ? `"${u.username}" akan KEHILANGAN akses admin (guardrail & Management User).`
+                            : `"${u.username}" akan mendapat akses penuh superadmin (bypass guardrail & kelola user).`
+                        }
+                        confirmLabel="Ya, ganti role"
+                        onConfirm={() => void doSetRole(u, u.role === 'superadmin' ? 'user' : 'superadmin')}
+                        trigger={
+                          <button
+                            type="button"
+                            disabled={busyUser === u.username}
+                            className="maa-btn-ghost flex items-center gap-1 px-2 py-1 text-[10.5px] font-medium disabled:opacity-50"
+                            title="Ganti role user ↔ superadmin"
+                          >
+                            <UserCog className="h-3 w-3" /> Ganti role
+                          </button>
+                        }
+                      />
                       <button
                         type="button"
                         disabled={busyUser === u.username}
@@ -827,6 +1180,43 @@ export function AdminDrawer({
             Semua aksi admin tervalog di CloudTrail. User nonaktif tetap tersimpan tapi tidak bisa login; hapus bersifat permanen.
           </p>
         </div>
+
+        {/* ---------- modal rename user (v3.5) ---------- */}
+        <AlertDialog
+          open={!!renameUser}
+          onOpenChange={(v) => { if (!v) setRenameUser(null); }}
+        >
+          <AlertDialogContent className="max-w-sm">
+            <AlertDialogHeader>
+              <AlertDialogTitle className="flex items-center gap-2 text-[15px] text-[var(--ink)]">
+                <PencilLine className="h-4 w-4" style={{ color: 'var(--accent)' }} /> Rename User
+              </AlertDialogTitle>
+              <AlertDialogDescription className="text-[12.5px] text-[var(--muted-fg)]">
+                Ganti nama tampilan untuk <b className="text-[var(--ink)]">{renameUser?.username}</b>. Username login tidak berubah.
+              </AlertDialogDescription>
+            </AlertDialogHeader>
+            <input
+              value={renameValue}
+              onChange={(e) => setRenameValue(e.target.value)}
+              placeholder="Nama tampilan (maks 60 karakter)"
+              maxLength={60}
+              className="h-9 w-full rounded-lg border border-[var(--line-soft)] bg-[var(--bg)] px-3 text-[13px] text-[var(--ink)] outline-none focus:border-[var(--accent)]"
+              autoFocus
+              aria-label="Nama tampilan baru"
+            />
+            <AlertDialogFooter>
+              <AlertDialogCancel className="rounded-lg border-[var(--line)]">Batal</AlertDialogCancel>
+              <AlertDialogAction
+                disabled={renameBusy || !renameValue.trim()}
+                onClick={(e) => { e.preventDefault(); void submitRename(); }}
+                className="maa-btn-primary rounded-lg"
+              >
+                {renameBusy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Check className="h-4 w-4" />}
+                Simpan
+              </AlertDialogAction>
+            </AlertDialogFooter>
+          </AlertDialogContent>
+        </AlertDialog>
 
         {/* ---------- modal undang 2 langkah ---------- */}
         <AlertDialog open={inviteOpen} onOpenChange={(v) => { if (!v) closeInvite(); }}>

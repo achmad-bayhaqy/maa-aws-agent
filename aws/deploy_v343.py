@@ -171,7 +171,7 @@ for attempt in range(15):
             lifecycleConfiguration={"idleRuntimeSessionTimeout": 900},
             environmentVariables=env,
             description="MAA AWS Agent v3.4.3 - durable artifact links (public gen/decks/apps, SSE-S3)",
-            tags={"Project": "maa-agent"},
+            tags={"Project": "maa-agent", "MAA": "true"},
         )
         break
     except bac.exceptions.ConflictException:

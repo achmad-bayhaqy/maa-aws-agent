@@ -438,10 +438,32 @@ TOOLS = [
         "Cari di Knowledge Base internal (runbook, asset inventory, arsitektur, best practices engineering). WAJIB dipakai untuk pertanyaan prosedur internal.",
         {"query": {"type": "string"}, "top_k": {"type": "integer"}}, ["query"]),
     _ts("kb_upload_doc",
-        "Perbarui Knowledge Base sendiri: simpan dokumen teks/markdown (maks 30k karakter) ke KB lalu sinkronkan.",
+        "Perbarui Knowledge Base sendiri: simpan dokumen BARU teks/markdown (maks 30k karakter) ke KB lalu sinkronkan. Untuk mengubah dokumen yang sudah ada pakai kb_edit_doc.",
         {"title": {"type": "string"}, "content": {"type": "string"}}, ["title", "content"]),
+    _ts("kb_list_docs",
+        "Daftar semua dokumen di Knowledge Base internal (nama, ukuran, tanggal, sumber: user/agent/seed). Panggil dulu sebelum membaca/mengedit.",
+        {}, []),
+    _ts("kb_read_doc",
+        "Baca isi lengkap sebuah dokumen Knowledge Base berdasarkan key (dari kb_list_docs). Maks 30k karakter.",
+        {"key": {"type": "string"}}, ["key"]),
+    _ts("kb_edit_doc",
+        "Edit dokumen Knowledge Base yang sudah ada: timpa isi dengan versi baru lalu jalankan re-index otomatis. Key wajib dari kb_list_docs.",
+        {"key": {"type": "string"}, "content": {"type": "string"}}, ["key", "content"]),
+    _ts("kb_delete_doc",
+        "Hapus dokumen dari Knowledge Base (file + jalankan re-index). Key wajib dari kb_list_docs.",
+        {"key": {"type": "string"}}, ["key"]),
     _ts("kb_sync", "Jalankan ingestion job Knowledge Base agar dokumen baru terindeks.",
         {}, []),
+    _ts("skills_list",
+        "Daftar skill library terpasang (format Agent Skills: panduan eksekusi ahli per domain — AWS, dokumen Office, desain, web app, dsb). Panggil saat tugas cocok dengan deskripsi skill.",
+        {}, []),
+    _ts("skills_use",
+        "Muat isi lengkap satu skill (petunjuk langkah-demi-langkah + gotchas) ke konteks Anda sebelum mengeksekusi tugas terkait. Nama dari skills_list.",
+        {"name": {"type": "string"}}, ["name"]),
+    _ts("skills_save",
+        "Buat/timpa skill baru ke library: tulis SKILL.md lengkap (frontmatter name+description + panduan teknis padat). Gunakan saat Anda menemukan pola kerja yang layak diingat permanen.",
+        {"name": {"type": "string"}, "description": {"type": "string"}, "content": {"type": "string"}},
+        ["name", "description", "content"]),
     _ts("iac_generate",
         "Validasi + simpan template CloudFormation YAML yang kamu susun. Kembalikan error validasi bila ada agar kamu bisa memperbaiki sendiri (self-heal) lalu panggil ulang.",
         {"stack_name": {"type": "string"}, "cloudformation_yaml": {"type": "string"}},
@@ -462,7 +484,7 @@ TOOLS = [
         {"prompt": {"type": "string"}, "size": {"type": "string", "enum": ["1024x1024", "1280x768", "768x1280"]}},
         ["prompt"]),
     _ts("code_interpreter",
-        "Jalankan kode Python di sandbox AgentCore Code Interpreter: analisis data, perhitungan, chart matplotlib (PNG tampil di chat). Tidak ada akses internet di sandbox.",
+        "Jalankan kode Python di sandbox AgentCore Code Interpreter: analisis data, scraping web (requests/urllib), perhitungan, chart matplotlib (PNG tampil di chat). Sandbox punya akses internet — pip install & scraping boleh.",
         {"code": {"type": "string"}}, ["code"]),
     _ts("aws_delete_resource",
         "HAPUS resource permanen: ec2 (terminate), s3 (bucket), dynamodb (table), rds, cloudformation (stack). TIDAK PERNAH dieksekusi langsung - sistem memicu protokol konfirmasi ganda.",
@@ -505,7 +527,8 @@ TOOLS = [
 
 DESTRUCTIVE_TYPES = {"ec2", "s3", "dynamodb", "rds", "cloudformation"}
 GATEWAY_TOOLS = {"web_search", "web_fetch"}
-SUBAGENT_TOOLS = {"web_search", "web_fetch", "kb_search", "code_interpreter",
+SUBAGENT_TOOLS = {"web_search", "web_fetch", "kb_search", "kb_read_doc", "code_interpreter",
+                  "skills_list", "skills_use",
                   "aws_list_resources", "aws_get_metrics", "aws_cost_analysis",
                   "aws_logs_inspect", "generate_image"}
 SUBAGENT_ROLES = {
@@ -575,6 +598,64 @@ def _todos_save(sid, todos):
 
 
 _LAST_TODOS = {}
+
+
+# ---------------------------------------------------------------- skills library (v3.5)
+# Format mengikuti standar Agent Skills (agentskills.io / anthropics/skills):
+# folder skills/<name>/SKILL.md dengan frontmatter YAML (name, description).
+# Progressive disclosure: model hanya melihat name+description (skills_list);
+# isi lengkap SKILL.md dimuat on-demand via skills_use.
+SKILLS_PREFIX = "skills/"
+_SKILLS_CACHE = {"ts": 0, "items": []}
+
+
+def _parse_skill_frontmatter(text):
+    """Parse frontmatter minimal dari SKILL.md tanpa lib yaml: name + description."""
+    name, desc = "", ""
+    m = re.match(r"\s*---\s*\n(.*?)\n\s*---", text or "", re.DOTALL)
+    fm = m.group(1) if m else ""
+    for line in fm.splitlines():
+        lm = re.match(r"^(name|description)\s*:\s*(.*)$", line.strip())
+        if not lm:
+            continue
+        val = lm.group(2).strip().strip('"').strip("'")
+        if lm.group(1) == "name":
+            name = val
+        else:
+            desc = val
+    if not name:
+        name = "(tanpa-nama)"
+    return name, desc
+
+
+def skills_list_cached(force=False):
+    """Daftar skill dari s3://{ART_BUCKET}/skills/*/SKILL.md (cache 5 menit)."""
+    if not force and _SKILLS_CACHE["items"] and now_ms() - _SKILLS_CACHE["ts"] < 300_000:
+        return _SKILLS_CACHE["items"]
+    r = get_client("s3").list_objects_v2(Bucket=ART_BUCKET, Prefix=SKILLS_PREFIX, MaxKeys=200)
+    items = []
+    for o in r.get("Contents", []):
+        key = o["Key"]
+        if not key.endswith("SKILL.md"):
+            continue
+        name_dir = key[len(SKILLS_PREFIX):].split("/")[0]
+        try:
+            body = get_client("s3").get_object(Bucket=ART_BUCKET, Key=key)["Body"].read()[:4096].decode("utf-8", "ignore")
+            fm_name, desc = _parse_skill_frontmatter(body)
+        except Exception:
+            fm_name, desc = name_dir, ""
+        items.append({"name": fm_name or name_dir, "folder": name_dir, "key": key,
+                      "description": desc[:400], "size": o["Size"],
+                      "updated": str(o.get("LastModified", ""))})
+    _SKILLS_CACHE["ts"] = now_ms()
+    _SKILLS_CACHE["items"] = items
+    return items
+
+
+def _skill_slug(name):
+    slug = re.sub(r"[^a-z0-9-]", "-", (name or "").lower().strip()).strip("-")
+    slug = re.sub(r"-{2,}", "-", slug)
+    return slug[:60]
 
 
 # ---------------------------------------------------------------- deck template
@@ -695,6 +776,115 @@ def exec_tool(name, args, sid=None, attachments=None):
                                      description="agent-triggered sync")
         return {"status": "ok", "jobId": job["ingestionJob"]["ingestionJobId"],
                 "ingestionStatus": job["ingestionJob"]["status"]}
+
+    # ---- KB management (v3.5: buka/edit/hapus via perintah chat) ----
+    if name == "kb_list_docs":
+        try:
+            r = get_client("s3").list_objects_v2(Bucket=KB_BUCKET, Prefix="docs/", MaxKeys=200)
+            docs = [{"key": o["Key"], "name": o["Key"].split("/")[-1], "size": o["Size"],
+                     "source": o["Key"].split("/")[1] if o["Key"].count("/") >= 2 else "root",
+                     "updated": str(o.get("LastModified", ""))}
+                    for o in r.get("Contents", [])]
+            return {"status": "ok", "count": len(docs), "docs": docs}
+        except Exception as e:
+            return {"status": "error", "message": str(e)[:200]}
+
+    if name == "kb_read_doc":
+        key = args.get("key", "")
+        if not key.startswith("docs/") or ".." in key:
+            return {"status": "error", "message": "key tidak valid (harus di bawah docs/)"}
+        try:
+            obj = get_client("s3").get_object(Bucket=KB_BUCKET, Key=key)
+            content = obj["Body"].read().decode("utf-8", "ignore")[:30000]
+            return {"status": "ok", "key": key, "content": content,
+                    "truncated": obj["ContentLength"] > 30000}
+        except Exception as e:
+            return {"status": "error", "message": str(e)[:200]}
+
+    if name == "kb_edit_doc":
+        key = args.get("key", "")
+        content = args.get("content", "")
+        if not key.startswith("docs/") or ".." in key:
+            return {"status": "error", "message": "key tidak valid (harus di bawah docs/)"}
+        if len(content) < 30:
+            return {"status": "error", "message": "konten terlalu pendek (min 30 karakter)"}
+        s3c = get_client("s3")
+        try:
+            s3c.head_object(Bucket=KB_BUCKET, Key=key)
+        except Exception:
+            return {"status": "error", "message": f"dokumen tidak ditemukan: {key} (cek kb_list_docs)"}
+        s3c.put_object(Bucket=KB_BUCKET, Key=key, Body=content[:30000].encode(),
+                       ServerSideEncryption="aws:kms", ContentType="text/markdown")
+        job_status = ""
+        try:
+            ba = get_client("bedrock-agent")
+            ds = ba.list_data_sources(knowledgeBaseId=KB_ID)["dataSourceSummaries"]
+            job = ba.start_ingestion_job(knowledgeBaseId=KB_ID, dataSourceId=ds[0]["dataSourceId"],
+                                         description=f"agent edit: {key.split('/')[-1][:40]}")
+            job_status = job["ingestionJob"]["status"]
+        except Exception as e:
+            job_status = f"upload OK, ingestion tertunda: {str(e)[:100]}"
+        return {"status": "ok", "key": key, "ingestion": job_status,
+                "note": "Dokumen diperbarui & re-index dimulai. Laporkan ke pengguna."}
+
+    if name == "kb_delete_doc":
+        key = args.get("key", "")
+        if not key.startswith("docs/") or ".." in key:
+            return {"status": "error", "message": "key tidak valid (harus di bawah docs/)"}
+        get_client("s3").delete_object(Bucket=KB_BUCKET, Key=key)
+        try:
+            ba = get_client("bedrock-agent")
+            ds = ba.list_data_sources(knowledgeBaseId=KB_ID)["dataSourceSummaries"]
+            ba.start_ingestion_job(knowledgeBaseId=KB_ID, dataSourceId=ds[0]["dataSourceId"],
+                                   description=f"agent delete: {key.split('/')[-1][:40]}")
+        except Exception:
+            pass
+        return {"status": "ok", "key": key,
+                "note": "Dokumen dihapus & re-index dimulai. Dokumen hilang permanen."}
+
+    # ---- Skills library (v3.5: Agent Skills ala Claude, progressive disclosure) ----
+    if name == "skills_list":
+        try:
+            items = skills_list_cached()
+            return {"status": "ok", "count": len(items), "skills": items,
+                    "note": "Panggil skills_use(name=...) untuk memuat panduan lengkap sebelum mengerjakan tugas yang cocok."}
+        except Exception as e:
+            return {"status": "error", "message": str(e)[:200]}
+
+    if name == "skills_use":
+        slug = _skill_slug(args.get("name", ""))
+        if not slug:
+            return {"status": "error", "message": "nama skill kosong"}
+        try:
+            key = f"{SKILLS_PREFIX}{slug}/SKILL.md"
+            obj = get_client("s3").get_object(Bucket=ART_BUCKET, Key=key)
+            body = obj["Body"].read().decode("utf-8", "ignore")
+            return {"status": "ok", "name": slug, "skill_md": body[:22000],
+                    "note": "Ikuti panduan skill ini secara ketat untuk tugas terkait."}
+        except Exception:
+            items = skills_list_cached(force=True)
+            fuzzy = [i["folder"] for i in items if slug in i["folder"] or i["folder"] in slug]
+            return {"status": "error", "message": f"skill '{slug}' tidak ditemukan",
+                    "available": [i["name"] for i in items][:40], "mirip": fuzzy}
+
+    if name == "skills_save":
+        slug = _skill_slug(args.get("name", ""))
+        desc = (args.get("description", "") or "").strip()
+        content = args.get("content", "")
+        if not slug or slug in ("(tanpa-nama)",):
+            return {"status": "error", "message": "nama skill tidak valid (a-z, 0-9, tanda hubung)"}
+        if not desc:
+            return {"status": "error", "message": "description wajib (kapan skill dipakai)"}
+        if len(content) < 100:
+            return {"status": "error", "message": "content terlalu pendek — tulis panduan teknis yang bermanfaat (min 100 char)"}
+        md = content if content.lstrip().startswith("---") else \
+            f"---\nname: {slug}\ndescription: \"{desc[:400]}\"\n---\n\n{content}"
+        key = f"{SKILLS_PREFIX}{slug}/SKILL.md"
+        get_client("s3").put_object(Bucket=ART_BUCKET, Key=key, Body=md[:60000].encode(),
+                                    ServerSideEncryption="aws:kms", ContentType="text/markdown")
+        skills_list_cached(force=True)
+        return {"status": "ok", "key": key, "name": slug,
+                "note": "Skill tersimpan permanen di library. Ia otomatis muncul di skills_list."}
 
     # ---- Web tools via AgentCore Gateway (MCP) ----
     if name in GATEWAY_TOOLS:
@@ -1215,16 +1405,24 @@ IDENTITAS & TUGAS
 
 PENGETAHUAN & KAPABILITAS (WAJIB dipahami)
 - Pengetahuan dasar Anda dimutakhirkan sampai HARI INI. Untuk hal yang bisa berubah (harga, versi, rilis, berita, kondisi terkini) JANGAN bilang "tidak tahu / cutoff" — panggil web_search, lalu web_fetch bila perlu membaca halamannya. Jawaban Anda dianggap terkini oleh pengguna.
-- Kapabilitas Anda: browsing web real-time (web_search + web_fetch), code interpreter (Python/matplotlib untuk analisis data & chart), generate gambar (Nova Canvas), memori jangka panjang lintas sesi (AgentCore Memory), multi-agent (subagent_run: researcher/analyst/architect/coder/reviewer/ops), todo list live (task_plan), membuat deck presentasi (generate_presentation) dan web app (deploy_web_app), serta operasi penuh AWS: EC2, EKS, RDS, S3, VPC, Lambda, DynamoDB, CloudWatch, Cost Explorer, CloudFormation.
+- Kapabilitas Anda: browsing web real-time (web_search + web_fetch), code interpreter (Python/matplotlib + akses internet utk scraping/pip install), generate gambar (Nova Canvas), memori jangka panjang lintas sesi (AgentCore Memory), skill library (skills_list/skills_use — panduan ahli per domain), multi-agent (subagent_run), todo list live (task_plan), deck presentasi (generate_presentation), web app (deploy_web_app), serta operasi penuh AWS: EC2, EKS, RDS, S3, VPC, Lambda, DynamoDB, CloudWatch, Cost Explorer, CloudFormation.
 - Bila pengguna bertanya "kamu bisa apa" atau meminta daftar kemampuan: jawab ringkas dengan daftar kapabilitas di atas (bahasa pengguna) — JANGAN menolak atau bertanya balik.
 - Bila Anda menemukan update AWS penting (resource/service baru, perubahan harga, deprecation), simpan ringkasannya ke Knowledge Base via kb_upload_doc lalu kb_sync agar pengetahuan internal tim selalu mutakhir.
+
+SKILLS LIBRARY (library skill ala Agent Skills)
+- Saat menerima tugas yang mungkin punya skill terkait (dokumen Office, desain, web app, optimasi biaya AWS, audit keamanan, dsb): panggil skills_list dulu, lalu skills_use untuk memuat panduan lengkap sebelum mengeksekusi. Ikuti panduannya secara ketat — itu kumpulan best practice + gotchas.
+- Bila Anda menemukan pola kerja baru yang layak diingat permanen (mis. urutan langkah yang berhasil, jebakan yang terpecahkan), simpan via skills_save agar bisa dipakai ulang sesi berikutnya.
+
+MANAJEMEN KNOWLEDGE BASE (via perintah chat)
+- Pengguna bisa minta buka/ubah/hapus dokumen KB lewat percakapan: kb_list_docs untuk melihat daftar, kb_read_doc untuk membaca, kb_edit_doc untuk mengubah, kb_delete_doc untuk menghapus. Re-index berjalan otomatis setelah edit/hapus.
+- Contoh: "buka dokumen runbook-ec2", "update KB: ganti versi di dokumen X", "hapus dokumen lama tentang Y" — kerjakan langsung dengan tool di atas, lalu laporkan hasilnya.
 
 DISIPLIN TOOL
 - Status/monitoring/list: aws_list_resources atau aws_get_metrics — jangan menebak.
 - Prosedur internal/kebijakan korporat/best practice engineering: kb_search DULU.
 - Informasi TERBARU dari internet (rilis, harga, berita, praktik 2026): web_search, lalu web_fetch untuk membaca halaman.
 - Gambar/diagram visual: generate_image (sebutkan promptnya di teks).
-- Analisis data/perhitungan/chart: code_interpreter (matplotlib untuk chart PNG).
+- Analisis data/perhitungan/chart: code_interpreter (matplotlib untuk chart PNG). Butuh data dari web (scraping Google Play/API publik)? code_interpreter punya akses internet — requests/urllib langsung jalan; bila gagal, fallback web_fetch.
 - Membangun infrastruktur kompleks: iac_generate (perbaiki sendiri bila validasi gagal), tawarkan iac_deploy_stack.
 - Analisis biaya: aws_cost_analysis. Diagnosis log: aws_logs_inspect.
 - Bila tool gagal: analisis error, koreksi parameter, panggil ulang (self-healing).

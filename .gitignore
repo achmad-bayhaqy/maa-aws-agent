@@ -81,4 +81,4 @@ aws/agent_runtime/*.zip
 aws/maa-user-credentials.json
 aws/probe_result.json
 aws/state-old-account.json.bak
-__pycache__/
+scripts/chat_models.txt.bak

@@ -12,11 +12,11 @@ import zipfile
 
 import boto3
 
-sys.path.insert(0, "/home/z/my-project/aws")
+sys.path.insert(0, __import__("os").path.dirname(__import__("os").path.abspath(__file__)))
 from lib_common import ACCOUNT_ID, REGION, log, load_state, save_state
 
 st = load_state()
-ROOT = "/home/z/my-project/aws/agent_runtime"
+ROOT = __import__("os").path.join(__import__("os").path.dirname(__import__("os").path.abspath(__file__)), "agent_runtime")
 PKG = f"{ROOT}/pkg"
 ZIP_PATH = f"{ROOT}/maa-agent-runtime.zip"
 S3_KEY = f"runtime/maa-agent-runtime-{uuid.uuid4().hex[:8]}.zip"
@@ -128,7 +128,7 @@ for attempt in range(15):
             lifecycleConfiguration={"idleRuntimeSessionTimeout": 900},
             environmentVariables=env,
             description="MAA AWS Agent - autonomous cloud operations brain",
-            tags={"Project": "maa-agent"},
+            tags={"Project": "maa-agent", "MAA": "true"},
         )
         break
     except bac.exceptions.ConflictException:
