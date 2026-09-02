@@ -141,6 +141,67 @@ function UserAttChips({ atts }: { atts?: MessageAtt[] }) {
   );
 }
 
+/* ------------------ gambar hasil agent (att type=image) ------------------ */
+
+function ImageCards({ atts }: { atts?: MessageAtt[] }) {
+  const imgs = asArray<MessageAtt>(atts).filter(
+    (a) => a && a.url && (a.kind === 'image' || a.type === 'image'),
+  );
+  const [failed, setFailed] = useState<Record<number, boolean>>({});
+  if (!imgs.length) return null;
+  return (
+    <div className="mt-2 flex flex-col gap-2">
+      {imgs.map((a, i) =>
+        failed[i] ? (
+          // Diagnostik detail (feedback user: "tambahkan about di checknya"):
+          // jangan diam bila gambar gagal — tunjukkan sebab & URL utk dicek manual.
+          <div
+            key={i}
+            className="flex w-fit max-w-full items-center gap-2 rounded-[10px] border border-[var(--line)] bg-[var(--surface)] px-3 py-2 text-[11px]"
+          >
+            <ImageIcon className="h-4 w-4 shrink-0" style={{ color: 'var(--accent)' }} />
+            <div className="min-w-0">
+              <span className="block font-semibold text-[var(--ink)]">
+                Gambar gagal dimuat{(a.name && ` — ${a.name}`) || ''}
+              </span>
+              <span className="block text-[var(--muted-fg)]">
+                Kemungkinan: akses ke storage ditolak (Access Denied) / objek tidak ada / jaringan
+                diblokir. Klik URL di bawah untuk lihat error aslinya.
+              </span>
+              <a
+                href={a.url}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="block max-w-[420px] truncate font-mono text-[10px] underline underline-offset-2"
+                style={{ color: 'var(--accent)' }}
+              >
+                {a.url}
+              </a>
+            </div>
+          </div>
+        ) : (
+          <a
+            key={i}
+            href={a.url}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="block w-fit max-w-full"
+            title="Buka gambar di tab baru"
+          >
+            <img
+              src={a.url}
+              alt={a.name || 'Gambar hasil agent'}
+              loading="lazy"
+              onError={() => setFailed((f) => ({ ...f, [i]: true }))}
+              className="max-h-[420px] max-w-full rounded-[10px] border border-[var(--line)] object-contain"
+            />
+          </a>
+        ),
+      )}
+    </div>
+  );
+}
+
 /* ------------------------ artefak agent (deck/webapp) ------------------------ */
 
 function ArtifactCards({ atts }: { atts?: MessageAtt[] }) {
@@ -234,6 +295,7 @@ function AssistantBubble({
         <div className="w-full rounded-[10px] border border-[var(--line-soft)] bg-[var(--surface)] px-3.5 py-2.5 shadow-[var(--shadow-soft)]">
           <Markdown text={active.text} />
         </div>
+        <ImageCards atts={msg.atts} />
         <ArtifactCards atts={msg.atts} />
         <div className="flex flex-wrap items-center gap-1.5 pl-0.5 text-[10px] text-[var(--muted-fg)]">
           <span className="font-mono">{fmtClock(active.ts)}</span>

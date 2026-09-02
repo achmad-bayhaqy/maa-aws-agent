@@ -89,13 +89,31 @@ function CodeBlock({ lang, code }: { lang: string; code: string }) {
 
 function MdImage({ alt, src }: { alt: string; src: string }) {
   const url = safeUrl(src);
+  const [failed, setFailed] = useState(false);
   if (url === '#') return <span className="text-[var(--muted-fg)]">[gambar tidak valid]</span>;
+  if (failed) {
+    // Diagnostik (feedback user: "tambahkan about di checknya") — jangan diam saja.
+    return (
+      <a
+        href={url}
+        target="_blank"
+        rel="noopener noreferrer"
+        className="mt-2 flex w-fit max-w-full items-center gap-2 rounded-[10px] border border-[var(--line)] bg-[var(--surface)] px-3 py-2 text-[11px] text-[var(--muted-fg)] transition-colors hover:text-[var(--ink)]"
+      >
+        <span className="shrink-0 font-medium text-[var(--accent)]">⚠ Gambar gagal dimuat</span>
+        <span className="truncate">
+          (kemungkinan akses ke storage ditolak / jaringan diblokir) — klik untuk buka URL langsung &amp; lihat pesan error-nya
+        </span>
+      </a>
+    );
+  }
   return (
     <a href={url} target="_blank" rel="noopener noreferrer" className="mt-2 block w-fit max-w-full">
       <img
         src={url}
         alt={alt || 'Gambar hasil agent'}
         loading="lazy"
+        onError={() => setFailed(true)}
         className="max-h-[420px] max-w-full rounded-[10px] border border-[var(--line)] object-contain"
       />
     </a>

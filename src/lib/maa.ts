@@ -160,6 +160,7 @@ export type MessageAtt = {
   key?: string;
   size?: number;
   kind?: string; // upload | image | pdf | text | file | deck | webapp
+  type?: string; // runtime mengirim "type": "image" — dipetakan ke kind saat render
   url?: string;
   slides?: number;
   files?: number;
