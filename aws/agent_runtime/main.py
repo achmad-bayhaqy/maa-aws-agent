@@ -543,14 +543,14 @@ TOOLS = [
         ["app_name", "index_html"]),
     # ------------- v3.6: konektor data source (ala Claude AI) -------------
     _ts("connector_list",
-        "Daftar konektor data user (Google Drive, OneDrive, ADLS Gen2, SFTP, API, MCP) beserta status koneksinya. Panggil ini dulu sebelum memakai konektor lain.",
+        "Daftar konektor data user (Google Drive, OneDrive, ADLS Gen2, GCS, BigQuery, S3, SFTP, API, MCP) beserta status koneksinya. Panggil ini dulu sebelum memakai konektor lain.",
         {}, []),
     _ts("connector_browse",
         "List file/folder di konektor data user. connector = nama/ID dari connector_list. path opsional (folder). Berguna sebelum connector_read.",
         {"connector": {"type": "string"}, "path": {"type": "string"}},
         ["connector"]),
     _ts("connector_read",
-        "Baca isi file dari konektor data user (Google Drive/OneDrive/ADLS/SFTP/API). connector = nama/ID; path = lokasi file (untuk Drive: fileId dari connector_browse).",
+        "Baca isi file dari konektor data user (Google Drive/OneDrive/ADLS/GCS/S3/SFTP/API/BigQuery). connector = nama/ID; path = lokasi file (untuk Drive: fileId dari connector_browse; BigQuery: dataset/tabel).",
         {"connector": {"type": "string"}, "path": {"type": "string"}},
         ["connector", "path"]),
 ]
@@ -610,6 +610,27 @@ def _art_public_url(key):
     dengan SSE-S3 (AES256), karena objek SSE-KMS tidak bisa dibaca anonim.
     """
     return f"https://{ART_BUCKET}.s3.{REGION}.amazonaws.com/{key}"
+
+
+def _svg_inject_size(svg_txt):
+    """Pastikan root <svg> punya atribut width/height eksplisit.
+
+    SVG yang hanya punya viewBox TANPA width/height = tanpa intrinsic size;
+    saat dirender via <img> dengan max-width/max-height (frontend), Chrome
+    menghitung content box 0x0 — hanya border 1px yang tampak (titik kecil),
+    itulah bug "gambar tidak muncul di chat" (feedback user 2026-09-03).
+    Dimensi diambil dari viewBox bila ada; fallback 1024x1024.
+    """
+    try:
+        head = (svg_txt or "")[:800]
+        if re.search(r"<svg[^>]*\swidth\s*=", head, re.I) and re.search(r"<svg[^>]*\sheight\s*=", head, re.I):
+            return svg_txt
+        mvb = re.search(r"viewBox\s*=\s*[\"']\s*[\d.]+\s+[\d.]+\s+([\d.]+)\s+([\d.]+)", head, re.I)
+        w = mvb.group(1).split(".")[0] if mvb else "1024"
+        h = mvb.group(2).split(".")[0] if mvb else "1024"
+        return re.sub(r"<svg", f'<svg width="{w}" height="{h}"', svg_txt, count=1, flags=re.I)
+    except Exception:
+        return svg_txt
 
 
 def _todos_save(sid, todos):
@@ -1222,7 +1243,7 @@ def exec_tool(name, args, sid=None, attachments=None, user_id=None, username=Non
                 msvg = re.search(r"<svg[\s\S]*?</svg>", svg)
                 if not msvg or len(msvg.group(0)) < 120:
                     raise ValueError("model tidak menghasilkan SVG valid")
-                svg_txt = msvg.group(0)
+                svg_txt = _svg_inject_size(msvg.group(0))
                 key = f"gen/art-{uuid.uuid4().hex}.svg"
                 get_client("s3").put_object(Bucket=ART_BUCKET, Key=key, Body=svg_txt.encode(),
                                             ServerSideEncryption="AES256", ContentType="image/svg+xml")

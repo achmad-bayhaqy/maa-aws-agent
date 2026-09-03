@@ -114,7 +114,8 @@ function MdImage({ alt, src }: { alt: string; src: string }) {
         alt={alt || 'Gambar hasil agent'}
         loading="lazy"
         onError={() => setFailed(true)}
-        className="max-h-[420px] max-w-full rounded-[10px] border border-[var(--line)] object-contain"
+        // min-w mencegah collapse 0x0 utk SVG tanpa intrinsic size (viewBox saja)
+        className="min-w-[160px] max-h-[420px] max-w-full rounded-[10px] border border-[var(--line)] object-contain"
       />
     </a>
   );

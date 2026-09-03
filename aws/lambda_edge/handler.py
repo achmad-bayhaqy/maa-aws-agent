@@ -8,6 +8,7 @@ file upload/artefak), /kb/content alias + dukungan skills/, RESEARCH mode,
 skill picker passthrough, auto re-index pasca delete."""
 import json
 import os
+import re
 import time
 import uuid
 import boto3
@@ -169,11 +170,45 @@ def resp_redirect(location):
 
 
 def _conn_cfg(item):
-    """Config konektor tersimpan sebagai string JSON (kompat low-level DDB)."""
+    """Config konektor tersimpan sebagai string JSON (kompat low-level DDB).
+    Nilai rahasia terenkripsi KMS didekripsi di sini (engine/UI mask terpisah)."""
+    try:
+        raw = json.loads(item.get("config") or "{}") if isinstance(item.get("config"), str) else (item.get("config") or {})
+        return _conn.open_config(raw)
+    except Exception:
+        return {}
+
+
+def _conn_cfg_raw(item):
+    """Config mentah TANPA dekripsi (baca field non-rahasia spt clientId)."""
     try:
         return json.loads(item.get("config") or "{}") if isinstance(item.get("config"), str) else (item.get("config") or {})
     except Exception:
         return {}
+
+
+def _oauth_origin(event):
+    """Origin frontend utk redirect_uri OAuth — dari header Origin/Referer."""
+    hdrs = {str(k).lower(): str(v) for k, v in (event.get("headers") or {}).items()}
+    origin = hdrs.get("origin") or ""
+    if not origin and hdrs.get("referer"):
+        m = re.match(r"^(https?://[^/]+)", hdrs["referer"])
+        origin = m.group(1) if m else ""
+    if origin.startswith("http://") and "localhost" not in origin and "127.0.0.1" not in origin:
+        origin = ""  # hanya localhost yang boleh http
+    if not origin:
+        origin = os.environ.get("MAA_FRONTEND_ORIGIN", "")
+    if not origin:
+        raise ValueError("origin tidak diketahui — set header Origin atau env MAA_FRONTEND_ORIGIN")
+    return origin
+
+
+def _oauth_state_secret():
+    """Secret HMAC utk state OAuth (diset saat deploy)."""
+    s = os.environ.get("OAUTH_STATE_SECRET", "")
+    if not s:
+        raise ValueError("OAUTH_STATE_SECRET belum diset di edge Lambda")
+    return s
 
 
 def handler(event, context):
@@ -851,6 +886,7 @@ def handler(event, context):
                     FilterExpression="#o = :u",
                     ExpressionAttributeNames={"#o": "owner"},
                     ExpressionAttributeValues={":u": cl["username"]}).get("Items", [])
+            items = [i for i in items if i.get("connectorId") != "__oauth_settings__" and i.get("type") != "settings"]
             items.sort(key=lambda x: int(x.get("createdAt", 0)), reverse=True)
             out = [{"connectorId": i["connectorId"], "name": i.get("name", ""),
                     "type": i.get("type", ""), "owner": i.get("owner", ""),
@@ -876,7 +912,7 @@ def handler(event, context):
             cid = "conn-" + uuid.uuid4().hex[:16]
             conn_tbl.put_item(Item={
                 "connectorId": cid, "owner": cl["username"], "name": name, "type": ctype,
-                "config": json.dumps(cfg), "status": "untested", "createdAt": now, "updatedAt": now})
+                "config": json.dumps(_conn.seal_config(cfg)), "status": "untested", "createdAt": now, "updatedAt": now})
             return resp(200, {"connectorId": cid, "name": name, "type": ctype,
                               "config": _conn.mask_config(cfg), "status": "untested",
                               "createdAt": now, "updatedAt": now})
@@ -899,7 +935,7 @@ def handler(event, context):
             it = conn_tbl.get_item(Key={"connectorId": cid}).get("Item")
             if not it or (it.get("owner") != cl["username"] and not is_superadmin(cl)):
                 return resp(404, {"error": "konektor tidak ditemukan"})
-            new_cfg = _conn.merge_config(_conn_cfg(it), body.get("config") or {})
+            new_cfg = _conn.seal_config(_conn.merge_config(_conn_cfg(it), body.get("config") or {}))
             name = (body.get("name") or it.get("name", "")).strip()[:80]
             conn_tbl.update_item(
                 Key={"connectorId": cid},
@@ -931,6 +967,115 @@ def handler(event, context):
                                                ":t": now_ms(), ":o": ok, ":m": msg[:300]})
             return resp(200, {"ok": ok, "message": msg, "detail": detail,
                               "type": ctype, "connectorId": cid or None})
+
+        # ---------------- v3.6.1: OAuth popup login (Google / Microsoft) -----
+        if path == "/connectors/oauth/settings" and method == "GET":
+            if conn_tbl is None:
+                return resp(501, {"error": "fitur konektor belum terpasang"})
+            st_item = conn_tbl.get_item(Key={"connectorId": "__oauth_settings__"}).get("Item") or {}
+            raw = _conn_cfg_raw(st_item)
+            origin = _oauth_origin(event)
+            out = {"redirectUri": f"{origin}/oauth/callback.html",
+                   "google": {"configured": bool(raw.get("google", {}).get("clientId")),
+                              "clientId": raw.get("google", {}).get("clientId", "")},
+                   "microsoft": {"configured": bool(raw.get("microsoft", {}).get("clientId")),
+                                 "clientId": raw.get("microsoft", {}).get("clientId", "")}}
+            return resp(200, out)
+
+        if path == "/connectors/oauth/settings" and method == "POST":
+            if conn_tbl is None:
+                return resp(501, {"error": "fitur konektor belum terpasang"})
+            if not is_superadmin(cl):
+                return resp(403, {"error": "hanya superadmin boleh mengatur OAuth app"})
+            body = json.loads(event.get("body") or "{}")
+            st_item = conn_tbl.get_item(Key={"connectorId": "__oauth_settings__"}).get("Item") or {}
+            cur = _conn_cfg(st_item)
+            for prov in ("google", "microsoft"):
+                inc = body.get(prov) or {}
+                if not isinstance(inc, dict):
+                    continue
+                curp = cur.get(prov) or {}
+                for k in ("clientId", "clientSecret", "tenant"):
+                    if inc.get(k) not in (None, "", "\u2022\u2022\u2022"):
+                        curp[k] = str(inc[k]).strip()
+                    elif inc.get(k) == "\u2022\u2022\u2022":
+                        pass  # termask = keep
+                cur[prov] = curp
+            now = now_ms()
+            conn_tbl.put_item(Item={
+                "connectorId": "__oauth_settings__", "owner": "__system__", "name": "OAuth App Settings",
+                "type": "settings", "config": json.dumps(_conn.seal_config(cur)),
+                "status": "ok", "createdAt": st_item.get("createdAt", now), "updatedAt": now})
+            return resp(200, {"saved": True,
+                              "google": {"configured": bool(cur.get("google", {}).get("clientId"))},
+                              "microsoft": {"configured": bool(cur.get("microsoft", {}).get("clientId"))}})
+
+        if path == "/connectors/oauth/start" and method == "GET":
+            if conn_tbl is None:
+                return resp(501, {"error": "fitur konektor belum terpasang"})
+            ctype = qs.get("type") or ""
+            provider = _conn.oauth_provider_for(ctype)
+            if not provider:
+                return resp(400, {"error": f"tipe {ctype} tidak didukung OAuth popup"})
+            st_item = conn_tbl.get_item(Key={"connectorId": "__oauth_settings__"}).get("Item") or {}
+            oc = _conn_cfg(st_item).get(provider) or {}
+            if not oc.get("clientId"):
+                return resp(400, {"error": f"OAuth app {provider} belum dikonfigurasi (isi clientId/clientSecret dulu)",
+                                   "needsSetup": True, "provider": provider})
+            origin = _oauth_origin(event)
+            redirect_uri = f"{origin}/oauth/callback.html"
+            secret = _oauth_state_secret()
+            verifier = uuid.uuid4().hex + uuid.uuid4().hex
+            state = _conn.signed_oauth_state(secret, {"t": ctype, "p": provider, "u": cl["username"],
+                                                       "v": verifier, "e": now_ms() + 600000})
+            if provider == "google":
+                url = _conn.google_authorize_url(oc, ctype, redirect_uri, state)
+            else:
+                url = _conn.microsoft_authorize_url(oc, redirect_uri, state, verifier)
+            return resp(200, {"url": url, "provider": provider, "redirectUri": redirect_uri})
+
+        if path == "/connectors/oauth/exchange" and method == "POST":
+            if conn_tbl is None:
+                return resp(501, {"error": "fitur konektor belum terpasang"})
+            body = json.loads(event.get("body") or "{}")
+            try:
+                payload = _conn.verify_oauth_state(_oauth_state_secret(), body.get("state") or "")
+            except ValueError as e:
+                return resp(400, {"error": str(e)})
+            if payload.get("u") != cl["username"]:
+                return resp(403, {"error": "state milik user lain"})
+            if int(payload.get("e", 0)) < now_ms():
+                return resp(400, {"error": "sesi OAuth kedaluwarsa — ulangi login"})
+            ctype, provider = payload.get("t", ""), payload.get("p", "")
+            origin = _oauth_origin(event)
+            redirect_uri = f"{origin}/oauth/callback.html"
+            st_item = conn_tbl.get_item(Key={"connectorId": "__oauth_settings__"}).get("Item") or {}
+            oc = _conn_cfg(st_item).get(provider) or {}
+            try:
+                if provider == "google":
+                    oauth_cfg = _conn.google_exchange(oc, ctype, body.get("code") or "", redirect_uri)
+                else:
+                    oauth_cfg = _conn.microsoft_exchange(oc, body.get("code") or "", redirect_uri,
+                                                         payload.get("v", ""))
+            except ValueError as e:
+                return resp(400, {"error": str(e)})
+            ok, msg, detail = _conn.test_connection(ctype, oauth_cfg)
+            if not ok:
+                return resp(400, {"error": f"login berhasil tapi test koneksi gagal: {msg}", "detail": detail})
+            now = now_ms()
+            cid = "conn-" + uuid.uuid4().hex[:16]
+            name = (body.get("name") or "").strip()[:80]
+            if not name:
+                acc = oauth_cfg.get("accountEmail") or cl["username"]
+                name = f"{_conn.TYPE_LABEL.get(ctype, ctype)} \u2014 {acc}"
+            conn_tbl.put_item(Item={
+                "connectorId": cid, "owner": cl["username"], "name": name, "type": ctype,
+                "config": json.dumps(_conn.seal_config(oauth_cfg)), "status": "ok",
+                "lastTestAt": now, "lastTestOk": True, "lastTestMsg": msg[:300],
+                "createdAt": now, "updatedAt": now})
+            return resp(200, {"connectorId": cid, "name": name, "type": ctype, "ok": True,
+                              "message": msg, "detail": detail,
+                              "config": _conn.mask_config(oauth_cfg)})
 
         return resp(404, {"error": f"route {method} {path} tidak ada"})
     except Exception as e:

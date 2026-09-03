@@ -2,10 +2,10 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
-  AtSign, Blocks, Cable, Check, ChevronDown, ClipboardCopy, Cloud, CloudUpload, Cloudy,
+  AtSign, Blocks, Box, Cable, Check, ChevronDown, ClipboardCopy, Cloud, CloudUpload, Cloudy,
   Database, Edit3, Eye, FileText, KeyRound, Loader2, Lock, LogIn, Mail, PencilLine, Plug,
-  Plus, RefreshCw, Save, Search, Server, ShieldCheck, Sparkles, Trash2, UserPlus, UserCog,
-  Users, Webhook, X,
+  Plus, RefreshCw, Save, Search, Server, Settings2, ShieldCheck, Sparkles, Table, Trash2,
+  UserPlus, UserCog, Users, Webhook, X,
 } from 'lucide-react';
 import {
   Sheet, SheetContent, SheetHeader, SheetTitle, SheetDescription,
@@ -18,11 +18,12 @@ import { Switch } from '@/components/ui/switch';
 import {
   adminDeleteUser, adminInviteUser, adminListUsers, adminRenameUser,
   adminResendInvite, adminSetPassword, adminSetUserRole, adminSetUserStatus,
-  createConnector, deleteConnector, deleteKbDoc, fmtBytes, getDocContent, getKbDocContent,
-  getSkillContent, listConnectors, listKbDocs, listSiteDocs, listSkills, presignUpload,
-  relTime, saveDocContent, saveKbDocContent, syncKb, testConnector, updateConnector,
+  createConnector, deleteConnector, deleteKbDoc, exchangeOAuth, fmtBytes, getDocContent,
+  getKbDocContent, getOAuthSettings, getSkillContent, listConnectors, listKbDocs, listSiteDocs,
+  listSkills, presignUpload, relTime, saveDocContent, saveKbDocContent, saveOAuthSettings,
+  startOAuth, syncKb, testConnector, updateConnector,
 } from '@/lib/maa';
-import type { AdminUser, Connector, MaaSkill } from '@/lib/maa';
+import type { AdminUser, Connector, MaaSkill, OAuthSettings } from '@/lib/maa';
 import { DocsContent } from './docs-content';
 import { Markdown } from './markdown';
 
@@ -1368,39 +1369,105 @@ type ConnectorField = {
   half?: boolean;
   hint?: string;
   select?: string[];
+  /** hanya tampil bila form.authMethod === opt (multi-opsi login) */
+  opt?: string;
 };
 
-const CONNECTOR_META: Record<string, { label: string; desc: string; fields: ConnectorField[] }> = {
+type ConnectorAuthMethod = { key: string; label: string; desc?: string };
+
+const CONNECTOR_META: Record<string, {
+  label: string; desc: string; fields: ConnectorField[];
+  authMethods?: ConnectorAuthMethod[];
+  oauthProvider?: 'google' | 'microsoft';
+}> = {
   gdrive: {
     label: 'Google Drive',
-    desc: 'Tempel access token OAuth, ATAU refresh token + client ID/secret (Google Cloud Console, scope drive.readonly).',
+    desc: 'Login popup Google (rekomendasi) atau refresh token manual (Google Cloud Console, scope drive.readonly).',
+    oauthProvider: 'google',
+    authMethods: [
+      { key: 'oauth', label: 'Login Google', desc: 'Popup login akun Google — tanpa token manual' },
+      { key: 'manual', label: 'Token Manual', desc: 'Tempel refresh token / access token sendiri' },
+    ],
     fields: [
-      { key: 'accessToken', label: 'Access Token (opsional bila pakai refresh)', secret: true, area: true },
-      { key: 'refreshToken', label: 'Refresh Token (opsional)', secret: true, area: true },
-      { key: 'clientId', label: 'Client ID (utk refresh)', half: true },
-      { key: 'clientSecret', label: 'Client Secret (utk refresh)', secret: true, half: true },
+      { key: 'accessToken', label: 'Access Token (opsional bila pakai refresh)', secret: true, area: true, opt: 'manual' },
+      { key: 'refreshToken', label: 'Refresh Token (opsional)', secret: true, area: true, opt: 'manual' },
+      { key: 'clientId', label: 'Client ID (utk refresh)', half: true, opt: 'manual' },
+      { key: 'clientSecret', label: 'Client Secret (utk refresh)', secret: true, half: true, opt: 'manual' },
       { key: 'folderId', label: 'Folder ID (opsional — batasi akses ke 1 folder)' },
     ],
   },
   onedrive: {
     label: 'OneDrive',
-    desc: 'Microsoft Graph: access token, ATAU refresh token + client ID/secret (Entra ID, scope Files.Read.All).',
+    desc: 'Login popup Microsoft (rekomendasi, PKCE) atau token manual (Entra ID, scope Files.Read.All).',
+    oauthProvider: 'microsoft',
+    authMethods: [
+      { key: 'oauth', label: 'Login Microsoft', desc: 'Popup login akun Microsoft/Entra — tanpa token manual' },
+      { key: 'manual', label: 'Token Manual', desc: 'Tempel refresh token / access token sendiri' },
+    ],
     fields: [
-      { key: 'accessToken', label: 'Access Token (opsional bila pakai refresh)', secret: true, area: true },
-      { key: 'refreshToken', label: 'Refresh Token (opsional)', secret: true, area: true },
-      { key: 'clientId', label: 'Client ID (utk refresh)', half: true },
-      { key: 'clientSecret', label: 'Client Secret (utk refresh)', secret: true, half: true },
-      { key: 'tenant', label: 'Tenant (opsional, default: common)' },
+      { key: 'accessToken', label: 'Access Token (opsional bila pakai refresh)', secret: true, area: true, opt: 'manual' },
+      { key: 'refreshToken', label: 'Refresh Token (opsional)', secret: true, area: true, opt: 'manual' },
+      { key: 'clientId', label: 'Client ID (utk refresh)', half: true, opt: 'manual' },
+      { key: 'clientSecret', label: 'Client Secret (utk refresh)', secret: true, half: true, opt: 'manual' },
+      { key: 'tenant', label: 'Tenant (opsional, default: common)', opt: 'manual' },
     ],
   },
   adls: {
     label: 'ADLS Gen2',
-    desc: 'Azure Data Lake Storage Gen2: storage account + filesystem, autentikasi SAS token atau account key.',
+    desc: 'Azure Data Lake Storage Gen2: Service Principal (OAuth), SAS token, atau account key.',
+    authMethods: [
+      { key: 'sp', label: 'Service Principal', desc: 'OAuth2 client_credentials Entra ID (rekomendasi)' },
+      { key: 'sas', label: 'SAS Token' },
+      { key: 'key', label: 'Account Key' },
+    ],
     fields: [
       { key: 'storageAccount', label: 'Storage Account', half: true, placeholder: 'mydatalake' },
       { key: 'filesystem', label: 'Filesystem (container)', half: true },
-      { key: 'sasToken', label: 'SAS Token (opsional bila pakai key)', secret: true, area: true },
-      { key: 'accountKey', label: 'Account Key (opsional bila pakas SAS)', secret: true, area: true },
+      { key: 'tenant', label: 'Tenant ID', half: true, opt: 'sp', placeholder: 'xxxxxxxx-xxxx-...' },
+      { key: 'clientId', label: 'Client ID (App registration)', half: true, opt: 'sp' },
+      { key: 'clientSecret', label: 'Client Secret', secret: true, opt: 'sp' },
+      { key: 'sasToken', label: 'SAS Token', secret: true, area: true, opt: 'sas' },
+      { key: 'accountKey', label: 'Account Key', secret: true, area: true, opt: 'key' },
+    ],
+  },
+  gcs: {
+    label: 'Google Cloud Storage',
+    desc: 'GCS: login popup Google (rekomendasi) atau Service Account JSON dari GCP Console.',
+    oauthProvider: 'google',
+    authMethods: [
+      { key: 'oauth', label: 'Login Google', desc: 'Popup login akun Google — akses project/bucket akun Anda' },
+      { key: 'sa', label: 'Service Account', desc: 'JSON key service account (server-to-server)' },
+    ],
+    fields: [
+      { key: 'project', label: 'Project ID (opsional bila isi bucket)', half: true, placeholder: 'my-gcp-project' },
+      { key: 'bucket', label: 'Bucket (opsional)', half: true, placeholder: 'my-bucket' },
+      { key: 'serviceAccountJson', label: 'Service Account JSON', secret: true, area: true, opt: 'sa', placeholder: '{"type": "service_account", ...}' },
+    ],
+  },
+  bigquery: {
+    label: 'Google BigQuery',
+    desc: 'BigQuery: login popup Google (rekomendasi) atau Service Account JSON — baca dataset & tabel.',
+    oauthProvider: 'google',
+    authMethods: [
+      { key: 'oauth', label: 'Login Google', desc: 'Popup login akun Google — akses project akun Anda' },
+      { key: 'sa', label: 'Service Account', desc: 'JSON key service account (server-to-server)' },
+    ],
+    fields: [
+      { key: 'project', label: 'Project ID', half: true, placeholder: 'my-gcp-project' },
+      { key: 'dataset', label: 'Dataset (opsional)', half: true },
+      { key: 'serviceAccountJson', label: 'Service Account JSON', secret: true, area: true, opt: 'sa', placeholder: '{"type": "service_account", ...}' },
+    ],
+  },
+  s3: {
+    label: 'AWS S3',
+    desc: 'S3: IAM user access key (opsional session token utk STS) — browse & baca objek.',
+    authMethods: [{ key: 'keys', label: 'Access Key', desc: 'IAM access key + secret (+ session token)' }],
+    fields: [
+      { key: 'region', label: 'Region', half: true, placeholder: 'us-east-1' },
+      { key: 'bucket', label: 'Bucket (opsional)', half: true, placeholder: 'my-bucket' },
+      { key: 'accessKey', label: 'Access Key ID', placeholder: 'AKIA...' },
+      { key: 'secretAccessKey', label: 'Secret Access Key', secret: true },
+      { key: 'sessionToken', label: 'Session Token (opsional, utk STS)', secret: true, area: true },
     ],
   },
   sftp: {
@@ -1440,6 +1507,9 @@ const TYPE_ICON: Record<string, React.ReactNode> = {
   gdrive: <Cloud className="h-4 w-4" />,
   onedrive: <Cloudy className="h-4 w-4" />,
   adls: <Database className="h-4 w-4" />,
+  gcs: <Box className="h-4 w-4" />,
+  bigquery: <Table className="h-4 w-4" />,
+  s3: <Box className="h-4 w-4" />,
   sftp: <Server className="h-4 w-4" />,
   api: <Webhook className="h-4 w-4" />,
   mcp: <Blocks className="h-4 w-4" />,
@@ -1463,6 +1533,11 @@ export function ConnectorDrawer({
   const [form, setForm] = useState<Record<string, string>>({});
   const [testRes, setTestRes] = useState<{ ok: boolean; message: string; detail: string } | null>(null);
   const [delItem, setDelItem] = useState<Connector | null>(null);
+  const [oauthCfg, setOauthCfg] = useState<OAuthSettings | null>(null);
+  const [oauthMsg, setOauthMsg] = useState<string | null>(null);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [settingsForm, setSettingsForm] = useState<Record<string, string>>({});
+  const [settingsSaving, setSettingsSaving] = useState(false);
 
   const refresh = useCallback(async () => {
     setLoading(true);
@@ -1477,8 +1552,81 @@ export function ConnectorDrawer({
   }, [token, notify]);
 
   useEffect(() => {
-    if (open) refresh();
-  }, [open, refresh]);
+    if (open) {
+      refresh();
+      getOAuthSettings(token).then(setOauthCfg).catch(() => setOauthCfg(null));
+    }
+  }, [open, refresh, token]);
+
+  // dengarkan hasil dari popup OAuth (public/oauth/callback.html)
+  useEffect(() => {
+    const onMsg = async (ev: MessageEvent) => {
+      const d = ev.data as { source?: string; code?: string; state?: string; error?: string };
+      if (!d || d.source !== 'maa-oauth') return;
+      if (d.error) {
+        setOauthMsg(`Login dibatalkan: ${d.error}`);
+        return;
+      }
+      if (d.code && d.state) {
+        setOauthMsg(null);
+        setBusy('oauth');
+        try {
+          const r = await exchangeOAuth(token, { code: d.code, state: d.state, name: name.trim() || undefined });
+          notify(`✓ ${r.name} terhubung — ${r.message}`, true);
+          setFormOpen(false);
+          resetForm();
+          refresh();
+        } catch (e) {
+          setOauthMsg(`Gagal menukar kode OAuth: ${(e as Error).message}`);
+        } finally {
+          setBusy('');
+        }
+      }
+    };
+    window.addEventListener('message', onMsg);
+    return () => window.removeEventListener('message', onMsg);
+  }, [token, notify, name, refresh]);
+
+  const authMethod = form.authMethod || CONNECTOR_META[ctype]?.authMethods?.[0]?.key || '';
+
+  const doOAuthLogin = async () => {
+    setOauthMsg(null);
+    setBusy('oauth-start');
+    try {
+      const r = await startOAuth(token, ctype);
+      window.open(r.url, 'maa-oauth', 'width=520,height=680,menubar=no,toolbar=no');
+    } catch (e) {
+      setOauthMsg((e as Error).message);
+    } finally {
+      setBusy('');
+    }
+  };
+
+  const doSaveSettings = async () => {
+    setSettingsSaving(true);
+    try {
+      const payload: Record<string, { clientId?: string; clientSecret?: string; tenant?: string }> = {};
+      if (settingsForm.gClientId || settingsForm.gClientSecret) {
+        payload.google = {};
+        if (settingsForm.gClientId) payload.google.clientId = settingsForm.gClientId;
+        if (settingsForm.gClientSecret) payload.google.clientSecret = settingsForm.gClientSecret;
+      }
+      if (settingsForm.mClientId || settingsForm.mClientSecret || settingsForm.mTenant) {
+        payload.microsoft = {};
+        if (settingsForm.mClientId) payload.microsoft.clientId = settingsForm.mClientId;
+        if (settingsForm.mClientSecret) payload.microsoft.clientSecret = settingsForm.mClientSecret;
+        if (settingsForm.mTenant) payload.microsoft.tenant = settingsForm.mTenant;
+      }
+      await saveOAuthSettings(token, payload);
+      notify('Pengaturan OAuth app tersimpan', true);
+      getOAuthSettings(token).then(setOauthCfg).catch(() => {});
+      setSettingsForm({});
+    } catch (e) {
+      notify(`Gagal simpan pengaturan: ${(e as Error).message}`);
+    } finally {
+      setSettingsSaving(false);
+    }
+  };
 
   const resetForm = () => {
     setEditId(null);
@@ -1486,18 +1634,27 @@ export function ConnectorDrawer({
     setName('');
     setForm({});
     setTestRes(null);
+    setOauthMsg(null);
   };
 
   const startEdit = (c: Connector) => {
     setEditId(c.connectorId);
     setCtype(c.type);
     setName(c.name);
-    setForm(Object.fromEntries(Object.entries(c.config || {}).map(([k, v]) => [k, String(v ?? '')])));
+    const cfg = Object.fromEntries(Object.entries(c.config || {}).map(([k, v]) => [k, String(v ?? '')]));
+    cfg.authMethod = cfg.authMethod || CONNECTOR_META[c.type]?.authMethods?.[0]?.key || '';
+    setForm(cfg);
     setTestRes(null);
+    setOauthMsg(null);
     setFormOpen(true);
   };
 
-  const collectConfig = () => Object.fromEntries(Object.entries(form).filter(([, v]) => v !== ''));
+  const collectConfig = () =>
+    Object.fromEntries(
+      Object.entries(form)
+        .filter(([k, v]) => v !== '' && k !== 'authMethod')
+        .map(([k, v]) => [k, v]),
+    );
 
   const doTest = async () => {
     setTestRes(null);
@@ -1523,9 +1680,23 @@ export function ConnectorDrawer({
     }
     setBusy('save');
     try {
+      let savedId = editId;
       if (editId) await updateConnector(token, editId, { name, config: collectConfig() });
-      else await createConnector(token, name, ctype, collectConfig());
-      notify(editId ? 'Konektor diperbarui' : 'Konektor ditambahkan', true);
+      else {
+        const created = await createConnector(token, name, ctype, collectConfig());
+        savedId = created.connectorId;
+      }
+      // auto test setelah simpan (dengan config final yg tersimpan)
+      if (savedId) {
+        try {
+          const tr = await testConnector(token, savedId);
+          notify(tr.ok ? `✓ ${name} — ${tr.message}` : `✗ Test: ${tr.message}`, tr.ok);
+        } catch {
+          /* test gagal jangan gagalkan simpan */
+        }
+      } else {
+        notify(editId ? 'Konektor diperbarui' : 'Konektor ditambahkan', true);
+      }
       setFormOpen(false);
       resetForm();
       refresh();
@@ -1559,8 +1730,9 @@ export function ConnectorDrawer({
             <Cable className="h-4 w-4" style={{ color: 'var(--accent)' }} /> Konektor Data
           </SheetTitle>
           <SheetDescription className="text-[11.5px] text-[var(--muted-fg)]">
-            Hubungkan sumber data eksternal (Google Drive, OneDrive, ADLS Gen2, SFTP, API, MCP) —
-            agent bisa menggunakannya di chat. Selalu uji koneksi setelah menyimpan.
+            Hubungkan sumber data eksternal (Google Drive, OneDrive, ADLS Gen2, GCS, BigQuery, S3,
+            SFTP, API, MCP) — agent bisa menggunakannya di chat. Login popup OAuth tersedia;
+            selalu uji koneksi setelah menyimpan.
           </SheetDescription>
         </SheetHeader>
 
@@ -1612,6 +1784,65 @@ export function ConnectorDrawer({
                 {meta.desc}
               </p>
 
+              {/* pilih opsi login (bila tipe punya >1 metode auth) */}
+              {meta.authMethods && meta.authMethods.length > 1 && (
+                <div className="mb-3">
+                  <label className="mb-1.5 block text-[11px] font-semibold text-[var(--muted-fg)]">Opsi Login</label>
+                  <div className="grid grid-cols-2 gap-1.5">
+                    {meta.authMethods.map((m) => (
+                      <button
+                        key={m.key}
+                        type="button"
+                        title={m.desc}
+                        onClick={() => setForm((s) => ({ ...s, authMethod: m.key }))}
+                        className={`flex items-center gap-1.5 rounded-[10px] border px-2.5 py-2 text-left text-[11px] font-medium transition-colors ${
+                          authMethod === m.key
+                            ? 'border-[var(--accent)] bg-[var(--accent-soft)] text-[var(--ink)]'
+                            : 'border-[var(--line-soft)] text-[var(--muted-fg)] hover:border-[var(--line)]'
+                        }`}
+                      >
+                        {m.key === 'oauth' && meta.oauthProvider === 'google' && <LogIn className="h-3.5 w-3.5 shrink-0" />}
+                        {m.key === 'oauth' && meta.oauthProvider === 'microsoft' && <LogIn className="h-3.5 w-3.5 shrink-0" />}
+                        {m.key === 'oauth' && !meta.oauthProvider && <KeyRound className="h-3.5 w-3.5 shrink-0" />}
+                        {m.key !== 'oauth' && <KeyRound className="h-3.5 w-3.5 shrink-0" />}
+                        {m.label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {/* tombol login popup OAuth (rekomendasi) */}
+              {meta.oauthProvider && authMethod === 'oauth' && (
+                <div className="mb-3 rounded-[12px] border border-[var(--line)] bg-[var(--bg)] p-3">
+                  <button
+                    type="button"
+                    onClick={doOAuthLogin}
+                    disabled={busy !== ''}
+                    className="maa-btn-primary flex h-9 w-full items-center justify-center gap-2 text-[12.5px] disabled:opacity-50"
+                  >
+                    {busy.startsWith('oauth') ? <Loader2 className="h-4 w-4 animate-spin" /> : <LogIn className="h-4 w-4" />}
+                    {meta.oauthProvider === 'google' ? 'Masuk dengan Google' : 'Masuk dengan Microsoft'}
+                  </button>
+                  <p className="mt-2 text-[10px] leading-relaxed text-[var(--muted-fg)]">
+                    Popup consent penyedia akan terbuka; setelah setuju, koneksi otomatis dibuat + diuji.
+                    Token disimpan terenkripsi KMS — tidak pernah tampil di UI.
+                  </p>
+                  {oauthCfg && !oauthCfg[meta.oauthProvider]?.configured && (
+                    <p className="mt-1.5 text-[10px] leading-relaxed text-[var(--danger)]">
+                      OAuth app {meta.oauthProvider} belum dikonfigurasi — isi Client ID/Secret di
+                      “Pengaturan OAuth App” di bawah.
+                    </p>
+                  )}
+                </div>
+              )}
+
+              {oauthMsg && (
+                <p className="mb-3 rounded-lg border border-[var(--danger)]/40 bg-[var(--danger)]/10 px-2.5 py-1.5 text-[10.5px] text-[var(--ink)]">
+                  {oauthMsg}
+                </p>
+              )}
+
               <label className="mb-1.5 block text-[11px] font-semibold text-[var(--muted-fg)]">Nama Konektor</label>
               <input
                 value={name}
@@ -1621,7 +1852,9 @@ export function ConnectorDrawer({
               />
 
               <div className="mb-3 grid grid-cols-2 gap-2">
-                {meta.fields.map((f) => (
+                {meta.fields
+                  .filter((f) => !f.opt || f.opt === authMethod)
+                  .map((f) => (
                   <div key={f.key} className={f.area || f.select ? 'col-span-2' : f.half ? 'col-span-1' : 'col-span-2'}>
                     <label className="mb-1 block text-[11px] font-semibold text-[var(--muted-fg)]">{f.label}</label>
                     {f.select ? (
@@ -1706,7 +1939,8 @@ export function ConnectorDrawer({
               <Cable className="mx-auto mb-2 h-6 w-6 text-[var(--muted-fg)]" />
               <p className="text-[12.5px] font-semibold text-[var(--ink)]">Belum ada konektor</p>
               <p className="mt-1 text-[11px] text-[var(--muted-fg)]">
-                Hubungkan Google Drive, OneDrive, ADLS Gen2, SFTP, API manual, atau MCP server.
+                Hubungkan Google Drive, OneDrive, ADLS Gen2, GCS, BigQuery, S3, SFTP, API manual,
+                atau MCP server.
               </p>
             </div>
           ) : (
@@ -1791,6 +2025,109 @@ export function ConnectorDrawer({
               })}
             </div>
           )}
+
+          {/* ---------------- pengaturan OAuth app (superadmin) ---------------- */}
+          <div className="mt-4 border-t border-[var(--line)] pt-4">
+            <button
+              type="button"
+              onClick={() => setSettingsOpen((v) => !v)}
+              className="flex w-full items-center justify-between text-left"
+            >
+              <span className="flex items-center gap-2 text-[12px] font-bold text-[var(--ink)]">
+                <Settings2 className="h-4 w-4" style={{ color: 'var(--accent)' }} /> Pengaturan OAuth App
+                <span className="rounded-full bg-[var(--muted-bg)] px-1.5 py-px font-mono text-[9px] text-[var(--muted-fg)]">admin</span>
+              </span>
+              <ChevronDown className={`h-4 w-4 text-[var(--muted-fg)] transition-transform ${settingsOpen ? 'rotate-180' : ''}`} />
+            </button>
+            <p className="mt-1 text-[10.5px] leading-relaxed text-[var(--muted-fg)]">
+              Client ID/Secret untuk login popup Google &amp; Microsoft (sekali untuk semua user).
+              Secret disimpan terenkripsi KMS.
+            </p>
+            {settingsOpen && (
+              <div className="mt-2 rounded-[12px] border border-[var(--line)] bg-[var(--surface)] p-3">
+                <div className="grid grid-cols-2 gap-2">
+                  <div>
+                    <label className="mb-1 block text-[10.5px] font-semibold text-[var(--muted-fg)]">
+                      Google Client ID {oauthCfg?.google?.configured ? '✓' : ''}
+                    </label>
+                    <input
+                      value={settingsForm.gClientId ?? oauthCfg?.google?.clientId ?? ''}
+                      onChange={(e) => setSettingsForm((s) => ({ ...s, gClientId: e.target.value }))}
+                      placeholder="xxxx.apps.googleusercontent.com"
+                      className="w-full rounded-lg border border-[var(--line)] bg-[var(--bg)] px-2.5 py-1.5 font-mono text-[11px] text-[var(--ink)] outline-none focus:border-[var(--accent)]"
+                    />
+                  </div>
+                  <div>
+                    <label className="mb-1 block text-[10.5px] font-semibold text-[var(--muted-fg)]">Google Client Secret</label>
+                    <input
+                      type="password"
+                      value={settingsForm.gClientSecret ?? ''}
+                      onChange={(e) => setSettingsForm((s) => ({ ...s, gClientSecret: e.target.value }))}
+                      placeholder={oauthCfg?.google?.configured ? '••• (tidak diubah)' : 'GOCSPX-...'}
+                      className="w-full rounded-lg border border-[var(--line)] bg-[var(--bg)] px-2.5 py-1.5 font-mono text-[11px] text-[var(--ink)] outline-none focus:border-[var(--accent)]"
+                    />
+                  </div>
+                  <div>
+                    <label className="mb-1 block text-[10.5px] font-semibold text-[var(--muted-fg)]">
+                      Microsoft Client ID {oauthCfg?.microsoft?.configured ? '✓' : ''}
+                    </label>
+                    <input
+                      value={settingsForm.mClientId ?? oauthCfg?.microsoft?.clientId ?? ''}
+                      onChange={(e) => setSettingsForm((s) => ({ ...s, mClientId: e.target.value }))}
+                      placeholder="App registration ID"
+                      className="w-full rounded-lg border border-[var(--line)] bg-[var(--bg)] px-2.5 py-1.5 font-mono text-[11px] text-[var(--ink)] outline-none focus:border-[var(--accent)]"
+                    />
+                  </div>
+                  <div>
+                    <label className="mb-1 block text-[10.5px] font-semibold text-[var(--muted-fg)]">Microsoft Client Secret</label>
+                    <input
+                      type="password"
+                      value={settingsForm.mClientSecret ?? ''}
+                      onChange={(e) => setSettingsForm((s) => ({ ...s, mClientSecret: e.target.value }))}
+                      placeholder={oauthCfg?.microsoft?.configured ? '••• (tidak diubah)' : ''}
+                      className="w-full rounded-lg border border-[var(--line)] bg-[var(--bg)] px-2.5 py-1.5 font-mono text-[11px] text-[var(--ink)] outline-none focus:border-[var(--accent)]"
+                    />
+                  </div>
+                  <div className="col-span-2">
+                    <label className="mb-1 block text-[10.5px] font-semibold text-[var(--muted-fg)]">Microsoft Tenant (opsional)</label>
+                    <input
+                      value={settingsForm.mTenant ?? ''}
+                      onChange={(e) => setSettingsForm((s) => ({ ...s, mTenant: e.target.value }))}
+                      placeholder="common / organizational / tenant-id"
+                      className="w-full rounded-lg border border-[var(--line)] bg-[var(--bg)] px-2.5 py-1.5 font-mono text-[11px] text-[var(--ink)] outline-none focus:border-[var(--accent)]"
+                    />
+                  </div>
+                </div>
+                <div className="mt-2 flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={doSaveSettings}
+                    disabled={settingsSaving}
+                    className="maa-btn-primary flex h-8 items-center gap-1.5 px-3 text-[11.5px] disabled:opacity-50"
+                  >
+                    {settingsSaving ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Save className="h-3.5 w-3.5" />}
+                    Simpan
+                  </button>
+                  {oauthCfg?.redirectUri && (
+                    <button
+                      type="button"
+                      title="Klik untuk salin"
+                      onClick={() => navigator.clipboard?.writeText(oauthCfg.redirectUri)}
+                      className="flex min-w-0 items-center gap-1 rounded-lg border border-[var(--line-soft)] px-2 py-1.5 text-[10px] text-[var(--muted-fg)] hover:text-[var(--ink)]"
+                    >
+                      <ClipboardCopy className="h-3 w-3 shrink-0" />
+                      <span className="truncate font-mono">Redirect URI: {oauthCfg.redirectUri}</span>
+                    </button>
+                  )}
+                </div>
+                <p className="mt-2 text-[10px] leading-relaxed text-[var(--muted-fg)]">
+                  Setup: di Google Cloud Console buat OAuth Client (Web application) + tambahkan redirect URI di atas;
+                  di Entra ID buat App registration (Web) + redirect URI, aktifkan ID token tidak wajib.
+                  Scope dipakai read-only (least privilege).
+                </p>
+              </div>
+            )}
+          </div>
         </div>
       </SheetContent>
     </Sheet>

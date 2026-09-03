@@ -3,7 +3,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Activity, Boxes, ChevronDown, Clapperboard, Globe, History, LogOut, Menu, MessageSquarePlus,
-  PanelRightClose, PanelRightOpen, RefreshCcw, ShieldCheck, TerminalSquare, Users, X,
+  PanelLeftClose, PanelLeftOpen, PanelRightClose, PanelRightOpen, RefreshCcw, ShieldCheck,
+  TerminalSquare, Users, X,
 } from 'lucide-react';
 import {
   DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuLabel,
@@ -128,6 +129,7 @@ export function ChatApp({
   const [sidebarOpen, setSidebarOpen] = useState(false); // sheet mobile
   const [traceSheetOpen, setTraceSheetOpen] = useState(false); // sheet mobile
   const [traceRailOpen, setTraceRailOpen] = useState(true); // rail desktop
+  const [navRailOpen, setNavRailOpen] = useState(true); // sidebar desktop (bisa disembunyikan)
   const [kbOpen, setKbOpen] = useState(false);
   const [skillsOpen, setSkillsOpen] = useState(false);
   const [connectorsOpen, setConnectorsOpen] = useState(false);
@@ -601,6 +603,17 @@ export function ChatApp({
           <Menu className="h-5 w-5" />
         </button>
 
+        {/* toggle sidebar desktop — sembunyikan/tampilkan seperti Live Trace */}
+        <button
+          type="button"
+          onClick={() => setNavRailOpen((v) => !v)}
+          aria-label={navRailOpen ? 'Sembunyikan menu samping' : 'Tampilkan menu samping'}
+          title="Menu samping"
+          className="maa-btn-ghost hidden h-9 w-9 items-center justify-center lg:flex"
+        >
+          {navRailOpen ? <PanelLeftClose className="h-4.5 w-4.5" /> : <PanelLeftOpen className="h-4.5 w-4.5" />}
+        </button>
+
         <span className="hidden sm:block"><LogoWordmark size={22} /></span>
         <span className="sm:hidden"><Logo size={22} /></span>
 
@@ -713,10 +726,12 @@ export function ChatApp({
 
       {/* ================= BODY 3 KOLOM ================= */}
       <div className="flex min-h-0 flex-1">
-        {/* sidebar desktop */}
-        <aside className="hidden w-[264px] shrink-0 border-r border-[var(--line)] lg:block">
-          {sidebarNode}
-        </aside>
+        {/* sidebar desktop (bisa disembunyikan via toggle di header) */}
+        {navRailOpen && (
+          <aside className="hidden w-[264px] shrink-0 border-r border-[var(--line)] lg:block">
+            {sidebarNode}
+          </aside>
+        )}
 
         {/* chat area */}
         <main className="flex min-w-0 flex-1 flex-col">

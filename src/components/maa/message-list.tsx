@@ -193,7 +193,8 @@ function ImageCards({ atts }: { atts?: MessageAtt[] }) {
               alt={a.name || 'Gambar hasil agent'}
               loading="lazy"
               onError={() => setFailed((f) => ({ ...f, [i]: true }))}
-              className="max-h-[420px] max-w-full rounded-[10px] border border-[var(--line)] object-contain"
+              // min-w mencegah collapse 0x0 utk SVG tanpa intrinsic size (viewBox saja)
+              className="min-w-[160px] max-h-[420px] max-w-full rounded-[10px] border border-[var(--line)] object-contain"
             />
           </a>
         ),

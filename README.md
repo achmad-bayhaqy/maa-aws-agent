@@ -10,6 +10,7 @@
 - [Ringkasan](#-ringkasan)
 - [Akses Demo](#-akses-demo)
 - [Tampilan Aplikasi](#-tampilan-aplikasi)
+- [Yang Baru di v3.6.1](#-yang-baru-di-v361)
 - [Yang Baru di v3.6](#-yang-baru-di-v36)
 - [Yang Baru di v3.5](#-yang-baru-di-v35)
 - [Yang Baru di v3.4.3](#-yang-baru-di-v343)
@@ -36,6 +37,54 @@ seluruh trajektori agen secara real-time.
 | ![Chat EC2](screenshots/chat-ec2.png) | ![Konfirmasi destruktif](screenshots/konfirmasi-destruktif.png) |
 | **Live Trace di mobile** — setiap event tool terlihat | |
 | ![Live Trace mobile](screenshots/livetrace-mobile.png) | |
+
+## 🔗 Yang Baru di v3.6.1
+
+**OAuth popup login konektor + 3 tipe baru (GCS/BigQuery/S3) + akar bug gambar ditemukan & diperbaiki + sidebar bisa disembunyikan.**
+
+### Login Popup OAuth (Google & Microsoft) — ala Claude AI
+
+- Tombol **"Masuk dengan Google" / "Masuk dengan Microsoft"** di form konektor → popup consent penyedia → setelah setuju, koneksi otomatis dibuat + **test koneksi otomatis** (user tidak perlu menempel token sama sekali)
+- **Best practice 2026 yang diterapkan**: Google `access_type=offline&prompt=consent` (refresh token dijamin), Microsoft **PKCE S256** (auth code flow SPA), state OAuth **bertanda tangan HMAC** (anti-CSRF, TTL 10 menit), scope **read-only least-privilege** per tipe (`drive.readonly` / `devstorage.read_only` / `bigquery.readonly` / `Files.Read.All`)
+- **Pengaturan OAuth App** (admin, di drawer Konektor): sekali isi Client ID/Secret untuk semua user; secret disimpan **terenkripsi KMS**, Redirect URI ditampilkan untuk disalin ke Google Cloud Console / Entra ID
+- Setup Google: OAuth Client (Web application) di Cloud Console + tambahkan Redirect URI. Setup Microsoft: App registration (Web) di Entra + Redirect URI
+
+### Konektor Baru + Multi-Opsi Login (9 tipe total)
+
+| Tipe | Opsi Login | Test Koneksi |
+|------|-----------|--------------|
+| **Google Drive** | Login popup Google · token manual | Profil Drive + akses folder |
+| **OneDrive** | Login popup Microsoft (PKCE) · token manual | Profil Graph + root drive |
+| **GCS** 🆕 | Login popup Google · **Service Account JSON** (JWT RS256 stdlib murni) | Metadata bucket / daftar bucket project |
+| **BigQuery** 🆕 | Login popup Google · Service Account JSON | Daftar dataset/tabel (tabledata.list utk baca) |
+| **S3** 🆕 | IAM access key + secret (+ session token STS) | head_bucket + list objek |
+| **ADLS Gen2** | **Service Principal OAuth2** 🆕 · SAS token · SharedKey | Metadata filesystem |
+| **SFTP / REST API / MCP** | password / private key · headers auth · headers | (seperti v3.6) |
+
+- Setiap konektor kini punya pemilih **"Opsi Login"** — field form menyesuaikan metode yang dipilih
+- Secret (refresh token, client secret, private key, account key, service account JSON) **dienkripsi envelope KMS** sebelum masuk DynamoDB (`enc:v1:...`), tidak pernah dikirim balik ke UI
+- Test koneksi otomatis juga berjalan **setelah simpan** — status dot hijau/merah langsung akurat
+- API baru: `GET/POST /connectors/oauth/settings`, `GET /connectors/oauth/start`, `POST /connectors/oauth/exchange`
+
+### Akar Bug "Gambar Tidak Muncul di Chat" Ditemukan (bukan Access Denied!)
+
+Investigasi 2026-09-03 (screenshot user + replikasi headless browser) menunjukkan:
+1. S3 publik **200 OK** ✓, attachment `type:image` sampai ke frontend ✓, kode render sudah benar ✓ — tetapi gambar tetap "hilang"
+2. **Akar sesungguhnya**: gambar dari engine SVG-art adalah SVG yang hanya punya `viewBox` **tanpa `width`/`height`** → tanpa intrinsic size, Chrome menghitung layout `<img>` dengan `max-width/max-height` menjadi **0×0 px** — hanya border 1px yang tampak (titik kecil seperti di screenshot)
+3. **Perbaikan dua sisi**: runtime menyuntikkan `width/height` dari viewBox saat menyimpan SVG baru (`_svg_inject_size`), dan frontend menambah `min-w-[160px]` pada `<img>` agar SVG lama (sudah di S3) ikut tampil
+4. Verifikasi: sesi lama yang tadinya kosong kini menampilkan gambar robot (replikasi browser: `clientWidth 0 → 158px`)
+
+### Sidebar Bisa Disembunyikan
+
+Toggle **panel kiri di header** (ikon panel, seperti Live Trace) — chat melebar penuh saat sidebar disembunyikan.
+
+### Verifikasi v3.6.1
+
+- E2E v4.0: **13/13 PASS** (login+TOTP, generate image, URL publik 200, KB CRUD, scraping INTERNET, files/view, user mgmt, skill, scheduler)
+- Smoke OAuth konektor: settings roundtrip (KMS) → authorize URL (offline+consent+state) → penolakan state palsu → cleanup: **ALL OK**
+- Test konektor S3 nyata via UI (kredensial STS): "AWS S3 terhubung — bucket dapat diakses (HTTP 200)"
+- Browser E2E: gambar tampil di chat, sidebar hide/show, 9 tipe konektor, opsi login, OAuth needsSetup message
+- Deploy: `python3 aws/deploy_v361.py` (IAM kms:Encrypt + edge + API GW OAuth routes) → `python3 aws/deploy_runtime_connectors.py` (runtime in-place) → `python3 aws/deploy_amplify.py` (frontend)
 
 ## 🔗 Yang Baru di v3.6
 

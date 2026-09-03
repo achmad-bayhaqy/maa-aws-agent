@@ -392,7 +392,8 @@ export const signOutAll = (token: string) => apiFetch<{ signedOut: boolean }>("P
 
 // ---------------- konektor (data source ala Claude AI) ----------------
 
-export type ConnectorType = "gdrive" | "onedrive" | "adls" | "sftp" | "api" | "mcp";
+export type ConnectorType =
+  | "gdrive" | "onedrive" | "adls" | "gcs" | "bigquery" | "s3" | "sftp" | "api" | "mcp";
 
 export type Connector = {
   connectorId: string;
@@ -424,12 +425,43 @@ export const updateConnector = (
 export const deleteConnector = (token: string, connectorId: string) =>
   apiFetch<{ deleted: string }>("DELETE", "/connectors", token, undefined, { id: connectorId });
 
-/** Test koneksi — connectorId opsional (form baru); nilai "•••" dipakai dari tersimpan. */
+/** Test koneksi — connectorId utk konektor tersimpan; tanpa connectorId,
+ *  config = { type, config } (form baru) -> dikirim top-level sesuai kontrak edge. */
 export const testConnector = (
   token: string, connectorId?: string, config?: Record<string, unknown>,
+) => {
+  const body = connectorId
+    ? { connectorId, ...(config ? { config } : {}) }
+    : {
+        type: (config as { type?: string } | undefined)?.type ?? "",
+        config: (config as { config?: Record<string, unknown> } | undefined)?.config ?? {},
+      };
+  return apiFetch<ConnectorTestResult>("POST", "/connectors/test", token, body);
+};
+
+// ---------------- konektor OAuth popup (Google / Microsoft) ----------------
+
+export type OAuthSettings = {
+  redirectUri: string;
+  google: { configured: boolean; clientId: string };
+  microsoft: { configured: boolean; clientId: string };
+};
+
+export const getOAuthSettings = (token: string) =>
+  apiFetch<OAuthSettings>("GET", "/connectors/oauth/settings", token);
+
+export const saveOAuthSettings = (
+  token: string, payload: { google?: { clientId?: string; clientSecret?: string }; microsoft?: { clientId?: string; clientSecret?: string; tenant?: string } },
+) => apiFetch<{ saved: boolean }>("POST", "/connectors/oauth/settings", token, payload);
+
+export const startOAuth = (token: string, type: ConnectorType | string) =>
+  apiFetch<{ url: string; provider: string; redirectUri: string }>("GET", "/connectors/oauth/start", token, undefined, { type });
+
+export const exchangeOAuth = (
+  token: string, payload: { code: string; state: string; name?: string },
 ) =>
-  apiFetch<ConnectorTestResult>("POST", "/connectors/test", token,
-    { connectorId, ...(config ? { config } : {}) });
+  apiFetch<{ connectorId: string; name: string; type: string; ok: boolean; message: string; detail: string }>(
+    "POST", "/connectors/oauth/exchange", token, payload);
 
 // ---------------- storage ----------------
 const KEY = "maa.session";
