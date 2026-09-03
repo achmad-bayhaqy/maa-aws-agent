@@ -51,6 +51,17 @@ KB_SKILLS_PREFIX = "skills/"
 
 FAST_MODEL = "amazon.nova-micro-v1:0"
 DEEP_MODEL = "openai.gpt-oss-120b-1:0"
+# v3.6.2: mesin gambar vektor premium (fallback Nova Canvas karena legacy/EOL).
+# Model diurutkan dari kualitas SVG terbaik (hasil benchmark 2026-09-03:
+# qwen3-32b 7.7KB/83 elem/7 grad vs gpt-oss 4.9KB/50 vs maverick 2.6KB/33).
+# Anthropic (Claude) TIDAK bisa dipakai: geo-block akun ini ("unsupported
+# countries", juga lewat profil us./global.) - diselidiki terpisah.
+ART_MODEL_CHAIN = [
+    "qwen.qwen3-32b-v1:0",
+    "openai.gpt-oss-120b-1:0",
+    "us.meta.llama4-maverick-17b-instruct-v1:0",
+]
+ART_MAX_TOKENS = {"anthropic": 16000, "default": 9000}
 VISION_MODEL = "amazon.nova-lite-v1:0"   # fallback utk lampiran gambar
 # pola modelId yang TIDAK mendukung input gambar (text-only)
 TEXT_ONLY_PAT = ("micro", "gpt-oss", "deepseek", "qwen3-coder", "qwen2.5-coder",
@@ -631,6 +642,118 @@ def _svg_inject_size(svg_txt):
         return re.sub(r"<svg", f'<svg width="{w}" height="{h}"', svg_txt, count=1, flags=re.I)
     except Exception:
         return svg_txt
+
+
+def _svg_quality(svg_txt):
+    """Skor kualitas SVG vektor (v3.6.2): mencegah hasil 'jelek/miskin detail'.
+
+    Kembalikan (bytes, n_elemen, n_gradien). Ambang kelayakan:
+    >= 6000 bytes, >= 25 elemen bentuk, >= 2 gradien. SVG Monas lama hanya
+    ~2KB/8 elemen -> itulah yang user komplain 'sangat jelek'.
+    """
+    if not svg_txt:
+        return 0, 0, 0
+    body = svg_txt
+    n_el = len(re.findall(r"<(path|rect|circle|ellipse|polygon|polyline|line|text|g|use|filter|clipPath)\b", body, re.I))
+    n_grad = len(re.findall(r"<(linearGradient|radialGradient|pattern|filter)\b", body, re.I))
+    return len(body.encode("utf-8")), n_el, n_grad
+
+
+def _svg_ok(svg_txt):
+    b, el, gr = _svg_quality(svg_txt)
+    return b >= 6000 and el >= 25 and gr >= 2
+
+
+def _svg_art_prompt(prompt, w, h, escalate=False, extra_tip=""):
+    """Art-direction prompt vektor premium (v3.6.2).
+
+    Struktur berlapis + arahan cahaya/bayangan/palet + ambang detail.
+    escalate=True dipakai saat percobaan sebelumnya dinilai kurang bagus.
+    extra_tip = saran perbaikan dari model vision (umpan balik render).
+    """
+    p = (prompt or "")[:600]
+    rubric = (
+        "Anda ilustrator vektor premium (kualitas artwork Dribbble/Behance). "
+        "Buat SATU gambar vektor SVG untuk prompt berikut.\n"
+        f"PROMPT: {p}\n\n"
+        "WAJIB - KOMPOSISI (jangan lewati satu pun):\n"
+        "1. Subjek utama SESUAI PROMPT, dominan dan jelas: tinggi/lebarnya "
+        "minimal 1/3 kanvas, diposisikan di tengah-komposisi, dibangun dari "
+        "BANYAK bentuk yang anatomis/proporsional (bukan satu bentuk besar).\n"
+        "2. LATAR: gradasi multi-stop (min. 3 <stop>), bukan warna flat.\n"
+        "3. MIDGROUND: lingkungan pendukung di belakang subjek, skala lebih kecil.\n"
+        "4. FOREGROUND: 10+ elemen kecil pendukung (jendela, daun, burung, kilau, "
+        "tekstur, lampu) - semuanya BENAR ukuran & posisinya, tidak menghalangi subjek.\n"
+        "5. CAHAYA: highlight di sisi sumber cahaya, bayangan di sisi berlawanan, "
+        "shadow lembut di bawah subjek.\n"
+        "6. PALET: 4-6 warna harmonis; SEMUA bidang besar pakai gradien.\n\n"
+        "ATURAN TEKNIS:\n"
+        f"7. Mulai dengan <svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 {w} {h}\">. "
+        f"Dimensi diminta: {w}x{h}.\n"
+        "8. Keluarkan HANYA kode SVG (tanpa penjelasan, tanpa markdown).\n"
+        "9. Minimal: 6 gradien, 35+ elemen bentuk, opacity untuk kedalaman.\n"
+        "10. Tanpa <image href>, tanpa font kustom, tanpa teks panjang (maks 2-3 kata).\n"
+        "11. Target ukuran kode 8-25 KB.\n"
+        "12. HINDARI: bentuk acak tidak berhubungan, elemen raksasa menutupi "
+        "kanvas, bidang hitam/datarius besar, komposisi miring.\n")
+    if escalate:
+        rubric += ("\nPERINGATAN: percobaan sebelumnya DITOLAK penilainya. "
+                   "Perbaiki sesuai saran di bawah dan lipatgandakan kerapian.\n")
+    if extra_tip:
+        rubric += f"\nSARAN PERBAIKAN DARI PENILAI GAMBAR (WAJIB DITAATI): {extra_tip}\n"
+    return rubric
+
+
+def _svg_render_png(svg_txt, width=512):
+    """Render SVG -> PNG bytes via resvg_py (wheel abi3 self-contained).
+
+    Dipakai untuk penilaian vision. Bila resvg tidak tersedia/render gagal,
+    kembalikan None - loop kualitas degradasi aman ke ambang bytes/elemen.
+    """
+    try:
+        import resvg_py  # vendored di pkg runtime
+        out = resvg_py.svg_to_bytes(svg_string=svg_txt, width=int(width))
+        return bytes(out)
+    except Exception:
+        return None
+
+
+def _svg_vision_score(png_bytes, prompt):
+    """Penilaian visual via VISION_MODEL (nova-lite). Kembalikan (skor, tip).
+
+    skor float 1-10 (0.0 bila gagal dinilai); tip = saran perbaikan singkat
+    yang disisipkan ke prompt percobaan berikutnya (self-critique loop).
+    """
+    try:
+        vprompt = (
+            "Anda juri kontes ilustrasi. Prompt gambar yang diminta: "
+            f"\"{(prompt or '')[:220]}\".\n"
+            "Nilai gambar vektor ini dengan kriteria: (1) subjek utama sesuai "
+            "prompt dan dominan (min 1/3 kanvas); (2) komposisi koheren & rapi - "
+            "bukan bentuk acak, tumpang tindih aneh, atau bidang kosong raksasa; "
+            "(3) warna & cahaya enak dilihat.\n"
+            "Jawab HANYA JSON tunggal tanpa teks lain: "
+            "{\"skor\": <angka 1-10>, \"masalah\": \"<maks 15 kata>\", "
+            "\"saran\": \"<perbaikan konkret maks 25 kata>\"}")
+        sr = get_client("bedrock-runtime").converse(
+            modelId=VISION_MODEL,
+            messages=[{"role": "user", "content": [
+                {"text": vprompt},
+                # PENTING: kirim bytes MENTAH - boto3 yang base64-encode sendiri.
+                # String base64 dikira Nova text/plain -> ValidationException.
+                {"image": {"format": "png", "source": {"bytes": png_bytes}}},
+            ]}],
+            inferenceConfig={"maxTokens": 300, "temperature": 0.2})
+        txt = "".join(c.get("text", "") for c in sr["output"]["message"]["content"] if "text" in c)
+        mjson = re.search(r"\{[\s\S]*\}", txt)
+        if not mjson:
+            return 0.0, ""
+        d = json.loads(mjson.group(0))
+        skor = float(d.get("skor", 0) or 0)
+        tip = f"{str(d.get('masalah', ''))[:120]} | saran: {str(d.get('saran', ''))[:160]}".strip(" |")
+        return max(0.0, min(10.0, skor)), tip[:280]
+    except Exception:
+        return 0.0, ""
 
 
 def _todos_save(sid, todos):
@@ -1217,43 +1340,76 @@ def exec_tool(name, args, sid=None, attachments=None, user_id=None, username=Non
                 last = str(e)
                 continue
         if not img:
-            # ---- Fallback v4.0: AI SVG-art (selalu tersedia) ----
-            # Model T2I tidak aktif di akun ini? Agent menggambar sendiri via LLM:
-            # SVG vektor (gradien, bentuk, komposisi) yang tampil bagus di browser.
+            # ---- Fallback v3.6.2: AI SVG-art premium + vision feedback loop ----
+            # Nova Canvas legacy/EOL 30 Sep 2026 + Titan retired + Stability T2I
+            # tidak ditawarkan di akun/region ini (diverifikasi 2026-09-03).
+            # Loop: generate (chain model terbaik) -> render resvg -> dinilai
+            # model vision -> regenerasi dengan saran; kandidat skor tertinggi menang.
+            best_svg, best_q, best_model, best_v = "", (0, 0, 0), "", -1.0
+            tip = ""
             try:
-                put_trace(sid or "-", "image_gen", "T2I model tidak tersedia -> fallback AI SVG-art")
-                svg_prompt = (
-                    "Buat SATU gambar ilustrasi vektor SVG untuk prompt berikut.\n"
-                    f"PROMPT: {prompt[:600]}\n\n"
-                    "ATURAN WAJIB:\n"
-                    "1. Keluarkan HANYA kode SVG, tanpa penjelasan, tanpa blok kode markdown.\n"
-                    "2. Mulai dengan <svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 1024 1024\">.\n"
-                    "3. Gunakan gradien (<linearGradient>/<radialGradient>), bentuk kaya, detail, "
-                    "komposisi artistik profesional. Gambar harus terlihat PENUH (bukan polos).\n"
-                    "4. Tanpa teks panjang di dalam gambar (maks 2-3 kata label bila perlu).\n"
-                    "5. Tanpa referensi eksternal (tanpa <image href>, tanpa font kustom).\n"
-                    "6. Untuk lanskap/portrait gunakan viewBox 1280x768 atau 768x1280 sesuai dimensi.\n"
-                    f"7. Dimensi diminta: {w}x{h}.\n")
-                sr = get_client("bedrock-runtime").converse(
-                    modelId=DEEP_MODEL,
-                    messages=[{"role": "user", "content": [{"text": svg_prompt}]}],
-                    system=[{"text": "Anda ilustrator vektor ahli. Output HANYA SVG valid."}],
-                    inferenceConfig={"maxTokens": 9000, "temperature": 0.7, "topP": 0.95})
-                svg = "".join(c.get("text", "") for c in sr["output"]["message"]["content"] if "text" in c)
-                msvg = re.search(r"<svg[\s\S]*?</svg>", svg)
-                if not msvg or len(msvg.group(0)) < 120:
-                    raise ValueError("model tidak menghasilkan SVG valid")
-                svg_txt = _svg_inject_size(msvg.group(0))
+                put_trace(sid or "-", "image_gen",
+                          "T2I raster tidak tersedia di akun ini -> SVG-art premium + vision loop")
+                tried = 0
+                for mid in ART_MODEL_CHAIN:
+                    mt = ART_MAX_TOKENS.get("anthropic", 9000) if "anthropic" in mid else ART_MAX_TOKENS["default"]
+                    for attempt in (1, 2):
+                        if tried >= 4:  # batasi total panggilan (latensi)
+                            break
+                        tried += 1
+                        svg_prompt = _svg_art_prompt(prompt, w, h, escalate=(attempt == 2), extra_tip=tip)
+                        try:
+                            sr = get_client("bedrock-runtime").converse(
+                                modelId=mid,
+                                messages=[{"role": "user", "content": [{"text": svg_prompt}]}],
+                                system=[{"text": "Anda ilustrator vektor ahli. Output HANYA SVG valid."}],
+                                inferenceConfig={"maxTokens": mt, "temperature": 0.7, "topP": 0.95})
+                            svg = "".join(c.get("text", "") for c in sr["output"]["message"]["content"] if "text" in c)
+                            msvg = re.search(r"<svg[\s\S]*?</svg>", svg)
+                            if not msvg or len(msvg.group(0)) < 120:
+                                continue
+                            cand = _svg_inject_size(msvg.group(0))
+                            q = _svg_quality(cand)
+                            vs = 0.0
+                            png = _svg_render_png(cand)
+                            if png:
+                                vs, vtip = _svg_vision_score(png, prompt)
+                                if vtip:
+                                    tip = vtip
+                                put_trace(sid or "-", "image_gen",
+                                          f"vision skor={vs} model={mid} bytes={q[0]} elem={q[1]}")
+                            else:
+                                put_trace(sid or "-", "image_gen",
+                                          f"render PNG gagal (resvg?) - fallback ambang bytes model={mid}")
+                            # pilih kandidat terbaik: vision skor dulu, lalu kualitas struktural
+                            if (vs, q) > (best_v, best_q):
+                                best_svg, best_q, best_model, best_v = cand, q, mid, vs
+                            if best_v >= 8.0 or (best_v <= 0 and _svg_ok(best_svg)):
+                                break  # cukup bagus, hentikan loop
+                        except Exception:
+                            continue
+                    if best_v >= 8.0 or (best_v <= 0 and _svg_ok(best_svg)):
+                        break
+                if not best_svg:
+                    raise ValueError("tidak ada model yang menghasilkan SVG valid")
+                svg_txt = best_svg
                 key = f"gen/art-{uuid.uuid4().hex}.svg"
                 get_client("s3").put_object(Bucket=ART_BUCKET, Key=key, Body=svg_txt.encode(),
                                             ServerSideEncryption="AES256", ContentType="image/svg+xml")
                 url = _art_public_url(key)
+                put_trace(sid or "-", "image_gen",
+                          f"SVG-art final model={best_model} vision={best_v} bytes={best_q[0]} elem={best_q[1]} grad={best_q[2]}")
                 if attachments is not None:
                     attachments.append({"type": "image", "url": url, "name": key.split("/")[-1]})
+                premium = "ilustrasi vektor premium" if (_svg_ok(svg_txt) or best_v >= 7) else "ilustrasi vektor"
                 return {"status": "ok", "image": url, "prompt": prompt[:200], "engine": "svg-art",
-                        "note": ("Gambar dibuat via AI SVG-art (mesin vektor; model raster tidak aktif "
-                                 "di akun ini). Sertakan di jawaban dengan markdown ![gambar](" + url + ") "
-                                 "dan sebutkan singkat bahwa formatnya vektor SVG.")}
+                        "model": best_model, "vision_score": best_v,
+                        "quality": {"bytes": best_q[0], "elements": best_q[1], "gradients": best_q[2]},
+                        "note": ("Model gambar raster tidak aktif di akun ini (Nova Canvas legacy/EOL 30 Sep 2026, "
+                                 "Titan retired, Stability T2I tidak ditawarkan), jadi gambar dibuat sebagai "
+                                 f"{premium} oleh {best_model} (sudah melalui penilaian visual otomatis). "
+                                 "Sertakan di jawaban dengan markdown ![gambar](" + url +
+                                 ") dan sebutkan singkat bahwa formatnya vektor SVG.")}
             except Exception as es:
                 return {"status": "error", "message": f"nova canvas gagal: {last[:160]}; svg-art: {str(es)[:160]}",
                         "note": ("Kedua mesin gambar gagal. Jelaskan dengan ramah dan tawarkan "
@@ -2179,7 +2335,9 @@ def handle_chat(payload):
                                 put_trace(sid, "web_search", f"{tname} hasil via Gateway: "
                                           f"{json.dumps(result, ensure_ascii=False)[:500]}")
                             if tname == "generate_image" and result.get("status") == "ok":
-                                put_trace(sid, "image_gen", f"Nova Canvas OK -> {result.get('image', '')[:160]}")
+                                put_trace(sid, "image_gen",
+                                          f"Gambar OK (engine={result.get('engine', 'nova-canvas')}) -> "
+                                          f"{result.get('image', '')[:160]}")
                             if tname == "code_interpreter":
                                 put_trace(sid, "code_interpreter",
                                           f"exit={result.get('exitCode')} stdout={str(result.get('stdout', ''))[:400]}"

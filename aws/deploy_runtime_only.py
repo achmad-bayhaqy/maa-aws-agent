@@ -38,6 +38,19 @@ if not os.path.exists(os.path.join(PKG, "boto3")):
                     "urllib3", "six"], check=True)
 subprocess.run([sys.executable, "-m", "pip", "install", "-q", "-t", PKG, "--no-deps",
                 "pypdf"], check=False)
+# v3.6.2: resvg-py (wheel abi3 self-contained, rust) utk render SVG->PNG
+# dalam vision feedback loop kualitas gambar.
+# PENTING: runtime AgentCore berjalan di ARM64 (Graviton) - wajib pakai
+# wheel manylinux aarch64, bukan wheel host (x86_64) -> CREATE_FAILED bila salah.
+import glob as _glob
+for _old in _glob.glob(os.path.join(PKG, "resvg_py*")):
+    import shutil as _sh
+    _sh.rmtree(_old, ignore_errors=True)
+subprocess.run([sys.executable, "-m", "pip", "install", "-q", "-t", PKG,
+                "--no-deps", "--only-binary=:all:",
+                "--platform", "manylinux2014_aarch64",
+                "--implementation", "cp", "--python-version", "3.12",
+                "resvg-py"], check=True)
 subprocess.run(["find", PKG, "-name", "__pycache__", "-type", "d",
                 "-exec", "rm", "-rf", "{}", "+"], check=False)
 
@@ -115,7 +128,7 @@ st["agent_runtime_id"] = rt_id
 json.dump(st, open(os.path.join(HERE, "state.json"), "w"), indent=2)
 log(f"runtime baru: {rt_id}")
 
-for i in range(40):
+for i in range(90):
     d = bac.get_agent_runtime(agentRuntimeId=rt_id)
     if d["status"] in ("ACTIVE", "READY", "FAILED"):
         log(f"status: {d['status']}")
@@ -124,6 +137,11 @@ for i in range(40):
             raise SystemExit(1)
         break
     time.sleep(10)
+else:
+    # loop habis saat masih CREATING - jangan lanjut diam-diam (bug lama)
+    d = bac.get_agent_runtime(agentRuntimeId=rt_id)
+    log(f"status akhir: {d['status']} - BATAL (belum READY)")
+    raise SystemExit(1)
 
 # update edge RUNTIME_ARN
 def edge_status():
@@ -135,19 +153,24 @@ for i in range(30):
     if s in ("Successful", "Failed"):
         break
     time.sleep(4)
+# v3.6.2: MERGE env (bukan timpa) - jaga env v3.6.1 seperti CONNECTORS_TABLE,
+# OAUTH_STATE_SECRET, MAA_KMS_KEY_ID, MAA_FRONTEND_ORIGIN, SCHEDULES_TABLE.
+cur_env = lam.get_function_configuration(FunctionName="maa-agent-edge").get(
+    "Environment", {}).get("Variables", {})
+cur_env.update({
+    "RUNTIME_ARN": st["agent_runtime_arn"],
+    "SESSIONS_TABLE": st["sessions_table"],
+    "CONF_TABLE": st["confirm_table"],
+    "KB_BUCKET": st["kb_bucket"],
+    "ART_BUCKET": ART,
+    "KB_ID": st.get("kb_id", ""),
+    "USER_POOL_ID": st["user_pool_id"],
+    "KMS_KEY_ID": st["kms_key_id"],
+    "TRACE_LOG_GROUP": st.get("trace_log_group", "/maa/agent/trace"),
+})
 lam.update_function_configuration(
     FunctionName="maa-agent-edge",
-    Environment={"Variables": {
-        "RUNTIME_ARN": st["agent_runtime_arn"],
-        "SESSIONS_TABLE": st["sessions_table"],
-        "CONF_TABLE": st["confirm_table"],
-        "KB_BUCKET": st["kb_bucket"],
-        "ART_BUCKET": ART,
-        "KB_ID": st.get("kb_id", ""),
-        "USER_POOL_ID": st["user_pool_id"],
-        "KMS_KEY_ID": st["kms_key_id"],
-        "TRACE_LOG_GROUP": st.get("trace_log_group", "/maa/agent/trace"),
-    }},
+    Environment={"Variables": cur_env},
     Timeout=290,
 )
 for i in range(30):
