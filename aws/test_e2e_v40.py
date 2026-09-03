@@ -146,8 +146,21 @@ ok7 = "example" in ans3.lower() or ("code_interpreter" in tr3 and '"ok"' in tr3)
 check("scraping CI INTERNET (Google Play class)", ok7, ans3[:100].replace("\n", " "))
 
 # ---- 4. /files/view ----
-c8, fv = api("GET", "/files/view", qs="key=uploads/e2e-tidak-ada.png")
-check("route /files/view terdaftar (403/404 utk key tak berhak)", c8 in (200, 302, 403, 404), str(c8))
+# 302 redirect ke presigned URL HARUS diuji tanpa forward header Authorization
+# (browser asli strip header saat cross-origin redirect; urllib tidak -> S3 400)
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+_op = urllib.request.build_opener(_NoRedirect)
+_req = urllib.request.Request(f"{API}/files/view?key=uploads/e2e-tidak-ada.png",
+                              headers={"Authorization": TOKEN})
+try:
+    _resp = _op.open(_req, timeout=30)
+    c8 = _resp.status
+except urllib.error.HTTPError as e:
+    c8 = e.code
+check("route /files/view terdaftar (200/302/403/404)", c8 in (200, 302, 403, 404), str(c8))
 
 # ---- 5. Management User ----
 c9, users = api("GET", "/admin/users")

@@ -1,6 +1,6 @@
 'use client';
 
-import { BookOpen, Check, Database, FileText, Loader2, LogOut, Moon, Palette, Plus, ShieldCheck, Sparkles, Trash2, X } from 'lucide-react';
+import { BookOpen, Cable, Check, Database, FileText, Loader2, LogOut, Moon, Palette, Plus, ShieldCheck, Sparkles, Trash2, X } from 'lucide-react';
 import type { SessionRow } from '@/lib/maa';
 import { relTime } from '@/lib/maa';
 import { LogoWordmark } from './logo';
@@ -21,6 +21,7 @@ export function SidebarContent({
   onOpenDocs,
   onOpenKb,
   onOpenSkills,
+  onOpenConnectors,
   onOpenAdmin,
   onOpenTheme,
   canAdmin,
@@ -35,6 +36,7 @@ export function SidebarContent({
   onOpenDocs: () => void;
   onOpenKb: () => void;
   onOpenSkills: () => void;
+  onOpenConnectors: () => void;
   onOpenAdmin: () => void;
   onOpenTheme: () => void;
   canAdmin: boolean;
@@ -117,6 +119,7 @@ export function SidebarContent({
           { icon: <FileText className="h-4 w-4" />, label: 'Dokumentasi', onClick: onOpenDocs },
           { icon: <Database className="h-4 w-4" />, label: 'Knowledge Base', onClick: onOpenKb },
           { icon: <Sparkles className="h-4 w-4" />, label: 'Skills Library', onClick: onOpenSkills },
+          { icon: <Cable className="h-4 w-4" />, label: 'Konektor Data', onClick: onOpenConnectors },
           ...(canAdmin
             ? [{ icon: <ShieldCheck className="h-4 w-4" />, label: 'Management User', onClick: onOpenAdmin }]
             : []),

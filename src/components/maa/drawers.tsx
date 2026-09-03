@@ -2,9 +2,10 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
-  AtSign, Check, ChevronDown, ClipboardCopy, CloudUpload, Database, Edit3, Eye,
-  FileText, KeyRound, Loader2, Lock, LogIn, Mail, PencilLine, RefreshCw, Save, Search,
-  ShieldCheck, Sparkles, Trash2, UserPlus, UserCog, Users, X,
+  AtSign, Blocks, Cable, Check, ChevronDown, ClipboardCopy, Cloud, CloudUpload, Cloudy,
+  Database, Edit3, Eye, FileText, KeyRound, Loader2, Lock, LogIn, Mail, PencilLine, Plug,
+  Plus, RefreshCw, Save, Search, Server, ShieldCheck, Sparkles, Trash2, UserPlus, UserCog,
+  Users, Webhook, X,
 } from 'lucide-react';
 import {
   Sheet, SheetContent, SheetHeader, SheetTitle, SheetDescription,
@@ -17,11 +18,11 @@ import { Switch } from '@/components/ui/switch';
 import {
   adminDeleteUser, adminInviteUser, adminListUsers, adminRenameUser,
   adminResendInvite, adminSetPassword, adminSetUserRole, adminSetUserStatus,
-  deleteKbDoc, fmtBytes, getDocContent, getKbDocContent, getSkillContent,
-  listKbDocs, listSiteDocs, listSkills, presignUpload, relTime, saveDocContent,
-  saveKbDocContent, syncKb,
+  createConnector, deleteConnector, deleteKbDoc, fmtBytes, getDocContent, getKbDocContent,
+  getSkillContent, listConnectors, listKbDocs, listSiteDocs, listSkills, presignUpload,
+  relTime, saveDocContent, saveKbDocContent, syncKb, testConnector, updateConnector,
 } from '@/lib/maa';
-import type { AdminUser, MaaSkill } from '@/lib/maa';
+import type { AdminUser, Connector, MaaSkill } from '@/lib/maa';
 import { DocsContent } from './docs-content';
 import { Markdown } from './markdown';
 
@@ -1350,6 +1351,447 @@ export function AdminDrawer({
             )}
           </AlertDialogContent>
         </AlertDialog>
+      </SheetContent>
+    </Sheet>
+  );
+}
+
+
+/* ---------------------------- konektor drawer ---------------------------- */
+
+type ConnectorField = {
+  key: string;
+  label: string;
+  placeholder?: string;
+  secret?: boolean;
+  area?: boolean;
+  half?: boolean;
+  hint?: string;
+  select?: string[];
+};
+
+const CONNECTOR_META: Record<string, { label: string; desc: string; fields: ConnectorField[] }> = {
+  gdrive: {
+    label: 'Google Drive',
+    desc: 'Tempel access token OAuth, ATAU refresh token + client ID/secret (Google Cloud Console, scope drive.readonly).',
+    fields: [
+      { key: 'accessToken', label: 'Access Token (opsional bila pakai refresh)', secret: true, area: true },
+      { key: 'refreshToken', label: 'Refresh Token (opsional)', secret: true, area: true },
+      { key: 'clientId', label: 'Client ID (utk refresh)', half: true },
+      { key: 'clientSecret', label: 'Client Secret (utk refresh)', secret: true, half: true },
+      { key: 'folderId', label: 'Folder ID (opsional — batasi akses ke 1 folder)' },
+    ],
+  },
+  onedrive: {
+    label: 'OneDrive',
+    desc: 'Microsoft Graph: access token, ATAU refresh token + client ID/secret (Entra ID, scope Files.Read.All).',
+    fields: [
+      { key: 'accessToken', label: 'Access Token (opsional bila pakai refresh)', secret: true, area: true },
+      { key: 'refreshToken', label: 'Refresh Token (opsional)', secret: true, area: true },
+      { key: 'clientId', label: 'Client ID (utk refresh)', half: true },
+      { key: 'clientSecret', label: 'Client Secret (utk refresh)', secret: true, half: true },
+      { key: 'tenant', label: 'Tenant (opsional, default: common)' },
+    ],
+  },
+  adls: {
+    label: 'ADLS Gen2',
+    desc: 'Azure Data Lake Storage Gen2: storage account + filesystem, autentikasi SAS token atau account key.',
+    fields: [
+      { key: 'storageAccount', label: 'Storage Account', half: true, placeholder: 'mydatalake' },
+      { key: 'filesystem', label: 'Filesystem (container)', half: true },
+      { key: 'sasToken', label: 'SAS Token (opsional bila pakai key)', secret: true, area: true },
+      { key: 'accountKey', label: 'Account Key (opsional bila pakas SAS)', secret: true, area: true },
+    ],
+  },
+  sftp: {
+    label: 'SFTP',
+    desc: 'Server SFTP: autentikasi password atau private key (PEM). Dipakai agent utk list & baca file.',
+    fields: [
+      { key: 'host', label: 'Host', half: true, placeholder: 'sftp.example.com' },
+      { key: 'port', label: 'Port', half: true, placeholder: '22' },
+      { key: 'username', label: 'Username' },
+      { key: 'password', label: 'Password (opsional bila pakai key)', secret: true },
+      { key: 'privateKey', label: 'Private Key PEM (opsional)', secret: true, area: true },
+      { key: 'path', label: 'Path default (opsional, mis. /data)' },
+    ],
+  },
+  api: {
+    label: 'REST API Manual',
+    desc: 'Endpoint API kustom: agent akan memanggil URL ini saat butuh data (bisa pakai header auth).',
+    fields: [
+      { key: 'method', label: 'Method', select: ['GET', 'POST', 'PUT', 'PATCH'], half: true },
+      { key: 'expectStatus', label: 'Status diharapkan', half: true, placeholder: '2xx atau 200' },
+      { key: 'url', label: 'URL', placeholder: 'https://api.example.com/v1/data' },
+      { key: 'headers', label: 'Headers (JSON, opsional)', area: true, placeholder: '{"Authorization": "Bearer xxx"}' },
+      { key: 'body', label: 'Body (opsional, utk POST/PUT)', area: true },
+    ],
+  },
+  mcp: {
+    label: 'MCP Server',
+    desc: 'MCP (Model Context Protocol) via Streamable HTTP: agent memakai tools dari server ini.',
+    fields: [
+      { key: 'url', label: 'URL MCP', placeholder: 'https://mcp.example.com/mcp' },
+      { key: 'headers', label: 'Headers (JSON, opsional)', area: true, placeholder: '{"Authorization": "Bearer xxx"}' },
+    ],
+  },
+};
+
+const TYPE_ICON: Record<string, React.ReactNode> = {
+  gdrive: <Cloud className="h-4 w-4" />,
+  onedrive: <Cloudy className="h-4 w-4" />,
+  adls: <Database className="h-4 w-4" />,
+  sftp: <Server className="h-4 w-4" />,
+  api: <Webhook className="h-4 w-4" />,
+  mcp: <Blocks className="h-4 w-4" />,
+};
+
+export function ConnectorDrawer({
+  open, onOpenChange, token, notify,
+}: {
+  open: boolean;
+  onOpenChange: (v: boolean) => void;
+  token: string;
+  notify: (msg: string, ok?: boolean) => void;
+}) {
+  const [items, setItems] = useState<Connector[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [busy, setBusy] = useState('');
+  const [formOpen, setFormOpen] = useState(false);
+  const [editId, setEditId] = useState<string | null>(null);
+  const [ctype, setCtype] = useState<string>('gdrive');
+  const [name, setName] = useState('');
+  const [form, setForm] = useState<Record<string, string>>({});
+  const [testRes, setTestRes] = useState<{ ok: boolean; message: string; detail: string } | null>(null);
+  const [delItem, setDelItem] = useState<Connector | null>(null);
+
+  const refresh = useCallback(async () => {
+    setLoading(true);
+    try {
+      const r = await listConnectors(token);
+      setItems(r.connectors || []);
+    } catch (e) {
+      notify(`Gagal memuat konektor: ${(e as Error).message}`);
+    } finally {
+      setLoading(false);
+    }
+  }, [token, notify]);
+
+  useEffect(() => {
+    if (open) refresh();
+  }, [open, refresh]);
+
+  const resetForm = () => {
+    setEditId(null);
+    setCtype('gdrive');
+    setName('');
+    setForm({});
+    setTestRes(null);
+  };
+
+  const startEdit = (c: Connector) => {
+    setEditId(c.connectorId);
+    setCtype(c.type);
+    setName(c.name);
+    setForm(Object.fromEntries(Object.entries(c.config || {}).map(([k, v]) => [k, String(v ?? '')])));
+    setTestRes(null);
+    setFormOpen(true);
+  };
+
+  const collectConfig = () => Object.fromEntries(Object.entries(form).filter(([, v]) => v !== ''));
+
+  const doTest = async () => {
+    setTestRes(null);
+    setBusy('test');
+    try {
+      const r = await testConnector(
+        token,
+        editId ?? undefined,
+        editId ? collectConfig() : { type: ctype, config: collectConfig() },
+      );
+      setTestRes(r);
+    } catch (e) {
+      setTestRes({ ok: false, message: (e as Error).message, detail: '' });
+    } finally {
+      setBusy('');
+    }
+  };
+
+  const doSave = async () => {
+    if (!name.trim()) {
+      notify('Nama konektor wajib diisi');
+      return;
+    }
+    setBusy('save');
+    try {
+      if (editId) await updateConnector(token, editId, { name, config: collectConfig() });
+      else await createConnector(token, name, ctype, collectConfig());
+      notify(editId ? 'Konektor diperbarui' : 'Konektor ditambahkan', true);
+      setFormOpen(false);
+      resetForm();
+      refresh();
+    } catch (e) {
+      notify(`Gagal menyimpan: ${(e as Error).message}`);
+    } finally {
+      setBusy('');
+    }
+  };
+
+  const doDelete = async (c: Connector) => {
+    setBusy(c.connectorId);
+    try {
+      await deleteConnector(token, c.connectorId);
+      notify(`Konektor "${c.name}" dihapus`, true);
+      refresh();
+    } catch (e) {
+      notify(`Gagal menghapus: ${(e as Error).message}`);
+    } finally {
+      setBusy('');
+    }
+  };
+
+  const meta = CONNECTOR_META[ctype];
+
+  return (
+    <Sheet open={open} onOpenChange={onOpenChange}>
+      <SheetContent side="right" className="w-full max-w-xl gap-0 overflow-y-auto p-0 sm:max-w-xl">
+        <SheetHeader className="border-b border-[var(--line)] px-5 py-4">
+          <SheetTitle className="flex items-center gap-2 text-[14px] font-bold text-[var(--ink)]">
+            <Cable className="h-4 w-4" style={{ color: 'var(--accent)' }} /> Konektor Data
+          </SheetTitle>
+          <SheetDescription className="text-[11.5px] text-[var(--muted-fg)]">
+            Hubungkan sumber data eksternal (Google Drive, OneDrive, ADLS Gen2, SFTP, API, MCP) —
+            agent bisa menggunakannya di chat. Selalu uji koneksi setelah menyimpan.
+          </SheetDescription>
+        </SheetHeader>
+
+        <div className="px-5 py-4">
+          {!formOpen && (
+            <button
+              type="button"
+              onClick={() => { resetForm(); setFormOpen(true); }}
+              className="maa-btn-primary mb-4 flex h-9 w-full items-center justify-center gap-2 text-[13px]"
+            >
+              <Plus className="h-4 w-4" /> Tambah Konektor
+            </button>
+          )}
+
+          {formOpen && (
+            <div className="mb-5 rounded-[12px] border border-[var(--line)] bg-[var(--surface)] p-4">
+              <div className="mb-3 flex items-center justify-between">
+                <span className="text-[12.5px] font-bold text-[var(--ink)]">
+                  {editId ? 'Edit Konektor' : 'Konektor Baru'}
+                </span>
+                <button type="button" onClick={() => { setFormOpen(false); resetForm(); }}
+                  className="rounded p-1 text-[var(--muted-fg)] hover:bg-[var(--muted-bg)]">
+                  <X className="h-4 w-4" />
+                </button>
+              </div>
+
+              {/* pilih tipe */}
+              {!editId && (
+                <div className="mb-3 grid grid-cols-3 gap-1.5">
+                  {Object.entries(CONNECTOR_META).map(([t, m]) => (
+                    <button
+                      key={t}
+                      type="button"
+                      onClick={() => { setCtype(t); setForm({}); setTestRes(null); }}
+                      className={`flex flex-col items-center gap-1 rounded-[10px] border px-2 py-2 text-[10.5px] font-medium transition-colors ${
+                        ctype === t
+                          ? 'border-[var(--accent)] bg-[var(--accent-soft)] text-[var(--ink)]'
+                          : 'border-[var(--line-soft)] text-[var(--muted-fg)] hover:border-[var(--line)]'
+                      }`}
+                    >
+                      <span style={{ color: ctype === t ? 'var(--accent)' : undefined }}>{TYPE_ICON[t]}</span>
+                      {m.label}
+                    </button>
+                  ))}
+                </div>
+              )}
+
+              <p className="mb-3 rounded-lg bg-[var(--accent-soft)] px-2.5 py-1.5 text-[10.5px] leading-relaxed text-[var(--muted-fg)]">
+                {meta.desc}
+              </p>
+
+              <label className="mb-1.5 block text-[11px] font-semibold text-[var(--muted-fg)]">Nama Konektor</label>
+              <input
+                value={name}
+                onChange={(e) => setName(e.target.value)}
+                placeholder="mis. Drive Marketing"
+                className="mb-3 w-full rounded-lg border border-[var(--line)] bg-[var(--bg)] px-3 py-2 text-[12.5px] text-[var(--ink)] outline-none focus:border-[var(--accent)]"
+              />
+
+              <div className="mb-3 grid grid-cols-2 gap-2">
+                {meta.fields.map((f) => (
+                  <div key={f.key} className={f.area || f.select ? 'col-span-2' : f.half ? 'col-span-1' : 'col-span-2'}>
+                    <label className="mb-1 block text-[11px] font-semibold text-[var(--muted-fg)]">{f.label}</label>
+                    {f.select ? (
+                      <select
+                        value={form[f.key] ?? f.select[0]}
+                        onChange={(e) => setForm((s) => ({ ...s, [f.key]: e.target.value }))}
+                        className="w-full rounded-lg border border-[var(--line)] bg-[var(--bg)] px-3 py-2 text-[12.5px] text-[var(--ink)] outline-none focus:border-[var(--accent)]"
+                      >
+                        {f.select.map((o) => <option key={o} value={o}>{o}</option>)}
+                      </select>
+                    ) : f.area ? (
+                      <textarea
+                        value={form[f.key] ?? ''}
+                        onChange={(e) => setForm((s) => ({ ...s, [f.key]: e.target.value }))}
+                        placeholder={f.secret ? 'kosongkan bila tidak diubah' : f.placeholder}
+                        rows={f.key === 'privateKey' ? 4 : 2}
+                        className="w-full rounded-lg border border-[var(--line)] bg-[var(--bg)] px-3 py-2 font-mono text-[11.5px] text-[var(--ink)] outline-none focus:border-[var(--accent)]"
+                      />
+                    ) : (
+                      <input
+                        type={f.secret ? 'password' : 'text'}
+                        value={form[f.key] ?? ''}
+                        onChange={(e) => setForm((s) => ({ ...s, [f.key]: e.target.value }))}
+                        placeholder={f.placeholder || (f.secret && editId ? '••• (tidak diubah)' : '')}
+                        className="w-full rounded-lg border border-[var(--line)] bg-[var(--bg)] px-3 py-2 text-[12.5px] text-[var(--ink)] outline-none focus:border-[var(--accent)]"
+                      />
+                    )}
+                  </div>
+                ))}
+              </div>
+
+              {/* hasil test */}
+              {testRes && (
+                <div
+                  className={`mb-3 rounded-[10px] border px-3 py-2.5 text-[11.5px] ${
+                    testRes.ok
+                      ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-200'
+                      : 'border-[var(--danger)]/40 bg-[var(--danger)]/10 text-[var(--ink)]'
+                  }`}
+                >
+                  <span className="font-bold">{testRes.ok ? '✓ Koneksi berhasil' : '✗ Koneksi gagal'}</span>
+                  <span className="ml-1.5">{testRes.message}</span>
+                  {testRes.detail && (
+                    <span className="mt-1 block break-all font-mono text-[10px] opacity-80">{testRes.detail}</span>
+                  )}
+                </div>
+              )}
+
+              <div className="flex gap-2">
+                <button
+                  type="button"
+                  onClick={doTest}
+                  disabled={busy !== ''}
+                  className="maa-btn-ghost flex h-9 flex-1 items-center justify-center gap-1.5 text-[12.5px] disabled:opacity-50"
+                >
+                  {busy === 'test' ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Plug className="h-3.5 w-3.5" />}
+                  Test Koneksi
+                </button>
+                <button
+                  type="button"
+                  onClick={doSave}
+                  disabled={busy !== ''}
+                  className="maa-btn-primary flex h-9 flex-1 items-center justify-center gap-1.5 text-[12.5px] disabled:opacity-50"
+                >
+                  {busy === 'save' ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Save className="h-3.5 w-3.5" />}
+                  {editId ? 'Simpan Perubahan' : 'Simpan Konektor'}
+                </button>
+              </div>
+              <p className="mt-2 text-[10px] text-[var(--muted-fg)]">
+                Test koneksi dijalankan dari server (bukan browser) — hasilnya sama seperti saat agent memakainya.
+              </p>
+            </div>
+          )}
+
+          {/* daftar konektor */}
+          {loading ? (
+            <div className="flex items-center justify-center py-8 text-[var(--muted-fg)]">
+              <Loader2 className="h-5 w-5 animate-spin" />
+            </div>
+          ) : items.length === 0 && !formOpen ? (
+            <div className="rounded-[12px] border border-dashed border-[var(--line)] px-4 py-10 text-center">
+              <Cable className="mx-auto mb-2 h-6 w-6 text-[var(--muted-fg)]" />
+              <p className="text-[12.5px] font-semibold text-[var(--ink)]">Belum ada konektor</p>
+              <p className="mt-1 text-[11px] text-[var(--muted-fg)]">
+                Hubungkan Google Drive, OneDrive, ADLS Gen2, SFTP, API manual, atau MCP server.
+              </p>
+            </div>
+          ) : (
+            <div className="flex flex-col gap-2">
+              {items.map((c) => {
+                const ok = c.status === 'ok';
+                const failed = c.status === 'failed';
+                return (
+                  <div key={c.connectorId} className="rounded-[12px] border border-[var(--line)] bg-[var(--surface)] p-3.5">
+                    <div className="flex items-start justify-between gap-2">
+                      <div className="flex min-w-0 items-start gap-2.5">
+                        <span
+                          className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg border border-[var(--line-soft)] bg-[var(--bg)]"
+                          style={{ color: 'var(--accent)' }}
+                        >
+                          {TYPE_ICON[c.type] || <Plug className="h-4 w-4" />}
+                        </span>
+                        <div className="min-w-0">
+                          <div className="flex items-center gap-1.5">
+                            <span className="truncate text-[12.5px] font-bold text-[var(--ink)]">{c.name}</span>
+                            <span
+                              title={c.status === 'ok' ? 'koneksi OK' : failed ? 'test terakhir gagal' : 'belum diuji'}
+                              className={`h-2 w-2 shrink-0 rounded-full ${
+                                ok ? 'bg-emerald-400' : failed ? 'bg-[var(--danger)]' : 'bg-zinc-500'
+                              }`}
+                            />
+                            {c.owner && <span className="shrink-0 rounded-full bg-[var(--muted-bg)] px-1.5 py-px font-mono text-[9px] text-[var(--muted-fg)]">{c.owner}</span>}
+                          </div>
+                          <span className="block text-[10.5px] text-[var(--muted-fg)]">
+                            {CONNECTOR_META[c.type]?.label || c.type}
+                            {c.lastTestMsg ? ` · ${c.lastTestMsg.slice(0, 80)}` : ''}
+                            {c.lastTestAt ? ` · ${relTime(c.lastTestAt)}` : ''}
+                          </span>
+                        </div>
+                      </div>
+                      <div className="flex shrink-0 items-center gap-0.5">
+                        <button
+                          type="button"
+                          title="Test koneksi"
+                          disabled={busy !== ''}
+                          onClick={async () => {
+                            setBusy(c.connectorId);
+                            try {
+                              const r = await testConnector(token, c.connectorId);
+                              notify(r.ok ? `✓ ${r.message}` : `✗ ${r.message}`, r.ok);
+                              refresh();
+                            } catch (e) {
+                              notify(`Gagal test: ${(e as Error).message}`);
+                            } finally {
+                              setBusy('');
+                            }
+                          }}
+                          className="rounded p-1.5 text-[var(--muted-fg)] hover:bg-[var(--muted-bg)] hover:text-[var(--ink)]"
+                        >
+                          {busy === c.connectorId ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5" />}
+                        </button>
+                        <button
+                          type="button"
+                          title="Edit"
+                          onClick={() => startEdit(c)}
+                          className="rounded p-1.5 text-[var(--muted-fg)] hover:bg-[var(--muted-bg)] hover:text-[var(--ink)]"
+                        >
+                          <PencilLine className="h-3.5 w-3.5" />
+                        </button>
+                        <ConfirmAction
+                          trigger={
+                            <button type="button" title="Hapus"
+                              className="rounded p-1.5 text-[var(--muted-fg)] hover:bg-[var(--muted-bg)] hover:text-[var(--danger)]">
+                              <Trash2 className="h-3.5 w-3.5" />
+                            </button>
+                          }
+                          title={`Hapus konektor "${c.name}"?`}
+                          description="Agent tidak akan bisa lagi mengakses sumber data ini."
+                          confirmLabel="Hapus"
+                          busy={busy === c.connectorId}
+                          onConfirm={() => doDelete(c)}
+                        />
+                      </div>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
       </SheetContent>
     </Sheet>
   );

@@ -45,6 +45,7 @@ GW_URL = os.environ.get("GW_URL", "")
 CI_ID = os.environ.get("CI_ID", "")
 TRACE_LOG_GROUP = os.environ.get("TRACE_LOG_GROUP", "/maa/agent/trace")
 SCHEDULES_TABLE = os.environ.get("SCHEDULES_TABLE", "")
+CONNECTORS_TABLE = os.environ.get("CONNECTORS_TABLE", "")
 KB_DOCS_PREFIX = "docs/"
 KB_SKILLS_PREFIX = "skills/"
 
@@ -540,6 +541,18 @@ TOOLS = [
                    "properties": {"path": {"type": "string"}, "content": {"type": "string"}},
                    "required": ["path", "content"]}}},
         ["app_name", "index_html"]),
+    # ------------- v3.6: konektor data source (ala Claude AI) -------------
+    _ts("connector_list",
+        "Daftar konektor data user (Google Drive, OneDrive, ADLS Gen2, SFTP, API, MCP) beserta status koneksinya. Panggil ini dulu sebelum memakai konektor lain.",
+        {}, []),
+    _ts("connector_browse",
+        "List file/folder di konektor data user. connector = nama/ID dari connector_list. path opsional (folder). Berguna sebelum connector_read.",
+        {"connector": {"type": "string"}, "path": {"type": "string"}},
+        ["connector"]),
+    _ts("connector_read",
+        "Baca isi file dari konektor data user (Google Drive/OneDrive/ADLS/SFTP/API). connector = nama/ID; path = lokasi file (untuk Drive: fileId dari connector_browse).",
+        {"connector": {"type": "string"}, "path": {"type": "string"}},
+        ["connector", "path"]),
 ]
 
 DESTRUCTIVE_TYPES = {"ec2", "s3", "dynamodb", "rds", "cloudformation"}
@@ -730,6 +743,61 @@ def _deck_html(title, subtitle, slides):
     return DECK_TMPL.replace("__TITLE__", title).replace("__DATA__", js)
 
 
+# ---------------------------------------------------------------- konektor (v3.6)
+try:
+    import connectors as _conn_mod
+except ImportError:
+    _conn_mod = None
+
+
+def _conn_find(username):
+    """List item konektor milik user (low-level DDB -> dict bersih).
+
+    config bisa "S" (JSON string, format baru) atau "M" (Map DDB, format lama)."""
+    if not CONNECTORS_TABLE:
+        return []
+    from boto3.dynamodb.types import TypeDeserializer
+    deser = TypeDeserializer()
+    cl = get_client("dynamodb")
+    r = cl.scan(TableName=CONNECTORS_TABLE,
+                FilterExpression="#o = :u",
+                ExpressionAttributeNames={"#o": "owner"},
+                ExpressionAttributeValues={":u": {"S": str(username or "")}})
+    out = []
+    for it in r.get("Items", []):
+        try:
+            raw = it.get("config", {})
+            if "S" in raw:
+                cfg = json.loads(raw["S"])
+            elif "M" in raw:
+                cfg = {k: deser.deserialize(v) for k, v in raw["M"].items()}
+            else:
+                cfg = {}
+        except Exception:
+            cfg = {}
+        out.append({"connectorId": it["connectorId"]["S"], "name": it.get("name", {}).get("S", ""),
+                    "type": it.get("type", {}).get("S", ""), "status": it.get("status", {}).get("S", "untested"),
+                    "config": cfg})
+    return out
+
+
+def _conn_pick(username, name_or_id):
+    """Ambil 1 konektor by name (case-insensitive) atau connectorId."""
+    if _conn_mod is None:
+        raise ValueError("modul konektor tidak tersedia di runtime")
+    items = _conn_find(username)
+    if not items:
+        raise ValueError("belum ada konektor — user bisa menambahkannya di sidebar > Konektor Data")
+    q = str(name_or_id or "").strip().lower()
+    for it in items:
+        if it["connectorId"].lower() == q or it["name"].lower() == q:
+            return it
+    fuzzy = [it for it in items if q and (q in it["name"].lower() or it["name"].lower() in q)]
+    if fuzzy:
+        return fuzzy[0]
+    raise ValueError(f"konektor '{name_or_id}' tidak ditemukan — pilih dari connector_list")
+
+
 # ---------------------------------------------------------------- tool executor
 def exec_tool(name, args, sid=None, attachments=None, user_id=None, username=None):
     """Jalankan tool. AWS ops pakai sesi STS single-use; web tools via Gateway;
@@ -866,6 +934,51 @@ def exec_tool(name, args, sid=None, attachments=None, user_id=None, username=Non
             pass
         return {"status": "ok", "key": key,
                 "note": "Dokumen dihapus & re-index dimulai. Dokumen hilang permanen."}
+
+    # ---- v3.6: konektor data source ----
+    if name == "connector_list":
+        try:
+            items = _conn_find(username)
+            return {"status": "ok" if items else "ok",
+                    "connectors": [{"connectorId": i["connectorId"], "name": i.get("name", ""),
+                                    "type": i.get("type", ""), "status": i.get("status", "untested")}
+                                   for i in items],
+                    "note": ("Gunakan connector_browse lalu connector_read dengan nama konektor. "
+                             "Status 'failed' berarti test koneksi terakhir gagal — info ke user bila ingin diperbaiki di menu Konektor Data.") if items else "Belum ada konektor - sarankan user menambahkannya di sidebar > Konektor Data."}
+        except Exception as e:
+            return {"status": "error", "message": str(e)[:200]}
+
+    if name == "connector_browse":
+        try:
+            it = _conn_pick(username, args.get("connector", ""))
+            files = _conn_mod.connector_list_files(it["type"], it.get("config") or {},
+                                                   str(args.get("path") or ""), 25)
+            return {"status": "ok", "connector": it.get("name"), "items": files}
+        except ValueError as e:
+            return {"status": "error", "message": str(e)[:250]}
+        except Exception as e:
+            return {"status": "error", "message": f"browse gagal: {str(e)[:200]}"}
+
+    if name == "connector_read":
+        try:
+            it = _conn_pick(username, args.get("connector", ""))
+            blob, ctype = _conn_mod.connector_read(it["type"], it.get("config") or {},
+                                                   str(args.get("path") or ""), 200000)
+            try:
+                text = blob.decode("utf-8")
+                return {"status": "ok", "connector": it.get("name"), "path": args.get("path"),
+                        "content_type": ctype, "content": text[:12000],
+                        "note": "Isi file (dipotong 12.000 char pertama). Analisis sesuai konteks permintaan user."}
+            except UnicodeDecodeError:
+                import base64 as _b64
+                return {"status": "ok", "connector": it.get("name"), "path": args.get("path"),
+                        "content_type": ctype, "binary": True,
+                        "base64_head": _b64.b64encode(blob).decode()[:8000],
+                        "note": "File biner - hanya metadata/head yang dikembalikan; gunakan code_interpreter bila butuh analisis lanjutan."}
+        except ValueError as e:
+            return {"status": "error", "message": str(e)[:250]}
+        except Exception as e:
+            return {"status": "error", "message": f"read gagal: {str(e)[:200]}"}
 
     # ---- Skills library (v3.5: Agent Skills ala Claude, progressive disclosure) ----
     if name in ("skills_list", "skill_list"):

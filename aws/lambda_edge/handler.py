@@ -16,6 +16,7 @@ from botocore.config import Config
 REGION = os.environ.get("AWS_REGION", "us-east-1")
 RUNTIME_ARN = os.environ["RUNTIME_ARN"]
 SESSIONS_TABLE = os.environ["SESSIONS_TABLE"]
+CONNECTORS_TABLE = os.environ.get("CONNECTORS_TABLE", "")
 KB_BUCKET = os.environ["KB_BUCKET"]
 ART_BUCKET = os.environ["ART_BUCKET"]
 MODELS_KEY = os.environ.get("MODELS_KEY", "models/allowed-chat-models.json")
@@ -30,6 +31,8 @@ cfg = Config(retries={"max_attempts": 2, "mode": "standard"}, read_timeout=280)
 lam = boto3.client("lambda", region_name=REGION, config=cfg)
 ddb_res = boto3.resource("dynamodb", region_name=REGION, config=cfg)
 sessions_tbl = ddb_res.Table(SESSIONS_TABLE)
+conn_tbl = ddb_res.Table(CONNECTORS_TABLE) if CONNECTORS_TABLE else None
+import connectors as _conn
 s3 = boto3.client("s3", region_name=REGION, config=cfg)
 # WAJIB SigV4 utk presigned URL dengan SSE-KMS (SigV2 default -> S3 tolak 400)
 s3v4 = boto3.client("s3", region_name=REGION,
@@ -163,6 +166,14 @@ def resp_redirect(location):
                         "Content-Type": "text/plain",
                         "Access-Control-Allow-Origin": "*"},
             "body": ""}
+
+
+def _conn_cfg(item):
+    """Config konektor tersimpan sebagai string JSON (kompat low-level DDB)."""
+    try:
+        return json.loads(item.get("config") or "{}") if isinstance(item.get("config"), str) else (item.get("config") or {})
+    except Exception:
+        return {}
 
 
 def handler(event, context):
@@ -828,6 +839,98 @@ def handler(event, context):
         if path == "/admin/signout" and method == "POST":
             cog.admin_user_global_sign_out(UserPoolId=USER_POOL_ID, Username=cl["username"])
             return resp(200, {"signedOut": True})
+
+        # ---------------- v3.6: Konektor (data source ala Claude AI) ----------------
+        if path == "/connectors" and method == "GET":
+            if conn_tbl is None:
+                return resp(501, {"error": "fitur konektor belum terpasang"})
+            if is_superadmin(cl):
+                items = conn_tbl.scan(Limit=200).get("Items", [])
+            else:
+                items = conn_tbl.scan(
+                    FilterExpression="#o = :u",
+                    ExpressionAttributeNames={"#o": "owner"},
+                    ExpressionAttributeValues={":u": cl["username"]}).get("Items", [])
+            items.sort(key=lambda x: int(x.get("createdAt", 0)), reverse=True)
+            out = [{"connectorId": i["connectorId"], "name": i.get("name", ""),
+                    "type": i.get("type", ""), "owner": i.get("owner", ""),
+                    "config": _conn.mask_config(_conn_cfg(i)),
+                    "status": i.get("status", "untested"),
+                    "lastTestAt": i.get("lastTestAt"), "lastTestOk": i.get("lastTestOk"),
+                    "lastTestMsg": i.get("lastTestMsg", ""), "createdAt": i.get("createdAt"),
+                    "updatedAt": i.get("updatedAt")} for i in items]
+            return resp(200, {"connectors": out})
+
+        if path == "/connectors" and method == "POST":
+            if conn_tbl is None:
+                return resp(501, {"error": "fitur konektor belum terpasang"})
+            body = json.loads(event.get("body") or "{}")
+            name = (body.get("name") or "").strip()[:80]
+            ctype = (body.get("type") or "").strip()
+            cfg = body.get("config") or {}
+            if not name:
+                return resp(400, {"error": "nama konektor wajib diisi"})
+            if ctype not in _conn.CONNECTOR_TYPES:
+                return resp(400, {"error": f"tipe harus salah satu dari: {', '.join(_conn.CONNECTOR_TYPES)}"})
+            now = now_ms()
+            cid = "conn-" + uuid.uuid4().hex[:16]
+            conn_tbl.put_item(Item={
+                "connectorId": cid, "owner": cl["username"], "name": name, "type": ctype,
+                "config": json.dumps(cfg), "status": "untested", "createdAt": now, "updatedAt": now})
+            return resp(200, {"connectorId": cid, "name": name, "type": ctype,
+                              "config": _conn.mask_config(cfg), "status": "untested",
+                              "createdAt": now, "updatedAt": now})
+
+        if path == "/connectors" and method == "DELETE":
+            if conn_tbl is None:
+                return resp(501, {"error": "fitur konektor belum terpasang"})
+            cid = qs.get("id") or ""
+            it = conn_tbl.get_item(Key={"connectorId": cid}).get("Item")
+            if not it or (it.get("owner") != cl["username"] and not is_superadmin(cl)):
+                return resp(404, {"error": "konektor tidak ditemukan"})
+            conn_tbl.delete_item(Key={"connectorId": cid})
+            return resp(200, {"deleted": cid})
+
+        if path == "/connectors/update" and method == "POST":
+            if conn_tbl is None:
+                return resp(501, {"error": "fitur konektor belum terpasang"})
+            body = json.loads(event.get("body") or "{}")
+            cid = body.get("connectorId") or ""
+            it = conn_tbl.get_item(Key={"connectorId": cid}).get("Item")
+            if not it or (it.get("owner") != cl["username"] and not is_superadmin(cl)):
+                return resp(404, {"error": "konektor tidak ditemukan"})
+            new_cfg = _conn.merge_config(_conn_cfg(it), body.get("config") or {})
+            name = (body.get("name") or it.get("name", "")).strip()[:80]
+            conn_tbl.update_item(
+                Key={"connectorId": cid},
+                UpdateExpression="SET #c = :c, #n = :n, updatedAt = :u",
+                ExpressionAttributeNames={"#c": "config", "#n": "name"},
+                ExpressionAttributeValues={":c": json.dumps(new_cfg), ":n": name, ":u": now_ms()})
+            return resp(200, {"connectorId": cid, "name": name, "type": it.get("type"),
+                              "config": _conn.mask_config(new_cfg), "status": it.get("status")})
+
+        if path == "/connectors/test" and method == "POST":
+            if conn_tbl is None:
+                return resp(501, {"error": "fitur konektor belum terpasang"})
+            body = json.loads(event.get("body") or "{}")
+            cid = body.get("connectorId") or ""
+            it = conn_tbl.get_item(Key={"connectorId": cid}).get("Item") if cid else None
+            if it and it.get("owner") != cl["username"] and not is_superadmin(cl):
+                return resp(404, {"error": "konektor tidak ditemukan"})
+            # config dari body (form belum disimpan) menimpa; nilai termask = pakai tersimpan
+            base_cfg = _conn_cfg(it) if it else {}
+            cfg = _conn.merge_config(base_cfg, body.get("config") or {}) if it else (body.get("config") or {})
+            ctype = (it or {}).get("type") or (body.get("type") or "")
+            ok, msg, detail = _conn.test_connection(ctype, cfg)
+            if it:
+                conn_tbl.update_item(
+                    Key={"connectorId": cid},
+                    UpdateExpression="SET #st = :s, lastTestAt = :t, lastTestOk = :o, lastTestMsg = :m",
+                    ExpressionAttributeNames={"#st": "status"},
+                    ExpressionAttributeValues={":s": "ok" if ok else "failed",
+                                               ":t": now_ms(), ":o": ok, ":m": msg[:300]})
+            return resp(200, {"ok": ok, "message": msg, "detail": detail,
+                              "type": ctype, "connectorId": cid or None})
 
         return resp(404, {"error": f"route {method} {path} tidak ada"})
     except Exception as e:

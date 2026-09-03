@@ -390,6 +390,47 @@ export const adminSetUserRole = (token: string, username: string, role: "user" |
 
 export const signOutAll = (token: string) => apiFetch<{ signedOut: boolean }>("POST", "/admin/signout", token);
 
+// ---------------- konektor (data source ala Claude AI) ----------------
+
+export type ConnectorType = "gdrive" | "onedrive" | "adls" | "sftp" | "api" | "mcp";
+
+export type Connector = {
+  connectorId: string;
+  name: string;
+  type: ConnectorType | string;
+  owner?: string;
+  config?: Record<string, unknown>;
+  status?: "ok" | "failed" | "untested" | string;
+  lastTestAt?: number;
+  lastTestOk?: boolean;
+  lastTestMsg?: string;
+  createdAt?: number;
+  updatedAt?: number;
+};
+
+export type ConnectorTestResult = { ok: boolean; message: string; detail: string };
+
+export const listConnectors = (token: string) =>
+  apiFetch<{ connectors: Connector[] }>("GET", "/connectors", token);
+
+export const createConnector = (
+  token: string, name: string, type: ConnectorType | string, config: Record<string, unknown>,
+) => apiFetch<Connector>("POST", "/connectors", token, { name, type, config });
+
+export const updateConnector = (
+  token: string, connectorId: string, patch: { name?: string; config?: Record<string, unknown> },
+) => apiFetch<Connector>("POST", "/connectors/update", token, { connectorId, ...patch });
+
+export const deleteConnector = (token: string, connectorId: string) =>
+  apiFetch<{ deleted: string }>("DELETE", "/connectors", token, undefined, { id: connectorId });
+
+/** Test koneksi — connectorId opsional (form baru); nilai "•••" dipakai dari tersimpan. */
+export const testConnector = (
+  token: string, connectorId?: string, config?: Record<string, unknown>,
+) =>
+  apiFetch<ConnectorTestResult>("POST", "/connectors/test", token,
+    { connectorId, ...(config ? { config } : {}) });
+
 // ---------------- storage ----------------
 const KEY = "maa.session";
 const REMEMBER_KEY = "maa.remember";

@@ -25,7 +25,7 @@ import { MessageList } from './message-list';
 import { TracePanel } from './trace-panel';
 import { ConfirmModal } from './confirm-modal';
 import { TodoPanel } from './todo-panel';
-import { AdminDrawer, DocsDrawer, KbDrawer, SkillsDrawer } from './drawers';
+import { AdminDrawer, ConnectorDrawer, DocsDrawer, KbDrawer, SkillsDrawer } from './drawers';
 import { ThemeDialog, ThemeSwitcher } from './theme-switcher';
 import { initTheme, type MaaTheme } from './theme';
 
@@ -130,6 +130,7 @@ export function ChatApp({
   const [traceRailOpen, setTraceRailOpen] = useState(true); // rail desktop
   const [kbOpen, setKbOpen] = useState(false);
   const [skillsOpen, setSkillsOpen] = useState(false);
+  const [connectorsOpen, setConnectorsOpen] = useState(false);
   const [docsOpen, setDocsOpen] = useState(false);
   const [adminOpen, setAdminOpen] = useState(false);
   const [themeOpen, setThemeOpen] = useState(false);
@@ -578,6 +579,7 @@ export function ChatApp({
       onOpenDocs={() => { setSidebarOpen(false); setDocsOpen(true); }}
       onOpenKb={() => { setSidebarOpen(false); setKbOpen(true); }}
       onOpenSkills={() => { setSidebarOpen(false); setSkillsOpen(true); }}
+      onOpenConnectors={() => { setSidebarOpen(false); setConnectorsOpen(true); }}
       onOpenAdmin={() => { setSidebarOpen(false); setAdminOpen(true); }}
       onOpenTheme={() => { setSidebarOpen(false); setThemeOpen(true); }}
       canAdmin={me?.role === 'superadmin'}
@@ -899,6 +901,7 @@ export function ChatApp({
 
       <KbDrawer open={kbOpen} onOpenChange={setKbOpen} token={token} notify={notify} />
       <SkillsDrawer open={skillsOpen} onOpenChange={setSkillsOpen} token={token} notify={notify} />
+      <ConnectorDrawer open={connectorsOpen} onOpenChange={setConnectorsOpen} token={token} notify={notify} />
       <DocsDrawer
         open={docsOpen}
         onOpenChange={setDocsOpen}

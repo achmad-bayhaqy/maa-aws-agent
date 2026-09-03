@@ -10,6 +10,7 @@
 - [Ringkasan](#-ringkasan)
 - [Akses Demo](#-akses-demo)
 - [Tampilan Aplikasi](#-tampilan-aplikasi)
+- [Yang Baru di v3.6](#-yang-baru-di-v36)
 - [Yang Baru di v3.5](#-yang-baru-di-v35)
 - [Yang Baru di v3.4.3](#-yang-baru-di-v343)
 - [Yang Baru di v3.4.2](#-yang-baru-di-v342)
@@ -35,6 +36,34 @@ seluruh trajektori agen secara real-time.
 | ![Chat EC2](screenshots/chat-ec2.png) | ![Konfirmasi destruktif](screenshots/konfirmasi-destruktif.png) |
 | **Live Trace di mobile** — setiap event tool terlihat | |
 | ![Live Trace mobile](screenshots/livetrace-mobile.png) | |
+
+## 🔗 Yang Baru di v3.6
+
+**Konektor Data ala Claude AI + perbaikan tampilan gambar di chat.**
+
+### Konektor Data Source (6 tipe, dengan Test Koneksi)
+
+| Tipe | Auth | Test Koneksi |
+|------|------|--------------|
+| **Google Drive** | Access token / refresh token + client ID/secret | Profil Drive user + akses folder |
+| **OneDrive** | Access token / refresh token (Microsoft Graph) | Profil Graph user + root drive |
+| **ADLS Gen2 (Azure)** | SAS token / storage account key (SharedKey signing) | Metadata filesystem |
+| **SFTP** | Password / private key PEM (paramiko) | Login + jumlah entri + hostkey |
+| **REST API Manual** | Method/URL/headers/body + status harapan | Panggilan nyata + preview body |
+| **MCP Server** | URL + headers (Streamable HTTP) | JSON-RPC initialize + serverInfo |
+
+- Sidebar → **Konektor Data**: tambah/edit/hapus + tombol **Test Koneksi** (jalan dari server, hasilnya identik dengan saat agent memakainya)
+- Test gagal selalu memberi **penyebab jelas** (DNS gagal / koneksi ditolak / timeout / HTTP status / auth ditolak)
+- Secret termask (`•••`) di UI — mengosongkan field saat edit berarti nilai lama dipertahankan
+- **Agent bisa memakai konektor di chat**: tool `connector_list` / `connector_browse` / `connector_read` (contoh nyata: baca API produk → agent menyebut nama produk & brand dari data live)
+- Storage: DynamoDB `maa-connectors` per-user (superadmin melihat semua); config lama (Map) & baru (JSON string) dua-duanya didukung
+
+### Perbaikan Gambar/File di Chat (feedback M+N)
+
+- **Akar bug ditemukan**: attachment `type:image` dari agent dibuang frontend (`ArtifactCards` hanya menangani deck/webapp) — kini ada komponen `ImageCards` yang merender gambar langsung dari attachment
+- **Diagnostik error visual** (permintaan "tambahkan about di checknya"): bila gambar gagal dimuat, chat menampilkan panel penyebab (akses ditolak / objek tak ada / jaringan) + URL untuk cek error asli — bukan gambar rusak diam-diam
+- Verifikasi S3: semua objek `gen/`, `decks/`, `apps/` publik 200 OK (tool baru `aws/check_artifacts_access.py` untuk diagnosis + `--fix`)
+- Tool deploy baru: `aws/deploy_connectors.py` (backend konektor) + `aws/deploy_runtime_connectors.py` (runtime in-place update — tanpa delete/recreate, ARN tetap)
 
 ## 🔗 Yang Baru di v3.5
 
