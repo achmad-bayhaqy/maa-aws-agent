@@ -70,9 +70,11 @@ export async function respondNewPasswordRequired(
   throw new Error(`Setelah set password, challenge tak dikenal: ${r.ChallengeName}`);
 }
 
-export async function associateSoftwareToken(session: string): Promise<string> {
+/** Associate TOTP. WAJIB pakai session yang dikembalikan (chained) untuk
+ *  VerifySoftwareToken — memakai session login lama -> "Invalid session for the user". */
+export async function associateSoftwareToken(session: string): Promise<{ secret: string; session: string }> {
   const r = await cognito("AssociateSoftwareToken", { Session: session });
-  return r.SecretCode as string;
+  return { secret: r.SecretCode as string, session: (r.Session as string) || session };
 }
 
 export async function verifySoftwareToken(session: string, code: string): Promise<string> {

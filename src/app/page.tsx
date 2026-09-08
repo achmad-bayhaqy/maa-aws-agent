@@ -117,10 +117,11 @@ export default function Home() {
         setView('new_password');
       } else if (r.kind === 'mfa_setup') {
         setAuthSession(r.session);
-        const sec = await associateSoftwareToken(r.session);
-        setSecret(sec);
+        const a = await associateSoftwareToken(r.session);
+        setSecret(a.secret);
+        setAuthSession(a.session); // sesi chained S2 dari AssociateSoftwareToken (wajib utk Verify)
         setQrData(await QRCode.toDataURL(
-          `otpauth://totp/MAA-Agent:${encodeURIComponent(username.trim())}?secret=${sec}&issuer=MAA%20AWS%20Agent&algorithm=SHA1&digits=6&period=30`,
+          `otpauth://totp/MAA-Agent:${encodeURIComponent(username.trim())}?secret=${a.secret}&issuer=MAA%20AWS%20Agent&algorithm=SHA1&digits=6&period=30`,
           { width: 320, margin: 4, color: { dark: '#000000', light: '#FFFFFF' } }
         ));
         setView('mfa_setup');
@@ -142,10 +143,11 @@ export default function Home() {
         enterChat(r.tokens, 'Kata sandi baru berhasil disimpan.');
       } else if (r.kind === 'mfa_setup') {
         setAuthSession(r.session);
-        const sec = await associateSoftwareToken(r.session);
-        setSecret(sec);
+        const a = await associateSoftwareToken(r.session);
+        setSecret(a.secret);
+        setAuthSession(a.session); // sesi chained S2 dari AssociateSoftwareToken (wajib utk Verify)
         setQrData(await QRCode.toDataURL(
-          `otpauth://totp/MAA-Agent:${encodeURIComponent(username.trim())}?secret=${sec}&issuer=MAA%20AWS%20Agent&algorithm=SHA1&digits=6&period=30`,
+          `otpauth://totp/MAA-Agent:${encodeURIComponent(username.trim())}?secret=${a.secret}&issuer=MAA%20AWS%20Agent&algorithm=SHA1&digits=6&period=30`,
           { width: 320, margin: 4, color: { dark: '#000000', light: '#FFFFFF' } }
         ));
         setView('mfa_setup');
@@ -163,7 +165,17 @@ export default function Home() {
       const ns = await verifySoftwareToken(authSession, code.trim());
       const t = await completeMfaSetup(ns, username.trim());
       enterChat(t, 'MFA TOTP berhasil didaftarkan!');
-    } catch (e) { setError((e as Error).message); }
+    } catch (e) {
+      const err = e as Error & { code?: string };
+      const msg = (err.message || '').toLowerCase();
+      if (err.code === 'ExpiredCodeException' || msg.includes('invalid session') || msg.includes('expired')) {
+        setError('Sesi pendaftaran sudah tidak berlaku. Silakan login ulang lalu ulangi pendaftaran MFA — secret di authenticator tetap bisa dipakai lagi.');
+      } else if (err.code === 'CodeMismatchException' || msg.includes('code mismatch')) {
+        setError('Kode 6 digit tidak cocok. Pastikan jam perangkat akurat, lalu coba kode terbaru.');
+      } else {
+        setError(err.message || 'Pendaftaran MFA gagal.');
+      }
+    }
     finally { setBusy(false); }
   };
 
