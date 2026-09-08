@@ -84,6 +84,18 @@ if not (os.path.exists(f"{PKG}/boto3") and os.path.exists(f"{PKG}/.slimmed")):
                         "--only-binary=:all:", "paramiko", "cryptography", "bcrypt",
                         "pynacl", "cffi", "pycparser"], capture_output=True, text=True)
         log("  + paramiko ARM64 (ulang setelah boto3)")
+# v3.6.2: resvg-py (wheel abi3 self-contained, rust) utk render SVG->PNG dalam
+# vision feedback loop kualitas gambar. Wajib wheel manylinux aarch64 karena
+# runtime AgentCore berjalan di ARM64 (Graviton) - wheel host x86_64 ->
+# CREATE_FAILED/update gagal saat import. Fail-loud: tanpa resvg kualitas
+# gambar turun ke fallback bytes (justru bug 'gambar jelek' yang dikeluhkan).
+if not os.path.exists(f"{PKG}/resvg_py"):
+    subprocess.run([sys.executable, "-m", "pip", "install", "-q", "-t", PKG,
+                    "--no-deps", "--only-binary=:all:",
+                    "--platform", "manylinux2014_aarch64",
+                    "--implementation", "cp", "--python-version", "3.12",
+                    "resvg-py"], check=True)
+    log("  + resvg-py aarch64 (vision feedback loop)")
 if os.path.exists(ZIP_PATH):
     os.remove(ZIP_PATH)
 with zipfile.ZipFile(ZIP_PATH, "w", zipfile.ZIP_DEFLATED) as z:

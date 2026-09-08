@@ -267,7 +267,9 @@ rt_policy = {
             "dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem", "dynamodb:Query"],
          "Resource": [f"arn:aws:dynamodb:{REGION}:{ACCOUNT_ID}:table/{st['sessions_table']}",
                       f"arn:aws:dynamodb:{REGION}:{ACCOUNT_ID}:table/{st['sessions_table']}/index/*",
-                      f"arn:aws:dynamodb:{REGION}:{ACCOUNT_ID}:table/{st['confirm_table']}"]},
+                      f"arn:aws:dynamodb:{REGION}:{ACCOUNT_ID}:table/{st['confirm_table']}",
+                      # v3.6.3: runtime menulis jadwal tugas terjadwal
+                      f"arn:aws:dynamodb:{REGION}:{ACCOUNT_ID}:table/{st.get('schedules_table', 'maa-agent-schedules')}"]},
         {"Sid": "STSExec", "Effect": "Allow", "Action": ["sts:AssumeRole"],
          "Resource": st["exec_role_arn"]},
         {"Sid": "VectorIndex", "Effect": "Allow", "Action": ["s3vectors:QueryVectors", "s3vectors:GetVectors"],
@@ -300,19 +302,39 @@ except Exception as e:
     log(f"  exec trust warn: {str(e)[:150]}")
 
 gw_role_arn = ensure_role(GW_ROLE, svc_trust("bedrock-agentcore.amazonaws.com"), "MAA gateway")
-iam.put_role_policy(RoleName=GW_ROLE, PolicyName="maa-agent-gateway-policy", PolicyDocument=json.dumps({
-    "Version": "2012-10-17",
-    "Statement": [
+
+
+def _gw_policy_doc(gw_resource):
+    """Policy role gateway. Sep 2026: attach Policy Engine kini menjalankan
+    probe 'GenesisPolicyEngineCheck' yang butuh bedrock-agentcore:AuthorizeAction
+    pada RESOURCE GATEWAY (bukan hanya policy-engine)."""
+    return {"Version": "2012-10-17", "Statement": [
         {"Sid": "InvokeTargets", "Effect": "Allow", "Action": ["lambda:InvokeFunction"],
          "Resource": f"arn:aws:lambda:{REGION}:{ACCOUNT_ID}:function:{GW_FN}*"},
         {"Sid": "PolicyEngineRead", "Effect": "Allow", "Action": [
             "bedrock-agentcore:GetPolicyEngine", "bedrock-agentcore:GetPolicy",
-            "bedrock-agentcore:ListPolicies", "bedrock-agentcore:AuthorizeAction"],
+            "bedrock-agentcore:ListPolicies"],
          "Resource": f"arn:aws:bedrock-agentcore:{REGION}:{ACCOUNT_ID}:policy-engine/*"},
+        {"Sid": "PolicyEngineAuthorize", "Effect": "Allow",
+         "Action": ["bedrock-agentcore:AuthorizeAction",
+                    "bedrock-agentcore:PartiallyAuthorizeActions"],
+         "Resource": [gw_resource,
+                      f"arn:aws:bedrock-agentcore:{REGION}:{ACCOUNT_ID}:policy-engine/*"]},
         {"Sid": "Logs", "Effect": "Allow", "Action": [
             "logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"],
          "Resource": f"arn:aws:logs:{REGION}:{ACCOUNT_ID}:*"},
-    ]}))
+    ]}
+
+
+# saat bootstrap gateway belum ada -> wildcard; dipersempit ke ARN spesifik
+# setelah gateway terbentuk (least privilege, docs AgentCore security BP).
+# CATATAN Sep 2026: probe attach Policy Engine (GenesisPolicyEngineCheck)
+# memeriksa AuthorizeAction SEQUENTIAL: gateway -> policy-engine -> policies.
+# AuthorizeAction pada policy-engine wajib tetap ada (resource policy-engine
+# dipertahankan wildcard karena id engine dibuat belakangan di alur ini).
+iam.put_role_policy(RoleName=GW_ROLE, PolicyName="maa-agent-gateway-policy",
+                    PolicyDocument=json.dumps(_gw_policy_doc(
+                        f"arn:aws:bedrock-agentcore:{REGION}:{ACCOUNT_ID}:gateway/*")))
 wait_role(GW_ROLE)
 log(f"  {GW_ROLE} ok")
 
@@ -503,6 +525,9 @@ for i in range(40):
     time.sleep(5)
 st["gateway_id"], st["gateway_url"] = gateway_id, gw_url
 st["gateway_arn"] = bac.get_gateway(gatewayIdentifier=gateway_id)["gatewayArn"]
+# persempit AuthorizeAction ke ARN gateway spesifik (least privilege)
+iam.put_role_policy(RoleName=GW_ROLE, PolicyName="maa-agent-gateway-policy",
+                    PolicyDocument=json.dumps(_gw_policy_doc(st["gateway_arn"])))
 save_state(st)
 
 # target
@@ -625,9 +650,52 @@ except Exception as e:
     else:
         log("  = workload identity sudah ada (auto-registered runtime)")
 ci_id = st.get("ci_id")
-# v3.5: Code Interpreter WAJIB networkMode INTERNET (permintaan user: scraping
-# Python — mis. Google Play Store — harus bisa akses internet; pip install juga).
-CI_NETWORK = {"networkMode": "INTERNET"}
+# v3.5: Code Interpreter WAJIB networkMode dengan akses internet (permintaan
+# user: scraping Python — mis. Google Play Store — harus bisa akses internet;
+# pip install juga).
+# API CHANGE Sep 2026: enum networkMode kini [SANDBOX, VPC, PUBLIC, ISOLATED]
+# — 'INTERNET' dihapus dari kontrak API (ValidationException bila dipakai).
+# 'PUBLIC' = pengganti resminya (akses jaringan publik). Coba INTERNET dulu
+# utk kompatibilitas akun/SDK lama, fallback ke PUBLIC.
+def _ci_net_candidates():
+    return [{"networkMode": "INTERNET"}, {"networkMode": "PUBLIC"}]
+
+
+def _ci_create():
+    last = None
+    for net in _ci_net_candidates():
+        try:
+            return bac.create_code_interpreter(
+                name="maacodeinterpreter",
+                description="Sandbox Python online: analisis data, chart, scraping web (AgentCore Code Interpreter)",
+                networkConfiguration=net,
+                tags={"Project": "maa-agent", "MAA": "true"})["codeInterpreterId"]
+        except Exception as e:
+            last = e
+            if "already" in str(e).lower() or "Conflict" in str(e):
+                break
+            if "enum value set" in str(e):
+                continue  # enum tak dikenal di API ini - coba kandidat berikut
+            raise
+    raise last
+
+
+def _ci_ensure_net(cid):
+    """Pastikan CI punya networkMode ber-internet (INTERNET/PUBLIC)."""
+    cur = bac.get_code_interpreter(codeInterpreterId=cid)
+    mode = ((cur.get("codeInterpreter") or {}).get("networkConfiguration") or {}).get("networkMode", "")
+    if mode in ("INTERNET", "PUBLIC"):
+        return mode
+    for net in _ci_net_candidates():
+        try:
+            bac.update_code_interpreter(codeInterpreterId=cid, networkConfiguration=net)
+            log(f"  CI networkMode {mode} -> {net['networkMode']} (fitur scraping aktif)")
+            return net["networkMode"]
+        except Exception as e:
+            if "enum value set" in str(e):
+                continue
+            raise
+    return mode
 # v4.0: validasi ci_id dari state — kalau sudah dihapus di akun, cari ulang
 if ci_id:
     try:
@@ -643,11 +711,7 @@ if not ci_id:
             break
 if not ci_id:
     try:
-        ci_id = bac.create_code_interpreter(
-            name="maacodeinterpreter",
-            description="Sandbox Python online: analisis data, chart, scraping web (AgentCore Code Interpreter)",
-            networkConfiguration=CI_NETWORK,
-            tags={"Project": "maa-agent", "MAA": "true"})["codeInterpreterId"]
+        ci_id = _ci_create()
     except Exception as e:
         if "Conflict" not in str(e) and "already" not in str(e).lower():
             log(f"  CI warn: {str(e)[:150]}")
@@ -657,19 +721,20 @@ if not ci_id:
                 ci_id = c["codeInterpreterId"]
                 break
 if ci_id:
-    # pastikan interpreter lama tidak terjebak SANDBOX (tanpa internet)
+    # pastikan interpreter lama tidak terjebak mode tanpa internet
     try:
-        cur = bac.get_code_interpreter(codeInterpreterId=ci_id)
-        mode = ((cur.get("codeInterpreter") or {}).get("networkConfiguration") or {}).get("networkMode", "")
-        if mode and mode != "INTERNET":
-            bac.update_code_interpreter(codeInterpreterId=ci_id, networkConfiguration=CI_NETWORK)
-            log(f"  CI networkMode {mode} -> INTERNET (fitur scraping aktif)")
+        _ci_ensure_net(ci_id)
     except Exception as e:
         if "update" in str(e).lower() or "not supported" in str(e).lower():
             log(f"  CI update warn: {str(e)[:120]}")
 if ci_id:
     st["ci_id"] = ci_id
-    log(f"  code interpreter: {ci_id} (INTERNET)")
+    try:
+        _mode = ((bac.get_code_interpreter(codeInterpreterId=ci_id).get("codeInterpreter") or {})
+                 .get("networkConfiguration") or {}).get("networkMode", "?")
+    except Exception:
+        _mode = "?"
+    log(f"  code interpreter: {ci_id} ({_mode})")
 save_state(st)
 
 # ================================================================ 9. Evaluator + Online Evaluation

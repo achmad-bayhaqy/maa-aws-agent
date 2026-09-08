@@ -67,7 +67,7 @@ log(f"zip built: {os.path.getsize(ZIP_PATH) / 1e6:.1f} MB")
 r = s3.put_object(Bucket=ART, Key=S3_KEY, Body=open(ZIP_PATH, "rb").read(),
                   ServerSideEncryption="aws:kms", SSEKMSKeyId=st["kms_key_id"],
                   ContentType="application/zip")
-version_id = r["VersionId"]
+version_id = r.get("VersionId", "")  # kosong bila bucket belum versioned
 
 env = {
     "SESSIONS_TABLE": st["sessions_table"],

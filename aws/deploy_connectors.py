@@ -126,7 +126,9 @@ auths = apig.get_authorizers(restApiId=api_id)["items"]
 auth_id = next((a["id"] for a in auths if a["name"] == "maa-cognito-authorizer"), None)
 fn_arn = lam.get_function(FunctionName=EDGE_FN)["Configuration"]["FunctionArn"]
 
-root_id = apig.get_resources(restApiId=api_id, limit=1)["items"][0]["id"]
+# root API = resource dengan path "/" (bukan items[0] - urutan tak terjamin;
+# bug lama: root ter-resolve ke /admin/signout -> tree /connectors salah tempat)
+root_id = next(r["id"] for r in apig.get_resources(restApiId=api_id, limit=400)["items"] if r["path"] == "/")
 resources = {r["path"]: r["id"] for r in apig.get_resources(restApiId=api_id, limit=400)["items"]}
 resources[""] = root_id
 ROUTES = [

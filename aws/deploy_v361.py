@@ -121,6 +121,7 @@ auth_id = next((a["id"] for a in auths if a["name"] == "maa-cognito-authorizer")
 fn_arn = lam.get_function(FunctionName=EDGE_FN)["Configuration"]["FunctionArn"]
 
 resources = {r["path"]: r["id"] for r in apig.get_resources(restApiId=api_id, limit=400)["items"]}
+resources[""] = next(r["id"] for r in apig.get_resources(restApiId=api_id, limit=400)["items"] if r["path"] == "/")
 ROUTES = [
     ("/connectors/oauth/settings", ["GET", "POST", "OPTIONS"]),
     ("/connectors/oauth/start", ["GET", "OPTIONS"]),

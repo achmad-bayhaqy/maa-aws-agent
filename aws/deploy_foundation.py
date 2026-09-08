@@ -127,7 +127,7 @@ def ensure_bucket(name, versioned=False, cors=False, tls_kms_policy=False):
 
 
 ensure_bucket(KB_BUCKET, versioned=True, cors=True, tls_kms_policy=True)
-ensure_bucket(ART_BUCKET, versioned=False, cors=False, tls_kms_policy=True)
+ensure_bucket(ART_BUCKET, versioned=True, cors=False, tls_kms_policy=True)
 st["kb_bucket"] = KB_BUCKET
 st["art_bucket"] = ART_BUCKET
 save_state(st)

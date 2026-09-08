@@ -39,6 +39,15 @@ else:
         DeletionProtection="ACTIVE",
         UsernameConfiguration={"CaseSensitive": False},
         UserPoolTags={"Project": "maa-agent"},
+        # custom:role = peran user (superadmin|admin|viewer) utk fine-grained
+        # authz (best practice: Cognito groups + atribut peran, docs AWS).
+        # CATATAN API: param CreateUserPool = "Schema" (bukan SchemaAttributes);
+        # custom attr TIDAK bisa ditambah belakangan via UpdateUserPool.
+        Schema=[
+            {"Name": "role", "AttributeDataType": "String",  # -> custom:role (prefix otomatis)
+             "Mutable": True,
+             "StringAttributeConstraints": {"MinLength": "1", "MaxLength": "64"}},
+        ],
     )
     pool_id = resp["UserPool"]["Id"]
     # Enable TOTP MFA (REQUIRED) - this API version uses SetUserPoolMfaConfig
@@ -73,8 +82,10 @@ else:
         IdTokenValidity=60,
         RefreshTokenValidity=30,  # days
         TokenValidityUnits={"AccessToken": "minutes", "IdToken": "minutes", "RefreshToken": "days"},
-        ReadAttributes=["email", "preferred_username"],
-        WriteAttributes=["email", "preferred_username"],
+        # custom:role wajib readable agar claim role ikut dalam ID token
+        # (is_superadmin di edge lambda membaca custom:role).
+        ReadAttributes=["email", "preferred_username", "custom:role"],
+        WriteAttributes=["email", "preferred_username", "custom:role"],
     )
     st["app_client_id"] = client["UserPoolClient"]["ClientId"]
     save_state(st)

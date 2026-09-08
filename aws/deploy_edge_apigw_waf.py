@@ -168,7 +168,8 @@ if not api_id:
     save_state(st)
     log(f"+ REST API created: {api_id}")
 
-root_id = apig.get_resources(restApiId=api_id)["items"][0]["id"]
+# root API = resource dengan path "/" (bukan items[0] - urutan tak terjamin)
+root_id = next(r["id"] for r in apig.get_resources(restApiId=api_id)["items"] if r["path"] == "/")
 
 # authorizer
 auths = apig.get_authorizers(restApiId=api_id)["items"]
