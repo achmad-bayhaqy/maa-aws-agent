@@ -121,7 +121,7 @@ export default function Home() {
         setSecret(sec);
         setQrData(await QRCode.toDataURL(
           `otpauth://totp/MAA-Agent:${encodeURIComponent(username.trim())}?secret=${sec}&issuer=MAA%20AWS%20Agent&algorithm=SHA1&digits=6&period=30`,
-          { width: 220, margin: 1, color: { dark: '#111111', light: '#FFFFFF' } }
+          { width: 320, margin: 4, color: { dark: '#000000', light: '#FFFFFF' } }
         ));
         setView('mfa_setup');
       } else {
@@ -146,7 +146,7 @@ export default function Home() {
         setSecret(sec);
         setQrData(await QRCode.toDataURL(
           `otpauth://totp/MAA-Agent:${encodeURIComponent(username.trim())}?secret=${sec}&issuer=MAA%20AWS%20Agent&algorithm=SHA1&digits=6&period=30`,
-          { width: 220, margin: 1, color: { dark: '#111111', light: '#FFFFFF' } }
+          { width: 320, margin: 4, color: { dark: '#000000', light: '#FFFFFF' } }
         ));
         setView('mfa_setup');
       } else if (r.kind === 'mfa_challenge') {
@@ -447,7 +447,7 @@ export default function Home() {
                 <li className="flex items-center gap-1.5"><span className="flex h-5 w-5 items-center justify-center rounded-full border border-[var(--line)] text-[9.5px] font-bold">2</span> Masukkan kode 6 digit</li>
               </ol>
               <div className="flex flex-col items-center gap-3">
-                {qrData && <img src={qrData} alt="QR pendaftaran MFA TOTP" width={190} height={190} className="rounded-[10px] border border-[var(--line)] p-1.5" />}
+                {qrData && <img src={qrData} alt="QR pendaftaran MFA TOTP" width={260} height={260} className="rounded-[10px] border border-[var(--line)] bg-white p-2" />}
                 <div className="w-full">
                   <p className="mb-1 text-[10px] font-semibold uppercase tracking-wider text-[var(--muted-fg)]">Secret key (entry manual)</p>
                   <code className="block select-all break-all rounded-lg border border-[var(--line-soft)] bg-[var(--surface)] p-2.5 text-center font-mono text-[11px] text-[var(--ink)]">{secret}</code>
