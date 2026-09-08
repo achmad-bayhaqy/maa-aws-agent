@@ -759,7 +759,10 @@ def handler(event, context):
             r = cog.admin_create_user(
                 UserPoolId=USER_POOL_ID, Username=username,
                 UserAttributes=[{"Name": "email", "Value": email},
-                                {"Name": "email_verified", "Value": "true"}],
+                                {"Name": "email_verified", "Value": "true"},
+                                # v3.6.4: tulis custom:role sejak pembuatan — sebelumnya
+                                # hanya group yang di-set, attribute kosong
+                                {"Name": "custom:role", "Value": role}],
                 DesiredDeliveryMediums=["EMAIL"],
                 # MessageAction default = SEND: Cognito mengirim email undangan
                 # (temp password) via sender default no-reply@verificationemail.com
