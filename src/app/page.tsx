@@ -7,9 +7,9 @@ import {
 } from 'lucide-react';
 import { useToast } from '@/hooks/use-toast';
 import {
-  associateSoftwareToken, clearSession, completeMfaSetup, getMe, loadSession, login,
-  respondMfaChallenge, respondNewPasswordRequired, saveSession, verifySoftwareToken,
-  type MeInfo, type Tokens,
+  associateSoftwareToken, clearSession, completeMfaSetup, ensureFreshTokens, getMe, jwtClaims,
+  loadSession, login, refreshTokens, respondMfaChallenge, respondNewPasswordRequired, saveSession,
+  verifySoftwareToken, type MeInfo, type Tokens,
 } from '@/lib/maa';
 import { ChatApp } from '@/components/maa/chat-app';
 import { Logo } from '@/components/maa/logo';
@@ -66,9 +66,24 @@ export default function Home() {
     if (saved) setRemember(true);
     const s = loadSession();
     if (s) {
-      setTokens(s.tokens);
-      setUsername(s.username);
-      setView('chat');
+      // v3.6.4: sesi tersimpan wajib dicek — bila IdToken hangus, coba refresh;
+      // refresh gagal (token lama/lingkungan beda) -> buang sesi, kembali ke login.
+      // Tanpa ini, sesi mati di-restore dan /me gagal -> role diam-diam jadi 'user'.
+      setBooting(false);
+      void (async () => {
+        try {
+          const fresh = await ensureFreshTokens(s.tokens);
+          if (fresh !== s.tokens) {
+            saveSession(s.username, fresh, saved);
+          }
+          setUsername(s.username);
+          setTokens(fresh);
+          setView('chat');
+        } catch {
+          clearSession();
+          setBooting(false);
+        }
+      })();
     } else {
       setBooting(false);
     }
@@ -83,7 +98,20 @@ export default function Home() {
         const m = await getMe(tokens.IdToken);
         if (alive) setMe({ ...m, role: m.role || 'user' });
       } catch {
-        if (alive) {
+        // v3.6.4: /me gagal — bila token hangus coba refresh sekali lalu ulang;
+        // tanpa ini tab lama (>1 jam) diam-diam turun grade jadi 'user'.
+        let recovered = false;
+        if (tokens.RefreshToken) {
+          try {
+            const fresh = await refreshTokens(tokens.RefreshToken);
+            if (!alive) return;
+            const uname = username || String(jwtClaims(fresh.IdToken)['cognito:username'] || 'user');
+            saveSession(uname, fresh, localStorage.getItem('maa.remember.user') === '1');
+            setTokens(fresh);
+            recovered = true;
+          } catch { /* refresh gagal -> fallback di bawah */ }
+        }
+        if (!recovered && alive) {
           // /me belum tersedia — jangan blokir chat; anggap user biasa
           setMe({ userId: username || 'user', username: username || 'user', role: 'user' });
         }

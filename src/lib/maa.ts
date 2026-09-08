@@ -112,6 +112,45 @@ export async function revokeToken(refreshToken: string): Promise<void> {
   }
 }
 
+// ---------------- token freshness (v3.6.4) ----------------
+/** Decode payload JWT (lokal, tanpa verifikasi — hanya utk cek exp). */
+export function jwtClaims(token: string): Record<string, unknown> {
+  try {
+    const p = token.split(".")[1] || "";
+    return JSON.parse(atob(p + "=".repeat((4 - (p.length % 4)) % 4)));
+  } catch {
+    return {};
+  }
+}
+
+/** IdToken hangus? (skew 60s; tanpa exp dianggap hangus). */
+export function idTokenExpired(token: string, skewSec = 60): boolean {
+  const exp = Number(jwtClaims(token)?.exp || 0);
+  return !exp || Date.now() / 1000 >= exp - skewSec;
+}
+
+/** REFRESH_TOKEN_AUTH: perbarui IdToken/AccessToken. RefreshToken lama dipakai ulang
+ *  bila Cognito tidak mengembalikan yang baru. Claim (custom:role, grup) terbaca
+ *  TERKINI pada IdToken baru — sesi lama sebelum role di-set ikut terbarui. */
+export async function refreshTokens(refreshToken: string): Promise<Tokens> {
+  const r = await cognito("InitiateAuth", {
+    AuthFlow: "REFRESH_TOKEN_AUTH",
+    AuthParameters: { REFRESH_TOKEN: refreshToken },
+    ClientId: CONFIG.clientId,
+  });
+  const a = r.AuthenticationResult;
+  if (!a?.IdToken) throw new Error("Sesi hangus — silakan login ulang");
+  return { IdToken: a.IdToken, AccessToken: a.AccessToken, RefreshToken: a.RefreshToken || refreshToken };
+}
+
+/** Pastikan token masih hidup; refresh otomatis bila expired.
+ *  Throw bila tidak ada refresh token / refresh ditolak → pemanggil wajib paksa re-login. */
+export async function ensureFreshTokens(t: Tokens): Promise<Tokens> {
+  if (!idTokenExpired(t.IdToken)) return t;
+  if (!t.RefreshToken) throw new Error("Sesi hangus — silakan login ulang");
+  return refreshTokens(t.RefreshToken);
+}
+
 // ---------------- API (contract v3) ----------------
 function authHeaders(token: string): Record<string, string> {
   return { Authorization: `Bearer ${token}`, "Content-Type": "application/json" };
