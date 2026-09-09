@@ -16,7 +16,9 @@ import time
 import uuid
 import zipfile
 import io
+import base64
 import datetime
+import threading
 
 import boto3
 import urllib3
@@ -50,7 +52,9 @@ KB_DOCS_PREFIX = "docs/"
 KB_SKILLS_PREFIX = "skills/"
 
 FAST_MODEL = "amazon.nova-micro-v1:0"
-DEEP_MODEL = "openai.gpt-oss-120b-1:0"
+# v3.6.5: DEEP -> Kimi K2.5 (agentic tool-calling terbaik tanpa geo-block;
+# gpt-oss-120b cenderung menulis function-call sbg teks + <reasoning> bocor ke final)
+DEEP_MODEL = "moonshotai.kimi-k2.5"
 # v3.6.2: mesin gambar vektor premium (fallback Nova Canvas karena legacy/EOL).
 # Model diurutkan dari kualitas SVG terbaik (hasil benchmark 2026-09-03:
 # qwen3-32b 7.7KB/83 elem/7 grad vs gpt-oss 4.9KB/50 vs maverick 2.6KB/33).
@@ -384,6 +388,83 @@ def gw_call_tool(name, args):
     return out if out else {"status": "ok"}
 
 
+# ---------------------------------------------------------------- native web fallbacks (v3.7)
+# Gateway webtool (bing-rss) sering mengembalikan hasil tidak relevan dan AgentCore
+# Browser bisa 403 saat handshake. Runtime berjalan di networkMode PUBLIC, jadi
+# pencarian/fetch LANGSUNG dari runtime adalah jalur primer yang jauh lebih andal.
+_BROWSER_UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+               "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
+_webhttp = urllib3.PoolManager(num_pools=8, timeout=urllib3.Timeout(connect=8, read=25))
+
+
+def _strip_html(raw):
+    """HTML -> teks bersih (tanpa script/style/tag) utk konteks model."""
+    raw = re.sub(r"<(script|style|noscript)[\s\S]*?</\1>", " ", raw, flags=re.I)
+    raw = re.sub(r"<br\s*/?>|</p>|</div>|</li>|</h[1-6]>|</tr>", "\n", raw, flags=re.I)
+    raw = re.sub(r"<[^>]+>", " ", raw)
+    raw = (raw.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
+              .replace("&quot;", '"').replace("&#39;", "'").replace("&nbsp;", " "))
+    return re.sub(r"[ \t]+", " ", re.sub(r"\n{3,}", "\n\n", raw)).strip()
+
+
+def _native_search(query, max_results=6):
+    """DuckDuckGo HTML (primer) + DDG Lite (cadangan). Return list hasil atau []."""
+    from urllib.parse import quote, unquote, parse_qs, urlparse
+    body = f"q={quote(str(query)[:400])}".encode()
+    hdrs = {"User-Agent": _BROWSER_UA, "content-type": "application/x-www-form-urlencoded",
+            "Accept-Language": "en-US,en;q=0.9,id;q=0.8"}
+    out = []
+    for endpoint in ("https://html.duckduckgo.com/html/", "https://lite.duckduckgo.com/lite/"):
+        try:
+            r = _webhttp.request("POST", endpoint, body=body, headers=hdrs)
+            if r.status != 200:
+                continue
+            txt = r.data.decode("utf-8", "ignore")
+            raw_links = re.findall(r'<a[^>]+class="result__a"[^>]+href="([^"]+)"[^>]*>([\s\S]*?)</a>', txt)
+            if not raw_links:
+                raw_links = re.findall(r'<a[^>]+href="([^"]+)"[^>]*class="result__a"[^>]*>([\s\S]*?)</a>', txt)
+            snippets = re.findall(r'class="result__snippet"[^>]*>([\s\S]*?)</a>', txt)
+            for i, (href, title) in enumerate(raw_links[:max_results * 2]):
+                if "uddg=" in href:
+                    try:
+                        href = unquote(parse_qs(urlparse(href).query).get("uddg", [href])[0])
+                    except Exception:
+                        pass
+                if href.startswith("//"):
+                    href = "https:" + href
+                if not href.startswith("http"):
+                    continue
+                snip = _strip_html(snippets[i]) if i < len(snippets) else ""
+                out.append({"url": href[:400], "title": _strip_html(title)[:180], "snippet": snip[:300]})
+                if len(out) >= max_results:
+                    break
+            if out:
+                return out
+        except Exception:
+            continue
+    return out
+
+
+def _native_fetch(url, max_chars=7000):
+    """Fetch langsung via urllib3 + ekstraksi teks. Raise bila gagal/terblokir.
+    Return (text, status_code, content_type)."""
+    hdrs = {"User-Agent": _BROWSER_UA, "Accept": "text/html,application/xhtml+xml,"
+            "application/json;q=0.9,text/plain;q=0.8,*/*;q=0.7",
+            "Accept-Language": "en-US,en;q=0.9,id;q=0.8"}
+    r = _webhttp.request("GET", str(url)[:2000], headers=hdrs)
+    if r.status >= 400:
+        raise RuntimeError(f"HTTP {r.status}")
+    ctype = (r.headers.get("content-type") or "").lower()
+    raw = r.data.decode("utf-8", "ignore")
+    if "html" in ctype or raw.lstrip()[:1] == "<":
+        txt = _strip_html(raw)
+    else:
+        txt = raw
+    if len(txt) < 40:
+        raise RuntimeError("konten terlalu pendek (kemungkinan halaman JS/anti-bot)")
+    return txt[:max_chars], r.status, ctype
+
+
 # ---------------------------------------------------------------- model catalog
 _MODELS = {"ts": 0, "by_id": {}}
 
@@ -428,6 +509,52 @@ TOOLS = [
     _ts("aws_create_vpc", "Buat VPC lengkap: VPC + subnet + IGW + route table + security group bernama.",
         {"name": {"type": "string"}, "cidr": {"type": "string"}, "subnet_cidr": {"type": "string"}},
         ["name"]),
+    _ts("aws_create_ec2",
+        "Buat instance EC2 lengkap siap-SSH: key pair, security group (port 22 + port layanan), IP publik, "
+        "dan instance profile SSM agar bisa dikendalikan via aws_ec2_run_command. "
+        "os: al2023 (user: ec2-user) atau ubuntu24 (user: ubuntu). "
+        "user_data = script bash yang JALAN OTOMATIS saat boot pertama. KONVENSI WAJIB user_data: baris awal "
+        "'exec > /var/log/maa-install.log 2>&1' agar semua log install bisa diperiksa, dan akhiri dengan "
+        "echo MAA-INSTALL-DONE. Instalasi berat taruh di user_data (paralel saat boot). "
+        "JANGAN buat duplikat: bila instance bernama sama sudah ada, tool mengembalikan status=exists — "
+        "lanjutkan pakai instance itu. "
+        "Private key PEM dikembalikan SEKALI di response — WAJIB tampilkan ke pengguna + simpan aman.",
+        {"name": {"type": "string"},
+         "instance_type": {"type": "string", "description": "default t3.small; t3.medium utk multi-service/docker/node"},
+         "os": {"type": "string", "enum": ["al2023", "ubuntu24"]},
+         "ports": {"type": "array", "items": {"type": "integer"},
+                    "description": "port TCP yang dibuka ke publik, selain 22 yang selalu terbuka"},
+         "user_data": {"type": "string"},
+         "subnet_id": {"type": "string"},
+         "key_name": {"type": "string"},
+         "force": {"type": "boolean", "description": "true = tetap buat baru walau nama sudah dipakai"}},
+        ["name"]),
+    _ts("aws_ec2_wait_ssm",
+        "Tunggu instance EC2 online di SSM (butuh 1-3 menit setelah launch). Panggil setelah aws_create_ec2 "
+        "sebelum aws_ec2_run_command — ULANGI panggilan ini bila ssm_online masih false. Kembalikan IP publik "
+        "+ status SSM + progress cloud-init (user_data sedang jalan atau selesai).",
+        {"instance_id": {"type": "string"}, "wait_seconds": {"type": "integer"}},
+        ["instance_id"]),
+    _ts("aws_ec2_run_command",
+        "Jalankan perintah shell (bash, sebagai root) di instance EC2 via SSM Run Command — utk install "
+        "software, konfigurasi service, verifikasi (curl/ss -tlnp/systemctl). commands = array baris shell. "
+        "Poll otomatis sampai selesai (maks ~100s); bila masih jalan -> status=running, lanjutkan dgn "
+        "aws_ec2_command_status.",
+        {"instance_id": {"type": "string"},
+         "commands": {"type": "array", "items": {"type": "string"}},
+         "comment": {"type": "string"},
+         "timeout_s": {"type": "integer"}},
+        ["instance_id", "commands"]),
+    _ts("aws_ec2_command_status",
+        "Cek status SSM command yang masih berjalan (dari aws_ec2_run_command yang mengembalikan status=running). "
+        "Kembalikan status terkini + output bila selesai.",
+        {"command_id": {"type": "string"}, "instance_id": {"type": "string"}},
+        ["command_id", "instance_id"]),
+    _ts("aws_ec2_open_ports",
+        "Buka port TCP tambahan di security group instance EC2 (mis. web service di port 3000/8080/8000).",
+        {"instance_id": {"type": "string"},
+         "ports": {"type": "array", "items": {"type": "integer"}}},
+        ["instance_id", "ports"]),
     _ts("aws_create_s3_bucket", "Buat S3 bucket terenkripsi (opsional versioning). Nama unik global lowercase.",
         {"name": {"type": "string"}, "versioning": {"type": "boolean"}}, ["name"]),
     _ts("aws_create_dynamodb_table", "Buat tabel DynamoDB on-demand.",
@@ -772,6 +899,7 @@ def _todos_save(sid, todos):
 
 
 _LAST_TODOS = {}
+_WAIT_SSM_CALLS = {}  # (sid, instance_id) -> jumlah panggilan offline beruntun (anti-loop)
 
 
 # ---------------------------------------------------------------- skills library (v3.5)
@@ -1249,14 +1377,62 @@ def exec_tool(name, args, sid=None, attachments=None, user_id=None, username=Non
         return {"status": "error", "message": f"action {act} tidak dikenal (create|list|delete)"}
 
     # ---- Web tools via AgentCore Gateway (MCP) ----
-    if name in GATEWAY_TOOLS:
+    if name == "web_search":
+        # v3.7: PRIMER = pencarian native DuckDuckGo (relevansi jauh lebih baik
+        # daripada bing-rss gateway yang sering tak nyambung). Gateway hanya cadangan.
+        q = str(args.get("query", "")).strip()
+        k = max(1, min(int(args.get("max_results") or 6), 10))
+        if not q:
+            return {"status": "error", "message": "query kosong"}
+        try:
+            res = _native_search(q, k)
+        except Exception:
+            res = []
+        if res:
+            return {"status": "ok", "engine": "duckduckgo-native", "count": len(res), "results": res,
+                    "note": "Baca halaman yang relevan dengan web_fetch(url)."}
         try:
             out = gw_call_tool(name, args)
             put_trace(sid or "-", "gateway", f"{name} via AgentCore Gateway OK", model=None)
             return out
         except Exception as e:
-            return {"status": "error", "via": "gateway",
-                    "message": f"Gateway gagal: {str(e)[:200]}. Coba lagi nanti atau gunakan pengetahuan internal."}
+            return {"status": "error", "via": "gateway+native",
+                    "message": f"native DDG & gateway gagal: {str(e)[:160]}. "
+                               "Lanjutkan dengan pengetahuan internal / verifikasi langsung di server."}
+
+    if name == "web_fetch":
+        # v3.7: PRIMER = fetch native dari runtime (networkMode PUBLIC). Cepat dan
+        # andal utk GitHub/README/docs. js=True atau native gagal -> AgentCore Browser.
+        url = str(args.get("url", "")).strip()
+        mc = max(2000, min(int(args.get("max_chars") or 7000), 20000))
+        if not url:
+            return {"status": "error", "message": "url kosong"}
+        if not re.match(r"^https?://", url):
+            return {"status": "error", "message": "url harus http(s)"}
+        native_err = None
+        try:
+            txt, code, ctype = _native_fetch(url, mc)
+            return {"status": "ok", "engine": "native-fetch", "http": code, "url": url[:300],
+                    "content": txt, "length": len(txt),
+                    "note": "Gunakan bagian yang relevan; jangan kutip seluruh konten di jawaban."}
+        except Exception as e:
+            native_err = str(e)[:160]
+        if not args.get("js"):
+            # coba sekali lagi via gateway bila native gagal (anti-bot dkk.)
+            try:
+                out = gw_call_tool(name, {**args, "max_chars": mc})
+                put_trace(sid or "-", "gateway", f"web_fetch via Browser OK (native gagal: {native_err})", model=None)
+                return out
+            except Exception as e2:
+                return {"status": "error", "native_error": native_err,
+                        "message": f"native fetch gagal ({native_err}); browser: {str(e2)[:160]}"}
+        try:
+            out = gw_call_tool(name, {**args, "max_chars": mc})
+            put_trace(sid or "-", "gateway", f"web_fetch(js) via Browser OK", model=None)
+            return out
+        except Exception as e2:
+            return {"status": "error", "native_error": native_err,
+                    "message": f"native fetch gagal ({native_err}); browser: {str(e2)[:160]}"}
 
     # ---- Code Interpreter (AgentCore, sandbox) ----
     if name == "code_interpreter":
@@ -1628,6 +1804,333 @@ def exec_tool(name, args, sid=None, attachments=None, user_id=None, username=Non
             return {"status": "ok", "action": "resize", "id": iid, "new_type": itype}
         return {"status": "error", "message": f"aksi {act} tidak dikenal"}
 
+    if name == "aws_create_ec2":
+        ec2 = sess.client("ec2")
+        nm = re.sub(r"[^A-Za-z0-9-]", "-", str(args.get("name", "vm"))).strip("-")[:40] or "vm"
+        # 0) v3.7 anti-duplikat: instance hidup dengan Name sama -> JANGAN buat baru
+        force = str(args.get("force", "")).lower() in ("1", "true", "yes")
+        if not force:
+            try:
+                live = ec2.describe_instances(Filters=[
+                    {"Name": "tag:Name", "Values": [nm]},
+                    {"Name": "instance-state-name",
+                     "Values": ["pending", "running", "stopping", "stopped"]}])["Reservations"]
+                ex = [i for res_ in live for i in res_["Instances"]]
+                if ex:
+                    i0 = ex[0]
+                    prof = (i0.get("IamInstanceProfile", {}) or {}).get("Arn", "")
+                    return {"status": "exists", "instance_id": i0["InstanceId"], "name": nm,
+                            "state": i0["State"]["Name"], "public_ip": i0.get("PublicIpAddress", ""),
+                            "private_ip": i0.get("PrivateIpAddress", ""),
+                            "instance_type": i0["InstanceType"], "ssm_profile": bool(prof),
+                            "message": f"Instance '{nm}' SUDAH ADA ({i0['InstanceId']}, state={i0['State']['Name']}) — JANGAN buat duplikat.",
+                            "default_action": "continue",
+                            "note": ("WAJIB (default): LANJUTKAN dengan instance ini — panggil aws_ec2_wait_ssm."
+                                     + (" Bila ssm_profile=false, wait_ssm otomatis SELF-HEAL (memasang profile SSM "
+                                        "+ reboot) lalu verifikasi via aws_ec2_run_command."
+                                        if not prof else
+                                        " Setelah SSM online, verifikasi via aws_ec2_run_command.")
+                                     + " JANGAN terminate dan JANGAN buat instance baru — kecuali pengguna "
+                                       "EKSPLISIT meminta dibuat ulang dari nol (baru gunakan aws_delete_resource "
+                                       "yang memicu konfirmasi ganda).")}
+            except Exception:
+                pass
+        itype = args.get("instance_type", "t3.small")
+        os_choice = args.get("os", "al2023")
+        ports = sorted({int(p) for p in (args.get("ports") or []) if p}) or []
+        user_data = str(args.get("user_data") or "")
+        key_name = re.sub(r"[^A-Za-z0-9-]", "-", str(args.get("key_name") or f"maa-{nm}")).strip("-")[:60]
+
+        # 1) key pair (reuse bila sudah ada)
+        key_material = None
+        try:
+            ec2.describe_key_pairs(KeyNames=[key_name])
+            key_note = f"key pair {key_name} sudah ada (dipakai ulang)"
+        except Exception:
+            kp = ec2.create_key_pair(KeyName=key_name)
+            key_material = kp["KeyMaterial"]
+            key_note = f"key pair baru {key_name} dibuat — tampilkan PEM ke pengguna SEKALI ini"
+
+        # 2) VPC/subnet: default VPC kecuali subnet_id eksplisit
+        if args.get("subnet_id"):
+            subnet_id = args["subnet_id"]
+            vpc_id = ec2.describe_subnets(SubnetIds=[subnet_id])["Subnets"][0]["VpcId"]
+        else:
+            vpc_id = next(v["VpcId"] for v in ec2.describe_vpcs()["Vpcs"] if v.get("IsDefault"))
+            subnet_id = ec2.describe_subnets(Filters=[{"Name": "vpc-id", "Values": [vpc_id]},
+                                                      {"Name": "default-for-az", "Values": ["true"]}])["Subnets"][0]["SubnetId"]
+
+        # 3) security group dgn port 22 + port layanan (idempotent)
+        sg_name = f"maa-{nm}-sg"
+        sgs = ec2.describe_security_groups(Filters=[{"Name": "group-name", "Values": [sg_name]},
+                                                    {"Name": "vpc-id", "Values": [vpc_id]}])["SecurityGroups"]
+        if sgs:
+            sg_id = sgs[0]["GroupId"]
+        else:
+            sg_id = ec2.create_security_group(GroupName=sg_name, Description=f"MAA {nm}",
+                                              VpcId=vpc_id,
+                                              TagSpecifications=[_tags("security-group", sg_name)])["GroupId"]
+        wanted = {22} | set(ports)
+        existing = {r["FromPort"] for g in ec2.describe_security_groups(GroupIds=[sg_id])["SecurityGroups"]
+                    for r in g.get("IpPermissions", []) if r.get("IpProtocol") == "tcp"}
+        for p in sorted(wanted - existing):
+            ec2.authorize_security_group_ingress(GroupId=sg_id, IpPermissions=[{
+                "IpProtocol": "tcp", "FromPort": p, "ToPort": p,
+                "IpRanges": [{"CidrIp": "0.0.0.0/0", "Description": f"MAA port {p}"}]}])
+
+        # 4) AMI terbaru (x86_64) via describe_images
+        if os_choice == "ubuntu24":
+            amis = ec2.describe_images(Owners=["099720109477"], Filters=[
+                {"Name": "name", "Values": ["ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-amd64-server-*"]},
+                {"Name": "state", "Values": ["available"]}])["Images"]
+            ssh_user = "ubuntu"
+        else:
+            amis = ec2.describe_images(Owners=["amazon"], Filters=[
+                {"Name": "name", "Values": ["al2023-ami-2023.*-kernel-6.1-x86_64"]},
+                {"Name": "state", "Values": ["available"]}])["Images"]
+            ssh_user = "ec2-user"
+        if not amis:
+            return {"status": "error", "message": f"AMI utk os={os_choice} tidak ditemukan"}
+        ami = sorted(amis, key=lambda x: x["CreationDate"])[-1]
+
+        # 5) RunInstances + SSM instance profile + user-data
+        run_kw = dict(ImageId=ami["ImageId"], InstanceType=itype, KeyName=key_name,
+                      MinCount=1, MaxCount=1,
+                      NetworkInterfaces=[{"DeviceIndex": 0, "SubnetId": subnet_id,
+                                          "Groups": [sg_id], "AssociatePublicIpAddress": True}],
+                      TagSpecifications=[{"ResourceType": "instance", "Tags": [
+                          {"Key": "Name", "Value": nm}, {"Key": "Project", "Value": "maa-agent"},
+                          {"Key": "ManagedBy", "Value": "MAA"}]}],
+                      BlockDeviceMappings=[{"DeviceName": "/dev/xvda" if os_choice == "al2023" else "/dev/sda1",
+                                            "Ebs": {"VolumeSize": 20, "VolumeType": "gp3"}}])
+        ssm_profile = os.environ.get("SSM_INSTANCE_PROFILE", "maa-agent-ssm-profile")
+        ssm_note = "SSM: instance profile terpasang"
+        # v3.7 FIX: get_instance_profile adalah API IAM — versi lama memanggilnya di
+        # client EC2 (AttributeError -> tertangkap except) sehingga instance SELALU
+        # diluncurkan tanpa SSM profile dan verifikasi post-install tidak pernah jalan.
+        try:
+            sess.client("iam").get_instance_profile(InstanceProfileName=ssm_profile)
+            run_kw["IamInstanceProfile"] = {"Name": ssm_profile}
+        except Exception:
+            ssm_note = ("SSM: instance profile tidak ditemukan — hanya SSH; "
+                        "hubungi admin untuk membuat profile SSM")
+        if user_data:
+            run_kw["UserData"] = base64.b64encode(user_data.encode()).decode()
+        try:
+            inst = ec2.run_instances(**run_kw)["Instances"][0]
+        except Exception as re_err:
+            # defensif: bila profil bermasalah, coba sekali lagi TANPA SSM profile
+            if "IamInstanceProfile" in run_kw and ("profile" in str(re_err).lower()
+                                                   or "iam" in str(re_err).lower()):
+                run_kw.pop("IamInstanceProfile", None)
+                ssm_note = "SSM: profile gagal dilekatkan (launch tanpa SSM)"
+                inst = ec2.run_instances(**run_kw)["Instances"][0]
+            else:
+                raise
+        iid = inst["InstanceId"]
+        ec2.get_waiter("instance_running").wait(InstanceIds=[iid], WaiterConfig={"Delay": 5, "MaxAttempts": 18})
+        d = ec2.describe_instances(InstanceIds=[iid])["Reservations"][0]["Instances"][0]
+        ip = d.get("PublicIpAddress", "")
+
+        # 6) simpan private key ke artifacts (privat, SSE-KMS) bila baru
+        key_url = ""
+        if key_material:
+            kkey = f"keys/{nm}-{uuid.uuid4().hex[:6]}.pem"
+            get_client("s3").put_object(Bucket=ART_BUCKET, Key=kkey, Body=key_material.encode(),
+                                        ServerSideEncryption="aws:kms",
+                                        ContentType="text/plain")
+            key_url = f"s3://{ART_BUCKET}/{kkey}"
+
+        return {"status": "ok", "instance_id": iid, "name": nm, "public_ip": ip,
+                "instance_type": itype, "os": os_choice, "ssh_user": ssh_user,
+                "key_name": key_name, "private_key_pem": (key_material or "") ,
+                "key_saved_to": key_url, "security_group_id": sg_id,
+                "open_ports": sorted(wanted), "subnet_id": subnet_id, "vpc_id": vpc_id,
+                "ami_id": ami["ImageId"], "state": d.get("State", {}).get("Name"),
+                "ssm": ssm_note, "key_note": key_note,
+                "next_step": "panggil aws_ec2_wait_ssm lalu aws_ec2_run_command utk install layanan"}
+
+    if name == "aws_ec2_wait_ssm":
+        ec2, ssm = sess.client("ec2"), sess.client("ssm")
+        iid = args["instance_id"]
+        # v3.7: invocation runtime dibatasi ~240s oleh AgentCore -> tunggu MAKS 40s,
+        # sisanya agent cukup memanggil ulang tool ini (murah, tanpa blokir lama).
+        wait_s = min(int(args.get("wait_seconds", 35) or 35), 40)
+        # v3.7: anti-loop tak berujung — bila 2x panggilan dalam sesi sama masih
+        # offline, paksa agent berhenti dan melapor + minta 'lanjut'.
+        global _WAIT_SSM_CALLS
+        ckey = (sid or "-", iid)
+        _WAIT_SSM_CALLS[ckey] = _WAIT_SSM_CALLS.get(ckey, 0) + 1
+        t0 = time.time()
+        online = False
+        healed = ""
+        while time.time() - t0 < wait_s:
+            # v3.7 SELF-HEAL: instance tanpa SSM profile -> lekatkan + reboot sekali
+            try:
+                d0 = ec2.describe_instances(InstanceIds=[iid])["Reservations"][0]["Instances"][0]
+                if d0["State"]["Name"] == "running" and not d0.get("IamInstanceProfile"):
+                    ssm_profile = os.environ.get("SSM_INSTANCE_PROFILE", "maa-agent-ssm-profile")
+                    try:
+                        sess.client("iam").get_instance_profile(InstanceProfileName=ssm_profile)
+                        ec2.associate_iam_instance_profile(
+                            IamInstanceProfile={"Name": ssm_profile}, InstanceId=iid)
+                        ec2.reboot_instances(InstanceIds=[iid])
+                        healed = (f"profile SSM '{ssm_profile}' dilekatkan + reboot — "
+                                  "menunggu SSM agent registrasi ulang")
+                        put_trace(sid or "-", "self_heal", f"wait_ssm: {healed} ({iid})")
+                    except Exception as he:
+                        healed = f"gagal self-heal profile: {str(he)[:120]}"
+                        break
+            except Exception:
+                pass
+            try:
+                infos = ssm.describe_instance_information(MaxResults=50).get("InstanceInformationList", [])
+                if any(i.get("InstanceId") == iid and i.get("PingStatus") == "Online"
+                       for i in infos):
+                    online = True
+                    break
+            except Exception as e:
+                put_trace(sid or "-", "error", f"wait_ssm describe diag: {str(e)[:120]}")
+            time.sleep(8)
+        d = ec2.describe_instances(InstanceIds=[iid])["Reservations"][0]["Instances"][0]
+        # v3.7: ikutkan progress cloud-init (user_data) + ssm profile bila online
+        cloud_init = ""
+        if online:
+            try:
+                cidr_ = ssm.send_command(InstanceIds=[iid], DocumentName="AWS-RunShellScript",
+                                         Comment="MAA cloud-init check",
+                                         Parameters={"commands": [
+                                             "cloud-init status; tail -3 /var/log/maa-install.log 2>/dev/null || true"],
+                                             "executionTimeout": ["60"]})["Command"]["CommandId"]
+                for _w in range(10):
+                    time.sleep(5)
+                    try:
+                        inv = ssm.get_command_invocation(CommandId=cidr_, InstanceId=iid)
+                        if inv["Status"] in ("Success", "Failed"):
+                            cloud_init = (inv.get("StandardOutputContent", "") or "")[:600]
+                            break
+                    except Exception as ee:
+                        if "not found" in str(ee).lower() or "not exist" in str(ee).lower():
+                            continue
+                        break
+            except Exception:
+                pass
+        prof = bool(d.get("IamInstanceProfile"))
+        if online:
+            _WAIT_SSM_CALLS.pop(ckey, None)
+        else:
+            attempts = _WAIT_SSM_CALLS.get(ckey, 1)
+            if attempts >= 2:
+                return {"status": "still_offline", "instance_id": iid, "ssm_online": False,
+                        "public_ip": d.get("PublicIpAddress", ""),
+                        "state": d.get("State", {}).get("Name"),
+                        "ssm_profile_attached": prof, "attempts": attempts,
+                        "self_heal": healed or None,
+                        "message": "SSM masih offline setelah 2 pengecekan + usaha self-heal.",
+                        "note": "STOP memanggil tool ini. LAPORKAN progres ke pengguna sekarang "
+                                "(instance id, IP publik, state, status SSM) dan minta mereka bilang "
+                                "'lanjut' untuk mengecek lagi nanti. JANGAN buat instance baru."}
+        return {"status": "ok", "instance_id": iid, "ssm_online": online,
+                "public_ip": d.get("PublicIpAddress", ""),
+                "state": d.get("State", {}).get("Name"), "ssm_profile_attached": prof,
+                "self_heal": healed or None,
+                "cloud_init": cloud_init or "(belum diketahui)",
+                "note": ("SSM siap — lanjut aws_ec2_run_command (cek cloud-init status --wait dulu)"
+                         if online else
+                         ("SSM belum online (biasanya 1-3 menit) — panggil ulang tool ini" if prof else
+                          "SSM tak akan online: instance diluncurkan TANPA SSM instance profile — "
+                          "terminate & buat ulang via aws_create_ec2"))}
+
+    if name in ("aws_ec2_run_command", "aws_ec2_command_status"):
+        ssm = sess.client("ssm")
+
+        def _ssm_ping(iid_):
+            """PingStatus instance di SSM: 'Online' / 'ConnectionLost' / 'Inactive' / ''.
+            v3.7 FIX: filter Key='InstanceId' menyebabkan ValidationException (key invalid
+            utk DescribeInstanceInformation) sehingga runtime SELALU menganggap SSM
+            offline — pakai list penuh + filter sisi-klien."""
+            try:
+                infos = ssm.describe_instance_information(MaxResults=50).get("InstanceInformationList", [])
+                return next((i.get("PingStatus", "") for i in infos
+                             if i.get("InstanceId") == iid_), "")
+            except Exception as e:
+                put_trace(sid or "-", "error", f"ssm ping diag: {str(e)[:120]}")
+                return ""
+
+        def _inv_not_ready(e):
+            """InvocationDoesNotExist = command belum dipungut agent -> RETRY, bukan error.
+            (v3.7 fix: pesan AWS berisi 'not found' — versi lama hanya cek 'not exist',
+            sehingga tool langsung error 0.2s dan verifikasi SSM selalu gagal.)"""
+            s = str(e).lower()
+            return ("invocationdoesnotexist" in s or "not exist" in s
+                    or "not found" in s or "does not exist" in s)
+
+        if name == "aws_ec2_run_command":
+            iid = args["instance_id"]
+            commands = [str(c) for c in (args.get("commands") or []) if str(c).strip()]
+            if not commands:
+                return {"status": "error", "message": "commands kosong"}
+            ping = _ssm_ping(iid)
+            if ping != "Online":
+                return {"status": "ssm_offline", "instance_id": iid, "ping_status": ping or "not-registered",
+                        "message": "SSM agent belum Online di instance ini.",
+                        "note": "Panggil aws_ec2_wait_ssm dulu (1-3 menit setelah launch); bila tetap "
+                                "offline, periksa IAM instance profile (maa-agent-ssm-profile) saat launch."}
+            tmo = min(int(args.get("timeout_s", 300) or 300), 3600)
+            r = ssm.send_command(
+                InstanceIds=[iid], DocumentName="AWS-RunShellScript",
+                Comment=str(args.get("comment", "MAA agent"))[:100],
+                TimeoutSeconds=tmo,
+                Parameters={"commands": commands, "executionTimeout": [str(tmo)]})
+            cid = r["Command"]["CommandId"]
+        else:
+            cid, iid = args["command_id"], args["instance_id"]
+        wait_s = min(int(args.get("timeout_s", 75) or 75), 90) if name == "aws_ec2_run_command" else 25
+        t0 = time.time()
+        no_inv_since = time.time()
+        while True:
+            try:
+                inv = ssm.get_command_invocation(CommandId=cid, InstanceId=iid)
+                no_inv_since = None
+                st_ = inv["Status"]
+                if st_ in ("Success", "Failed", "Cancelled", "TimedOut"):
+                    return {"status": "ok", "command_id": cid, "result": st_,
+                            "stdout": inv.get("StandardOutputContent", "")[:6000],
+                            "stderr": inv.get("StandardErrorContent", "")[:3000]}
+            except Exception as e:
+                if _inv_not_ready(e):
+                    pass  # invocation belum terlihat — poll lagi
+                else:
+                    return {"status": "error", "message": str(e)[:250]}
+            now = time.time()
+            if now - t0 > wait_s:
+                if no_inv_since and now - no_inv_since > 40 and _ssm_ping(iid) != "Online":
+                    return {"status": "ssm_offline", "command_id": cid, "instance_id": iid,
+                            "message": "Command terkirim tapi SSM agent tidak Online — invocation tak akan diproses.",
+                            "note": "Cek IAM instance profile & reboot via aws_ec2_action(start/stop), lalu ulangi."}
+                return {"status": "running", "command_id": cid,
+                        "note": "perintah masih berjalan — tunggu ~20-30s lalu panggil aws_ec2_command_status"}
+            time.sleep(6)
+
+    if name == "aws_ec2_open_ports":
+        ec2 = sess.client("ec2")
+        iid, ports = args["instance_id"], sorted({int(p) for p in (args.get("ports") or []) if p})
+        d = ec2.describe_instances(InstanceIds=[iid])["Reservations"][0]["Instances"][0]
+        sg_id = d["SecurityGroups"][0]["GroupId"]
+        existing = {r["FromPort"] for g in ec2.describe_security_groups(GroupIds=[sg_id])["SecurityGroups"]
+                    for r in g.get("IpPermissions", []) if r.get("IpProtocol") == "tcp"}
+        opened = []
+        for p in ports:
+            if p in existing:
+                continue
+            ec2.authorize_security_group_ingress(GroupId=sg_id, IpPermissions=[{
+                "IpProtocol": "tcp", "FromPort": p, "ToPort": p,
+                "IpRanges": [{"CidrIp": "0.0.0.0/0", "Description": f"MAA port {p}"}]}])
+            opened.append(p)
+        return {"status": "ok", "instance_id": iid, "sg_id": sg_id, "opened_ports": opened,
+                "public_ip": d.get("PublicIpAddress", ""),
+                "note": "port terbuka dari 0.0.0.0/0 — akses via http://<public_ip>:<port>"}
+
     if name == "aws_create_vpc":
         ec2 = sess.client("ec2")
         cidr = args.get("cidr", "10.100.0.0/16")
@@ -1861,6 +2364,49 @@ DISIPLIN TOOL
 - Analisis biaya: aws_cost_analysis. Diagnosis log: aws_logs_inspect.
 - Bila tool gagal: analisis error, koreksi parameter, panggil ulang (self-healing).
 
+PROVISIONING SERVER & LAYANAN DI EC2 (WAJIB — JANGAN PERNAH MENOLAK)
+- Permintaan "buatkan server/vm/EC2 + install X + akses publik" SELALU BISA dikerjakan end-to-end dengan tool EC2 provisioning. JANGAN menjawab "tidak bisa" atau hanya memberi tutorial — EKSEKUSI.
+- Alur baku:
+  1. task_plan (susun langkah).
+  2. (opsional, maks 3 call) web_search/web_fetch utk cara install software yang diminta. web_search/web_fetch kini native & andal; GitHub README selalu bisa dibaca.
+  3. aws_create_ec2: name, instance_type (t3.small utk service ringan, t3.medium utk multi-service/node/docker), os (al2023 -> user ec2-user; ubuntu24 -> user ubuntu, apt), ports utk layanan web, user_data = script bash bootstrap. Bila tool mengembalikan status=exists -> JANGAN buat duplikat: lanjutkan pakai instance lama (dengan SSM + run_command) atau tanyakan pengguna bila mau dibuat ulang.
+  4. TAMPILKAN private key PEM dari hasil aws_create_ec2 ke pengguna (hanya muncul sekali — wajib disampaikan).
+  5. aws_ec2_wait_ssm sampai ssm_online=true (panggil ULANG bila belum; 1-3 menit). Bila tool bilang instance tanpa SSM profile -> terminate & buat ulang.
+  6. aws_ec2_run_command utk VERIFIKASI & konfigurasi lanjutan:
+     a. "cloud-init status --wait" (tunggu user_data selesai; maks ~2x panggilan)
+     b. "tail -30 /var/log/maa-install.log" (diagnosis bila gagal)
+     c. "systemctl is-active <svc>; curl -s -o /dev/null -w '%{http_code}' http://localhost:PORT; ss -tlnp | grep <port>"
+     Bila Failed -> baca stderr, perbaiki via run_command berikutnya (self-healing). Bila ssm_offline -> aws_ec2_wait_ssm ulang.
+  7. aws_ec2_open_ports bila ada port layanan yang belum terbuka.
+  8. LAPORAN AKHIR WAJIB berisi: perintah SSH lengkap (ssh -i key.pem <user>@<public_ip>), IP publik + instance id, URL akses tiap layanan (http://<public_ip>:<port>), lokasi file key (s3://...), dan bukti verifikasi nyata per layanan (output curl/systemctl — bukan dikira-kira). Bila sebuah layanan memang CLI-only (mis. hermes), jelaskan cara memakainya via SSH.
+- KONVENSI user_data (WAJIB): baris pertama setelah shebang: "exec > /var/log/maa-install.log 2>&1"; setiap langkah diberi echo "== step =="; akhiri dengan "echo MAA-INSTALL-DONE". idempotent (pakai apt-get -y, --no-install-recommends; systemctl enable --now).
+- RESEP TERVERIFIKASI (uji hidup 2026-09-09 di akun ini, pakai tanpa riset ulang):
+  * 9Router (github.com/decolua/9router v0.5.69 — dashboard + API proxy AI, port 20128): butuh Node 22.
+    PENTING: `9router` polos adalah launcher interaktif — di server headless (systemd tanpa TTY) ia
+    menerima stdin EOF lalu "Exiting..." crash-loop. WAJIB mode background: cli.js --tray --skip-update.
+    user_data: Node 22 (curl -fsSL https://deb.nodesource.com/setup_22.x | bash -; apt-get install -y
+    nodejs), "npm install -g 9router", unit systemd:
+      [Service]
+      User=ubuntu
+      Environment=TRAY_MODE=1
+      ExecStart=/usr/bin/node /usr/lib/node_modules/9router/cli.js --tray --skip-update -p 20128
+      Restart=always
+      RestartSec=5
+    systemctl daemon-reload && systemctl enable --now 9router. Buka port 20128.
+    Verifikasi: systemctl is-active 9router; systemctl show 9router -p NRestarts (harus kecil/0);
+    curl -s -o /dev/null -w '%{http_code}' http://localhost:20128/dashboard -> 200/307.
+    Akses publik: http://<ip>:20128/dashboard (API: /v1).
+  * Hermes Agent (github.com/NousResearch/hermes-agent v0.21.1 — CLI/TUI + gateway messaging):
+    "sudo -u ubuntu bash -lc 'curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash'"
+    di user_data (installer menyiapkan uv+Python 3.11, 4-8 menit; selesai dengan pesan
+    "Reload your shell"). Verifikasi: "sudo -u ubuntu bash -lc 'hermes --version'". Ini aplikasi CLI —
+    akses publiknya lewat SSH: pengguna login ssh lalu jalankan `hermes`. Sebutkan itu di laporan.
+  * Aplikasi docker umum: apt-get install -y docker.io docker-compose-v2; systemctl enable --now docker; docker compose -f ... up -d.
+- PEM HILANG / key pair sudah ada tapi private key tidak dimiliki (dibuat sesi lain):
+  buat akses SSH BARU via aws_ec2_run_command di instance: (1) "ssh-keygen -t ed25519 -f /home/ubuntu/.ssh/maa-access -N '' -q" (2) "cat /home/ubuntu/.ssh/maa-access.pub >> /home/ubuntu/.ssh/authorized_keys" (3) "cat /home/ubuntu/.ssh/maa-access" — tampilkan private key ini ke pengguna + instruksi "ssh -i maa-access ubuntu@<ip>". Jangan berhenti hanya karena PEM lama tidak ada.
+- Prinsip waktu: anggaran satu giliran agent ±4 MENIT (AgentCore memotong lebih panjang itu). Tool yang menunggu (aws_ec2_wait_ssm 35-40s, aws_ec2_run_command 60-75s) boleh max 2-3 panggilan per giliran; sisanya cukup PANGGIL ULANG tool-nya di giliran sama (murah). Bila pekerjaan belum selesai dan hasil tool masih "belum siap", laporkan progres nyata (ID/IP/status) dan minta pengguna bilang "lanjut" — lanjutkan dari fase terakhir, jangan mulai dari nol. Instance yang sudah ada TIDAK dibuat ulang.
+- Hemat biaya: instance type terkecil yang memadai; sebutkan estimasi biaya/jam di laporan akhir.
+
 MEMORI & KONTEKS
 - Anda mungkin menerima blok [MEMORI JANGKA PANJANG] berisi fakta sesi-sesi sebelumnya dari AgentCore Memory. Gunakan untuk kontinuitas; jangan tanya ulang hal yang sudah diketahui.
 - Bila pengguna meminta "ingat X", ucapkan bahwa Anda akan mengingatnya, dan pastikan poin X tercantum eksplisit di jawaban Anda (sistem mencatatnya ke memori otomatis).
@@ -1939,13 +2485,13 @@ def route_model(mode, model_id, agent_mode="STANDARD"):
     if mode == "FAST" and not heavy:
         return FAST_MODEL, {"maxTokens": 900, "temperature": 0.2, "topP": 0.9}, None, True
     if mode == "DEEP" or (mode == "FAST" and heavy):
-        return DEEP_MODEL, {"maxTokens": 9000 if not heavy else 12000, "temperature": 0.3, "topP": 0.9}, \
+        return DEEP_MODEL, {"maxTokens": 14000 if not heavy else 20000, "temperature": 0.3, "topP": 0.9}, \
             {"reasoning_effort": "high"}, False
     if mode == "MANUAL":
         mid = model_id or FAST_MODEL
         meta = model_meta(mid) or {}
         extra = {"reasoning_effort": "high"} if meta.get("reasoning") and "gpt-oss" in mid else None
-        return mid, {"maxTokens": 12000 if heavy else 6000, "temperature": 0.4, "topP": 0.9}, extra, \
+        return mid, {"maxTokens": 16000 if heavy else 8000, "temperature": 0.4, "topP": 0.9}, extra, \
             bool(meta.get("cacheSupported"))
     return FAST_MODEL, {"maxTokens": 900, "temperature": 0.2, "topP": 0.9}, None, True
 
@@ -1962,6 +2508,56 @@ TEXT_EXTS = {"txt", "md", "csv", "json", "log", "yaml", "yml", "xml", "html",
              "sh", "sql", "ini", "conf", "toml", "env", "tsv"}
 
 
+def _repair_tool_pairs(messages):
+    """v3.6.5: pastikan setiap toolUse (assistant) langsung diikuti SATU user message
+    yang memuat toolResult utk SEMUA toolUseId-nya. Perbaiki otomatis bila ada
+    hasil ganda / terpisah / hilang (mis. karena respons terpotong max_tokens)."""
+    out = []
+    i = 0
+    n = len(messages)
+    while i < n:
+        m = messages[i]
+        out.append(m)
+        if m.get("role") == "assistant":
+            ids = [c["toolUse"]["toolUseId"] for c in m.get("content", []) if "toolUse" in c]
+            if ids:
+                got, consumed, j = {}, [], i + 1
+                while j < n and messages[j].get("role") == "user":
+                    has_tr, rest = False, []
+                    for c in messages[j].get("content", []):
+                        tr = c.get("toolResult") if isinstance(c, dict) else None
+                        if tr and tr.get("toolUseId") in ids and tr["toolUseId"] not in got:
+                            got[tr["toolUseId"]] = tr
+                            has_tr = True
+                        else:
+                            rest.append(c)
+                    if has_tr:
+                        consumed.append(rest)
+                        j += 1
+                    else:
+                        break  # user message tanpa toolResult -> berhenti (pesan biasa)
+                if j > i + 1:
+                    results = [{"toolResult": got[tid]} for tid in ids if tid in got]
+                    for tid in ids:
+                        if tid not in got:
+                            results.append({"toolResult": {"toolUseId": tid, "status": "error",
+                                            "content": [{"text": "(hasil tool hilang karena respons terpotong)"}]}})
+                    out.append({"role": "user", "content": results})
+                    # konten non-toolResult (mis. instruksi teks) dilepas kembali sebagai pesan sendiri
+                    for leftover in consumed:
+                        if leftover:
+                            out.append({"role": "user", "content": leftover})
+                    i = j
+                    continue
+                # tidak ada user berikutnya dgn hasil -> isi error utk semua
+                out.append({"role": "user", "content": [
+                    {"toolResult": {"toolUseId": tid, "status": "error",
+                     "content": [{"text": "(hasil tool hilang karena respons terpotong)"}]}}
+                    for tid in ids]})
+        i += 1
+    return out
+
+
 def call_converse(model_id, messages, inference, extra, use_cache, with_tools=True, with_guardrail=True, agent_mode="STANDARD", system_extra=""):
     system_text = SYSTEM_PROMPT + MODE_PROMPTS.get(agent_mode or "", "")
     if system_extra:
@@ -1969,7 +2565,7 @@ def call_converse(model_id, messages, inference, extra, use_cache, with_tools=Tr
     system = [{"text": system_text}]
     if use_cache:
         system.append({"cachePoint": {"type": "default"}})
-    kwargs = dict(modelId=model_id, messages=messages, system=system, inferenceConfig=inference)
+    kwargs = dict(modelId=model_id, messages=_repair_tool_pairs(messages), system=system, inferenceConfig=inference)
     if extra:
         kwargs["additionalModelRequestFields"] = extra
     if with_tools:
@@ -2218,8 +2814,20 @@ def handle_chat(payload):
     last_err_tool = None
     tools_disabled = False
     guardrail_hit = False
+    research_calls = 0
+    research_nudged = False
     try:
         max_iter = LOOP_LIMITS.get(agent_mode, 8)
+        # v3.7: provisioning EC2 end-to-end butuh iterasi banyak (riset+create+wait+
+        # verifikasi+self-heal). Naikkan budget loop otomatis tanpa mengubah mode UI.
+        _m_low = message.lower()
+        _prov_kw = ("ec2", "vm ", "vps", "instance", "server", "install",
+                    "provision", "learning-vm", "deploy")
+        if any(k in _m_low for k in _prov_kw) and \
+                any(k in _m_low for k in ("buat", "bikin", "create", "launch", "install",
+                                          "pasang", "setup", "provision", "deploy")):
+            max_iter = max(max_iter, LOOP_LIMITS["LONG"])
+            put_trace(sid, "thinking", f"Tugas provisioning terdeteksi -> loop budget {max_iter}")
         for iteration in range(max_iter):
             with_tools = not tools_disabled
             try:
@@ -2323,8 +2931,41 @@ def handle_chat(payload):
                     else:
                         try:
                             t0 = time.time()
+                            # v3.6.5: code_interpreter yang membawa URL http dihitung sbg riset
+                            # (menutup celah riset tanpa batas via CI)
+                            is_ci_research = (tname == "code_interpreter" and
+                                              bool(re.search(r"https?://", str(targs.get("code", "")))))
+                            if tname in GATEWAY_TOOLS or is_ci_research:
+                                research_calls += 1
+                            # v3.6.5: HARD BLOCK riset setelah 12x (web + CI riset gabungan)
+                            if (tname in GATEWAY_TOOLS or is_ci_research) and research_calls > 12:
+                                put_trace(sid, "thinking",
+                                          f"Riset diblokir keras ({research_calls - 1}x sebelumnya) - paksa eksekusi", model=model)
+                                tool_results.append({"toolResult": {
+                                    "toolUseId": tu["toolUseId"], "status": "error",
+                                    "content": [{"text":
+                                        f"BATAS RISET TERCAPAI ({research_calls - 1} call web+code). Riset ditutup — "
+                                        "termasuk fetch via code_interpreter. Informasi yang sudah terkumpul CUKUP. "
+                                        "WAJIB sekarang: (1) task_plan bila belum ada, "
+                                        "(2) EKSEKUSI: aws_create_ec2 dgn user_data lengkap (git clone + install "
+                                        "dilakukan DARI instance yang punya IP bersih — bebas rate-limit), "
+                                        "(3) aws_ec2_wait_ssm, (4) aws_ec2_run_command utk install + verifikasi. "
+                                        "GitHub 429 saat riset BUKAN alasan menunda — install di server tidak kena limit."}]}})
+                                continue  # lanjut toolUse berikutnya di batch yang sama (jangan pecah pasangan)
                             result = exec_tool(tname, targs, sid=sid, attachments=attachments,
                                                user_id=user_id, username=username)
+                            # v3.6.5: anggaran riset — setelah 6x, sisipkan perintah eksekusi
+                            # di dalam hasil tool (aman utk semua model, tanpa pesan ekstra)
+                            if (tname in GATEWAY_TOOLS or is_ci_research) and research_calls >= 6 and not research_nudged:
+                                research_nudged = True
+                                if isinstance(result, dict):
+                                    result["system_note"] = (
+                                        f"Riset sudah {research_calls}x — CUKUP. Mulai SEKARANG eksekusi nyata: "
+                                        "task_plan bila belum ada, lalu aws_create_ec2 (user_data lengkap), "
+                                        "aws_ec2_wait_ssm, aws_ec2_run_command utk install+verifikasi. "
+                                        "Detail install bisa diverifikasi di server nanti — jangan riset lagi.")
+                                put_trace(sid, "thinking",
+                                          f"Anggaran riset habis ({research_calls}x) - dorong eksekusi", model=model)
                             dt = time.time() - t0
                             put_trace(sid, "tool_result",
                                       f"{tname} ({dt:.1f}s) -> {json.dumps(result, ensure_ascii=False)[:1000]}", model=model)
@@ -2359,9 +3000,74 @@ def handle_chat(payload):
                 conv.append({"role": "user", "content": tool_results})
                 continue
 
-            final_text = "".join(c.get("text", "") for c in out["content"] if "text" in c).strip()
+            raw_text = "".join(c.get("text", "") for c in out["content"] if "text" in c).strip()
+            # v3.6.5: gpt-oss kadang mengalirkan reasoning sebagai teks <reasoning>...</reasoning>.
+            # Bila respons terpotong (max_tokens) DI TENGAH reasoning, jangan pernah jadi jawaban final.
+            if stop == "max_tokens" and iteration < max_iter - 1:
+                for chunk in re.findall(r"<reasoning>(.*?)</reasoning>", raw_text, re.S):
+                    put_trace(sid, "thinking", f"[cot-reasoning] {chunk[:700]}", model=model)
+                put_trace(sid, "thinking", "Respons terpotong (max_tokens) - minta model melanjutkan", model=model)
+                # v3.6.5: bila assistant terpotong saat menulis toolUse, wajib tutup dgn
+                # toolResult error agar pasangan tool valid utk Converse
+                dangling = [{"toolResult": {
+                    "toolUseId": c["toolUse"]["toolUseId"], "status": "error",
+                    "content": [{"text": "Respons model terpotong saat menyusun pemanggilan tool. "
+                                          "Panggil ulang tool ini dengan parameter yang sama bila masih diperlukan, "
+                                          "lalu lanjutkan tugas."}]}}
+                    for c in out["content"] if "toolUse" in c]
+                if dangling:
+                    conv.append({"role": "user", "content": dangling})
+                else:
+                    conv.append({"role": "user", "content": [{"text":
+                        "Respons kamu terpotong di batas token. Lanjutkan TEPAT dari titik terakhir. "
+                        "Prioritaskan EKSEKUSI tool untuk menyelesaikan tugas pengguna; "
+                        "jangan mengulang analisis yang sudah selesai."}]})
+                continue
+            final_text = raw_text
+            if "<reasoning>" in final_text:
+                for chunk in re.findall(r"<reasoning>(.*?)</reasoning>", final_text, re.S):
+                    put_trace(sid, "thinking", f"[cot-reasoning] {chunk[:700]}", model=model)
+                final_text = re.sub(r"<reasoning>.*?</reasoning>", "", final_text, flags=re.S).strip()
+                final_text = re.sub(r"</?reasoning>", "", final_text).strip()
+            # v3.6.5: rescue — model menulis function-call sebagai TEKS
+            # {"function": "x", "arguments": {...}} / {"name": "x", "arguments": {...}}
+            # -> parse & EKSEKUSI nyata, jangan diterima sbg jawaban final.
+            _mjson = re.search(r'\{\s*"(?:function|name)"\s*:\s*"[A-Za-z0-9_]+"[^{}]*?"arguments"\s*:\s*\{', final_text)
+            if _mjson and iteration < max_iter - 1 and not tools_disabled:
+                _cand = None
+                try:
+                    _dec = json.JSONDecoder()
+                    _s = final_text[_mjson.start():]
+                    _obj, _end = _dec.raw_decode(_s)
+                    _fname = _obj.get("function") or _obj.get("name")
+                    _fargs = _obj.get("arguments") or _obj.get("parameters") or {}
+                    if _fname and isinstance(_fargs, dict):
+                        _cand = (_fname, _fargs)
+                except Exception:
+                    _cand = None
+                if _cand:
+                    _fname, _fargs = _cand
+                    put_trace(sid, "thinking", f"Rescue text-encoded tool call: {_fname}", model=model)
+                    _out_text = final_text[:_mjson.start()].strip()
+                    if _out_text:
+                        conv.append({"role": "assistant", "content": [{"text": _out_text}]})
+                    _rid = f"rescue-{uuid.uuid4().hex[:8]}"
+                    conv.append({"role": "assistant", "content": [
+                        {"toolUse": {"toolUseId": _rid, "name": _fname, "input": _fargs}}]})
+                    try:
+                        _rres = exec_tool(_fname, _fargs, sid=sid, attachments=attachments,
+                                          user_id=user_id, username=username)
+                    except Exception as _re:
+                        _rres = {"status": "error", "message": str(_re)[:300]}
+                    conv.append({"role": "user", "content": [{"toolResult": {
+                        "toolUseId": _rid, "status": "success",
+                        "content": [{"json": _rres if isinstance(_rres, dict) else {"result": str(_rres)[:800]}}]}}]})
+                    final_text = ""
+                    continue
             if not final_text and stop == "max_tokens":
                 final_text = "(Respons terpotong karena batas token - sederhanakan permintaan.)"
+                break
+            if not final_text:
                 break
             if "<thinking>" in final_text:
                 inner = re.findall(r"<thinking>(.*?)</thinking>", final_text, re.S)
@@ -2372,6 +3078,20 @@ def handle_chat(payload):
             # v3.4.2: buang tag <thinking> liar (tanpa pasangan) agar tak tampil di UI
             if "<thinking>" in final_text or "</thinking>" in final_text:
                 final_text = re.sub(r"</?thinking>", "", final_text).strip()
+            # v3.6.5: anti "premature final" — teks pendek tanpa angka/ID/blok klarifikasi
+            # hampir pasti ruminasi internal, bukan laporan hasil. Dorong model lanjut bekerja.
+            _short_ramble = (len(final_text) < 160 and not re.search(r"\d", final_text)
+                             and "[[CLARIFY]]" not in final_text
+                             and "http" not in final_text.lower())
+            if _short_ramble and iteration < max_iter - 1:
+                put_trace(sid, "thinking",
+                          f"Teks final premature ({len(final_text)} char, tanpa data) - dorong eksekusi", model=model)
+                conv.append({"role": "user", "content": [{"text":
+                    "Jangan berhenti pada rencana/analisis. EKSEKUSI sekarang dengan tool yang tersedia "
+                    "(aws_create_ec2 -> aws_ec2_wait_ssm -> aws_ec2_run_command), lalu laporkan hasil "
+                    "nyata berisi ID, IP, URL, dan status verifikasi. Tugas dianggap selesai hanya "
+                    "setelah laporan final tersebut."}]})
+                continue
             break
 
         if not final_text:
@@ -2544,13 +3264,34 @@ def handle_confirm(payload):
 
 
 # ---------------------------------------------------------------- entrypoint
+# v3.7: AgentCore membatasi 1 invocation ~240s lalu RETRY request yang sama.
+# Tanpa guard, retry membuat loop kedua jalan paralel (dobel tool call, ras DDB).
+# Loop PERTAMA tetap hidup di thread server (menulis hasil ke DDB), jadi retry
+# cukup dijawab "processing" — hasil final tetap sampai ke UI via polling status.
+_INV_ACTIVE = {}
+_INV_MU = threading.Lock()
+
+
 def invoke(payload, context=None):
     ptype = payload.get("type", "chat")
     if ptype == "confirm":
         return handle_confirm(payload)
     if ptype == "translate":
         return handle_translate(payload)
-    return handle_chat(payload)
+    sid = str(payload.get("sessionId", ""))
+    with _INV_MU:
+        prev = _INV_ACTIVE.get(sid)
+        if prev and time.time() - prev < 480:
+            put_trace(sid or "-", "guard",
+                      "Dobel-invoke diblokir: sesi masih dieksekusi di latar (AgentCore retry)")
+            return {"sessionId": sid, "status": "processing",
+                    "note": "Sesi ini sedang dieksekusi di latar; hasil akan muncul via polling status."}
+        _INV_ACTIVE[sid] = time.time()
+    try:
+        return handle_chat(payload)
+    finally:
+        with _INV_MU:
+            _INV_ACTIVE.pop(sid, None)
 
 
 # AgentCore Runtime HTTP contract (port 8080): POST /invocations, GET /ping
