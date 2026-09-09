@@ -10,6 +10,8 @@
 - [Ringkasan](#-ringkasan)
 - [Akses Demo](#-akses-demo)
 - [Tampilan Aplikasi](#-tampilan-aplikasi)
+- [Yang Baru di v3.8](#-yang-baru-di-v38)
+- [Yang Baru di v3.7](#-yang-baru-di-v37)
 - [Yang Baru di v3.6.1](#-yang-baru-di-v361)
 - [Yang Baru di v3.6](#-yang-baru-di-v36)
 - [Yang Baru di v3.5](#-yang-baru-di-v35)
@@ -37,6 +39,40 @@ seluruh trajektori agen secara real-time.
 | ![Chat EC2](screenshots/chat-ec2.png) | ![Konfirmasi destruktif](screenshots/konfirmasi-destruktif.png) |
 | **Live Trace di mobile** — setiap event tool terlihat | |
 | ![Live Trace mobile](screenshots/livetrace-mobile.png) | |
+
+## 🔗 Yang Baru di v3.8 — AgentCore 2026 Superpowers
+
+**Riset fitur AgentCore per 9 September 2026 (Harness, Policy GA, Evaluations, Optimization, Payments) lalu diintegrasikan ke agent.** Runtime: `maa_agent_runtime-SETSK2FPE4`.
+
+| Fitur AgentCore 2026 | Status di MAA-AWS-AGENT |
+|---|---|
+| **Runtime** (microVM per sesi, HTTP) | ✅ Native sejak v3 — otak agent jalan di AgentCore Runtime |
+| **Gateway** (MCP tool runtime) | ✅ web_search/web_fetch via MCP + SigV4; fallback native DDG |
+| **Browser** | ✅ web_fetch otomatis pakai AgentCore Browser untuk halaman ber-JS |
+| **Code Interpreter** | ✅ Native — analisis data, chart, scraping, self-test kode |
+| **Memory** (semantic + preferensi) | ✅ Native + **v3.8 episodic memory** (goal→outcome→score tiap tugas berat) |
+| **Policy** (GA Mar 2026 — guardrail tool call) | ✅ **v3.8: policy engine in-process** — read bebas, destruktif dipaksa konfirmasi ganda, IAM/Organizations/Account/Billing hanya baca |
+| **Evaluations** (kualitas agent) | ✅ **v3.8: `task_evaluate` + auto-evaluasi** rubrik goal_met/correctness/efficiency/safety |
+| **Optimization** (perbaiki prompt/tool) | ✅ **v3.8: `self_improve`** — analisis error 24 jam dari trace sendiri → 3 rekomendasi → otomatis tersimpan ke Knowledge Base |
+| **Harness** (Strands, config-driven) | 🔶 Pola diserap: reflection loop + task_plan + loop budget (runtime custom terbukti E2E) |
+| **Identity** (workload identity) | 🔶 Ekivalen: STS single-use 900s per eksekusi tool (eksposur < detik) |
+| **Payments** (x402/MPP, preview) | ⏳ Belum diintegrasikan (butuh penyedia pembayaran) |
+
+### Tool baru v3.8
+- **`aws_api`** — satu tool, ribuan operasi AWS semua service via boto3 (`{service, operation, params}`). Read-only (get/list/describe/search) langsung jalan; write umum langsung; **destruktif otomatis dikunci konfirmasi ganda**; IAM/Org/Account/Billing ditolak policy. Route53, SES, EKS, WAF, CloudWatch dashboard, EventBridge, Step Functions — semuanya kini terjangkau.
+- **`task_evaluate`** — agent menilai pekerjaannya sendiri di akhir tugas besar.
+- **`self_improve`** — agent belajar dari error 24 jam terakhirnya, tulis rekomendasi ke KB.
+
+### Verifikasi v3.8 (E2E via API produksi, akun ini)
+- ✅ T1 `aws_api` read: `ec2 describe_instances` — agent lihat 2 instance nyata
+- ✅ T2 `aws_api` write IAM `create_role` → **policy DENY** + agent menjelaskan batas
+- ✅ T3 `aws_api` `terminate_instances` → **confirmation_required** (layar konfirmasi ganda)
+- ✅ T4 `self_improve` → analisis error 24 jam + rekomendasi tersimpan ke KB
+- ✅ learning-vm tetap LIVE: `http://100.59.18.103:20128/dashboard` (9Router publik, HTTP 307→dashboard)
+
+## 🔗 Yang Baru di v3.7
+
+**Agent EC2 provisioning end-to-end terbukti lewat chat produksi**: buat `learning-vm` (t3.medium, ubuntu24) berisi **Hermes AI + 9Router AI**, verifikasi via SSM, lapor akses SSH + URL publik — 7 putaran E2E iteratif, round-7 sukses penuh 82 detik. Termasuk: SSM self-heal (instance profile perbaikan otomatis), anti-duplikat provisioning, web_search/web_fetch native fallback, resep 9Router headless systemd (`--tray --skip-update`) + Hermes installer resmi, recovery PEM via ssh-keygen, loop budget provisioning 24 iterasi.
 
 ## 🔗 Yang Baru di v3.6.1
 

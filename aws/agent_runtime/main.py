@@ -8,6 +8,16 @@
 - Destructive ops: protokol konfirmasi ganda (challenge, TTL 5 menit).
 - AgentCore Memory: konteks lintas-sesi (semantic + preferensi) + events per giliran.
 - Structured clarification: [[CLARIFY]]{...} saat instruksi ambigu -> chips UI.
+
+v3.8 AGENTCORE 2026 SUPERPOWERS (riset fitur AgentCore per Sep 2026):
+- aws_api: akses RIBUAN operasi AWS semua service via boto3 satu tool generic.
+- Policy engine in-process (mirror AgentCore Policy GA 3/2026): read-only bebas,
+  destruktif dipaksa konfirmasi ganda, IAM/Org/Account/Billing hanya baca.
+- Evaluations (mirror AgentCore Evaluations 2026): task_evaluate + auto-evaluation
+  rubrik goal_met/correctness/efficiency/safety utk tugas berat.
+- Optimization (mirror AgentCore Optimization preview 5/2026): self_improve —
+  analisis error 24 jam dari trace sendiri -> rekomendasi -> Knowledge Base.
+- Episodic memory: episode goal->outcome->score dicatat tiap tugas berat.
 """
 import json
 import os
@@ -642,6 +652,28 @@ TOOLS = [
     _ts("code_interpreter",
         "Jalankan kode Python di sandbox AgentCore Code Interpreter: analisis data, perhitungan, chart matplotlib (PNG tampil di chat), DAN web scraping (internet tersedia: requests + BeautifulSoup, selenium tidak tersedia). Untuk scraping: pakai requests dengan User-Agent browser, tangani retry/timeout, pip install diperbolehkan.",
         {"code": {"type": "string"}}, ["code"]),
+    _ts("aws_api",
+        "SUPER TOOL v3.8 — panggil API AWS APA SAJA dari ratusan service via boto3: "
+        "{service: 'ec2'|'cloudwatch'|'route53'|'ses'|'s3'|'eks'|'wafv2'|..., operation: nama metode "
+        "boto3 camelCase (mis. describe_instances), params: dict argumen keyword}. Policy engine "
+        "menilai tiap panggilan: read-only (get/list/describe/search) langsung jalan; write umum "
+        "langsung; destruktif (delete/terminate/detach/...) OTOMATIS dipaksa konfirmasi ganda "
+        "pengguna; IAM/Organizations/Account/Billing hanya read-only. Gunakan untuk kebutuhan AWS "
+        "yang belum ada tool khususnya. SELALU mulai dari list/describe sebelum write.",
+        {"service": {"type": "string"},
+         "operation": {"type": "string"},
+         "params": {"type": "object", "description": "argumen keyword boto3, boleh kosong"}},
+        ["service", "operation"]),
+    _ts("task_evaluate",
+        "Nilai kualitas pekerjaanmu sendiri di sesi ini (AgentCore Evaluations): goal_met, "
+        "correctness, efficiency, safety + 1 saran perbaikan. Panggil di akhir tugas besar "
+        "sebelum laporan final, lalu ikuti saran 'improvement' bila ada yang kurang.",
+        {}, []),
+    _ts("self_improve",
+        "Analisis error 24 jam terakhir dari trace-mu sendiri (AgentCore Optimization): temukan "
+        "pola berulang, tulis 3 rekomendasi perbaikan konkret, simpan ke Knowledge Base. Panggil "
+        "saat diminta 'perbaiki dirimu / belajar dari kesalahan' atau periodik setelah tugas berat.",
+        {}, []),
     _ts("aws_delete_resource",
         "HAPUS resource permanen: ec2 (terminate), s3 (bucket), dynamodb (table), rds, cloudformation (stack). TIDAK PERNAH dieksekusi langsung - sistem memicu protokol konfirmasi ganda.",
         {"resource_type": {"type": "string", "enum": ["ec2", "s3", "dynamodb", "rds", "cloudformation"]},
@@ -698,7 +730,7 @@ GATEWAY_TOOLS = {"web_search", "web_fetch"}
 SUBAGENT_TOOLS = {"web_search", "web_fetch", "kb_search", "kb_read_doc", "code_interpreter",
                   "skills_list", "skills_use", "skill_list", "skill_load",
                   "aws_list_resources", "aws_get_metrics", "aws_cost_analysis",
-                  "aws_logs_inspect", "generate_image"}
+                  "aws_logs_inspect", "generate_image", "aws_api"}
 SUBAGENT_ROLES = {
     "researcher": "Kamu agent researcher: riset internet via web_search/web_fetch, rangkum temuan dengan sumber URL.",
     "analyst": "Kamu agent analyst: olah data & angka, pakai code_interpreter untuk hitung/chart, sajikan insight kuantitatif.",
@@ -707,6 +739,82 @@ SUBAGENT_ROLES = {
     "reviewer": "Kamu agent reviewer: kritik draft/hasil kerja, temukan risiko/kesalahan, beri saran perbaikan konkret.",
     "ops": "Kamu agent ops: inspeksi resource AWS via aws_list_resources/aws_get_metrics/aws_logs_inspect, laporkan fakta ID nyata.",
 }
+
+
+# ---------------- v3.8 AgentCore-style POLICY ENGINE (mirror AgentCore Policy GA 3/2026)
+POLICY_READ_PREFIX = ("get", "list", "describe", "search", "head", "lookup", "query", "scan",
+                      "batch_get", "simulate", "explain", "preview", "generate", "export",
+                      "validate", "check", "test")
+POLICY_DESTRUCTIVE_PREFIX = ("delete", "terminate", "deregister", "revoke", "disable",
+                             "detach", "remove", "cancel", "purge", "release")
+POLICY_DENY_SERVICES = {"iam", "organizations", "account", "support", "billing", "budgets"}
+
+
+def policy_verdict(service, operation):
+    """v3.8: keputusan policy utk aws_api -> ("allow"|"confirm"|"deny", alasan)."""
+    svc = (service or "").lower().replace("-", "_").replace(" ", "")
+    op = (operation or "").lower()
+    if op.startswith(POLICY_READ_PREFIX):
+        return "allow", "read-only"
+    if svc in POLICY_DENY_SERVICES:
+        return ("deny",
+                f"service '{svc}' hanya boleh read-only oleh policy agent (identitas/billing terlindungi)")
+    if op.startswith(POLICY_DESTRUCTIVE_PREFIX):
+        return "confirm", f"operasi {svc}.{op} destruktif — wajib konfirmasi ganda pengguna"
+    return "allow", "write umum"
+
+
+def policy_check_tool(name, args):
+    """v3.8: gerbang policy utk SEMUA tool call (pola AgentCore Policy via Gateway)."""
+    if name == "aws_api":
+        return policy_verdict(args.get("service"), args.get("operation"))
+    return "allow", ""
+
+
+def _trim_aws_result(o, depth=0):
+    """Pangkas hasil API AWS agar JSON-safe & hemat konteks: list maks 15, string maks 400."""
+    if depth > 5:
+        return "..."
+    if isinstance(o, dict):
+        return {k: _trim_aws_result(v, depth + 1) for k, v in list(o.items())[:40]}
+    if isinstance(o, list):
+        out = [_trim_aws_result(v, depth + 1) for v in o[:15]]
+        return out + (["..."] if len(o) > 15 else [])
+    if isinstance(o, str):
+        return o[:400] + ("..." if len(o) > 400 else "")
+    return o
+
+
+def _run_evaluation(goal, outcome, tool_count=0):
+    """v3.8 AgentCore-style Evaluations: grade rubrik via model FAST."""
+    um = (f"GOAL PENGGUNA: {str(goal)[:1500]}\n\nOUTCOME AGENT: {str(outcome)[:3000]}\n\n"
+          f"Jumlah tool call: {tool_count}\n\nNilai dengan JSON tunggal (tanpa teks lain): "
+          '{"goal_met": <0-10>, "correctness": <0-10>, "efficiency": <0-10>, "safety": <0-10>, '
+          '"improvement": "<satu kalimat perbaikan konkret>"}')
+    resp = call_converse(FAST_MODEL, [{"role": "user", "content": [{"text": um}]}],
+                         {"maxTokens": 400, "temperature": 0.1}, None, False,
+                         with_tools=False, with_guardrail=False,
+                         system_extra="Anda evaluator kualitas agent. Jawab HANYA JSON valid.")
+    txt = "".join(c.get("text", "") for c in resp["output"]["message"]["content"] if "text" in c)
+    m = re.search(r"\{.*\}", txt, re.S)
+    if not m:
+        return {"goal_met": "?", "improvement": txt[:200]}
+    try:
+        return json.loads(m.group(0))
+    except Exception:
+        return {"goal_met": "?", "improvement": txt[:200]}
+
+
+def _auto_evaluate(sid, user_id, goal, outcome, tool_count):
+    """v3.8: evaluasi otomatis tugas berat + episodic memory (pola episodic memory re:Invent 2025)."""
+    try:
+        rubric = _run_evaluation(goal, outcome, tool_count)
+        put_trace(sid, "evaluation", json.dumps(rubric, ensure_ascii=False)[:900])
+        memory_write(user_id, sid,
+                     f"[EPISODE] goal: {str(goal)[:300]}",
+                     f"[EPISODE] outcome: {str(outcome)[:600]} | goal_met: {rubric.get('goal_met', '?')}/10")
+    except Exception:
+        pass
 
 
 def short_type(t):
@@ -1071,9 +1179,11 @@ def _conn_pick(username, name_or_id):
 
 
 # ---------------------------------------------------------------- tool executor
-def exec_tool(name, args, sid=None, attachments=None, user_id=None, username=None):
+def exec_tool(name, args, sid=None, attachments=None, user_id=None, username=None,
+              confirmed=False):
     """Jalankan tool. AWS ops pakai sesi STS single-use; web tools via Gateway;
-    CI/Canvas/KB native. Return dict (JSON-safe)."""
+    CI/Canvas/KB native. Return dict (JSON-safe). confirmed=True hanya dari
+    handle_confirm (sudah lewat konfirmasi ganda) — untuk policy verdict 'confirm'."""
     user_id_arg = user_id or str(args.get("userId", "")) or "unknown"
     # ---- KB search (runtime role, read-only) ----
     if name == "kb_search":
@@ -2301,6 +2411,114 @@ def exec_tool(name, args, sid=None, attachments=None, user_id=None, username=Non
         return {"status": "ok", "stack_id": r["StackId"],
                 "note": "CREATE_IN_PROGRESS; cek status via aws_list_resources"}
 
+    # ---- v3.8: generic AWS API + policy engine (AgentCore superpower) ----
+    if name == "aws_api":
+        svc = str(args.get("service", "")).strip().lower()
+        op = str(args.get("operation", "")).strip()
+        params = args.get("params") or {}
+        if not isinstance(params, dict):
+            return {"status": "error", "message": "params harus object/dict argumen keyword boto3"}
+        if not svc or not op:
+            return {"status": "error", "message": "service & operation wajib diisi"}
+        verdict, reason = policy_verdict(svc, op)
+        if verdict == "deny":
+            return {"status": "error", "policy": "denied", "message": reason}
+        if verdict == "confirm" and not confirmed:
+            return {"status": "error", "policy": "confirmation_required",
+                    "message": f"Operasi {svc}.{op} destruktif — hanya bisa dieksekusi di percakapan "
+                               "utama setelah pengguna menyelesaikan konfirmasi ganda (layar "
+                               "konfirmasi otomatis muncul di UI). Jangan coba mengakali."}
+        sess = assume_execution()
+        try:
+            client = sess.client(svc)
+            fn = getattr(client, op, None)
+            if not callable(fn):
+                return {"status": "error",
+                        "message": f"operasi boto3 '{op}' tidak dikenal di service '{svc}'",
+                        "hint": "gunakan nama metode boto3 camelCase, mis. describe_instances"}
+            out = fn(**params)
+        except TypeError as e:
+            return {"status": "error", "message": f"parameter tidak valid: {str(e)[:300]}",
+                    "hint": "params = dict argumen keyword untuk operasi boto3 tersebut"}
+        except Exception as e:
+            return {"status": "error", "message": f"{svc}.{op} gagal: {str(e)[:400]}"}
+        try:
+            out = json.loads(json.dumps(out, default=str))
+        except Exception:
+            out = {"raw": str(out)[:2000]}
+        return {"status": "ok", "service": svc, "operation": op,
+                "policy": reason if verdict != "allow" else "allowed",
+                "result": _trim_aws_result(out)}
+
+    # ---- v3.8: AgentCore-style Evaluations (self-grade) ----
+    if name == "task_evaluate":
+        if not sid:
+            return {"status": "error", "message": "task_evaluate butuh sessionId"}
+        um_txt, am_txt = "", ""
+        try:
+            rec = session_get(sid)
+            for mm in rec["messages"]["L"]:
+                mi = mm["M"]
+                role = mi.get("role", {}).get("S", "")
+                if role == "user" and not um_txt:
+                    um_txt = mi.get("text", {}).get("S", "")
+                if role == "assistant" and not am_txt:
+                    am_txt = mi.get("text", {}).get("S", "")
+                if um_txt and am_txt:
+                    break
+        except Exception:
+            pass
+        score = _run_evaluation(um_txt or "(sesi ini)", am_txt or "(belum ada jawaban)")
+        try:
+            put_trace(sid, "evaluation", json.dumps(score, ensure_ascii=False)[:900])
+        except Exception:
+            pass
+        return {"status": "ok", "evaluation": score,
+                "note": "Bila ada rubrik <8 atau saran 'improvement', perbaiki dulu sebelum lapor selesai."}
+
+    # ---- v3.8: AgentCore-style Optimization (self-improvement loop) ----
+    if name == "self_improve":
+        logs = get_client("logs")
+        start_ms = now_ms() - 24 * 3600 * 1000
+        errs, seen = [], set()
+        try:
+            pag = logs.get_paginator("filter_log_events")
+            for page in pag.paginate(logGroupName=TRACE_LOG_GROUP, startTime=start_ms,
+                                     filterPattern="?\"error\" ?\"failed\" ?\"gagal\" ?\"Exception\""):
+                for ev in page.get("events", [])[:150]:
+                    try:
+                        body = json.loads(ev["message"])
+                        if body.get("type") == "error" and body.get("content"):
+                            txt = str(body["content"])[:220]
+                            if txt not in seen:
+                                seen.add(txt)
+                                errs.append(txt)
+                    except Exception:
+                        continue
+                if len(errs) >= 40:
+                    break
+        except Exception as e:
+            return {"status": "error", "message": f"gagal membaca trace: {str(e)[:150]}"}
+        if not errs:
+            return {"status": "ok", "finding": "Tidak ada error dalam 24 jam terakhir — sistem sehat.",
+                    "action": "tidak ada perbaikan yang perlu disimpan"}
+        um = ("Daftar error agent 24 jam terakhir:\n" + "\n".join(f"- {e}" for e in errs[:40]) +
+              "\n\nAnalisis pola berulang, lalu tulis TEPAT 3 baris berformat: "
+              "POLA: <pola error> | REKOMENDASI: <perbaikan konkret pada prompt/tool/konvensi>")
+        resp = call_converse(FAST_MODEL, [{"role": "user", "content": [{"text": um}]}],
+                             {"maxTokens": 800, "temperature": 0.2}, None, False,
+                             with_tools=False, with_guardrail=False,
+                             system_extra="Anda reliability engineer AI agent. Jawab ringkas & teknis.")
+        report = "".join(c.get("text", "") for c in resp["output"]["message"]["content"] if "text" in c)
+        title = f"self-improvement {datetime.datetime.utcnow():%Y-%m-%d %H:%M} UTC"
+        r2 = exec_tool("kb_upload_doc", {
+            "title": title,
+            "content": (f"# Self-Improvement Report (otomatis, AgentCore Optimization pattern)\n\n"
+                        f"{len(errs)} error unik dalam 24 jam terakhir.\n\n{report}\n\n"
+                        "## Sampel error\n" + "\n".join(f"- {e}" for e in errs[:20]))}, sid=sid)
+        return {"status": "ok", "errors_found": len(errs), "report": report[:1800],
+                "kb_saved": r2.get("status")}
+
     if name == "aws_delete_resource":
         rt_, ident = args["resource_type"], args["identifier"]
         if rt_ == "ec2":
@@ -2342,7 +2560,7 @@ IDENTITAS & TUGAS
 
 PENGETAHUAN & KAPABILITAS (WAJIB dipahami)
 - Pengetahuan dasar Anda dimutakhirkan sampai HARI INI. Untuk hal yang bisa berubah (harga, versi, rilis, berita, kondisi terkini) JANGAN bilang "tidak tahu / cutoff" — panggil web_search, lalu web_fetch bila perlu membaca halamannya. Jawaban Anda dianggap terkini oleh pengguna.
-- Kapabilitas Anda: browsing web real-time (web_search + web_fetch), code interpreter (Python/matplotlib untuk analisis data & chart, DAN web scraping — internet tersedia, pakai requests+bs4 dengan User-Agent browser), generate gambar (Nova Canvas, otomatis fallback AI SVG-art vektor sehingga selalu menghasilkan gambar), memori jangka panjang lintas sesi (AgentCore Memory), SKILLS eksperti (skills_list/skill_list + skills_use/skill_load — muat dan ikuti skill yang relevan; skills_save untuk menyimpan pola kerja baru), multi-agent (subagent_run), todo list live (task_plan), tugas terjadwal otomatis (task_schedule — create/list/delete, hasil terkirim ke sesi), manajemen Knowledge Base penuh via perintah (kb_list_docs/kb_read_doc/kb_edit_doc/kb_delete_doc/kb_sync), membuat deck presentasi (generate_presentation) dan web app (deploy_web_app), serta operasi penuh AWS: EC2, EKS, RDS, S3, VPC, Lambda, DynamoDB, CloudWatch, Cost Explorer, CloudFormation.
+- Kapabilitas Anda: browsing web real-time (web_search + web_fetch), code interpreter (Python/matplotlib untuk analisis data & chart, DAN web scraping — internet tersedia, pakai requests+bs4 dengan User-Agent browser), generate gambar (Nova Canvas, otomatis fallback AI SVG-art vektor sehingga selalu menghasilkan gambar), memori jangka panjang lintas sesi (AgentCore Memory), SKILLS eksperti (skills_list/skill_list + skills_use/skill_load — muat dan ikuti skill yang relevan; skills_save untuk menyimpan pola kerja baru), multi-agent (subagent_run), todo list live (task_plan), tugas terjadwal otomatis (task_schedule — create/list/delete, hasil terkirim ke sesi), manajemen Knowledge Base penuh via perintah (kb_list_docs/kb_read_doc/kb_edit_doc/kb_delete_doc/kb_sync), membuat deck presentasi (generate_presentation) dan web app (deploy_web_app), serta operasi penuh AWS: EC2, EKS, RDS, S3, VPC, Lambda, DynamoDB, CloudWatch, Cost Explorer, CloudFormation — plus aws_api: akses ribuan API AWS semua service di bawah policy guardrails, self-evaluasi (task_evaluate) dan self-improvement (self_improve).
 - Bila pengguna bertanya "kamu bisa apa" atau meminta daftar kemampuan: jawab ringkas dengan daftar kapabilitas di atas (bahasa pengguna) — JANGAN menolak atau bertanya balik.
 - Bila Anda menemukan update AWS penting (resource/service baru, perubahan harga, deprecation), simpan ringkasannya ke Knowledge Base via kb_upload_doc lalu kb_sync agar pengetahuan internal tim selalu mutakhir.
 
@@ -2363,6 +2581,13 @@ DISIPLIN TOOL
 - Membangun infrastruktur kompleks: iac_generate (perbaiki sendiri bila validasi gagal), tawarkan iac_deploy_stack.
 - Analisis biaya: aws_cost_analysis. Diagnosis log: aws_logs_inspect.
 - Bila tool gagal: analisis error, koreksi parameter, panggil ulang (self-healing).
+
+SUPERPOWERS AGENTCORE 2026 (v3.8)
+- aws_api = akses TAK TERBATAS: ribuan operasi AWS semua service via satu tool ({service, operation, params} boto3). Read-only (get/list/describe/search) SELALU langsung jalan — jadikan alat utama untuk melihat kondisi nyata sebelum aksi apa pun. Write umum langsung. DESTRIKTIF (delete/terminate/detach/...) OTOMATIS dikunci POLICY engine menjadi konfirmasi ganda — bila hasil tool berisi status=confirmation_required cukup informasikan bahwa layar konfirmasi menunggu di UI; JANGAN mengulang/mengakali. Bila status=policy_denied (IAM/Organizations/Account/Billing): jelaskan batasnya dan tawarkan alternatif, JANGAN coba lagi.
+- Gunakan aws_api untuk semua service yang belum ada tool khusus: Route53 (DNS), SES (email), EKS, WAF, CloudWatch dashboard/alarm, CloudFront, SSM Parameter Store, EventBridge, Step Functions, dan ribuan lainnya. Selalu mulai dari list/describe sebelum write.
+- REFLECTION LOOP (pola Strands harness): setelah tool gagal -> baca pesan error -> perbaiki parameter -> panggil ulang (maks 3x per masalah). Sebelum melapor selesai -> VERIFIKASI hasil dengan operasi baca (curl/systemctl/describe). Tidak pernah lapor sukses tanpa bukti nyata.
+- task_evaluate: nilai pekerjaanmu sendiri (goal_met/correctness/efficiency/safety) di akhir tugas besar; bila ada rubrik rendah atau saran 'improvement', perbaiki dulu. Sistem juga auto-evaluasi tugas berat dan menyimpan episode (goal->outcome->score) ke memori episodic — gunakan pengalaman itu di sesi berikutnya.
+- self_improve: pelajari error 24 jam terakhir dari trace-mu sendiri, dapatkan 3 rekomendasi konkret, otomatis tersimpan ke Knowledge Base. Panggil saat pengguna minta 'perbaiki dirimu/belajar dari kesalahan' atau setelah banyak error terjadi.
 
 PROVISIONING SERVER & LAYANAN DI EC2 (WAJIB — JANGAN PERNAH MENOLAK)
 - Permintaan "buatkan server/vm/EC2 + install X + akses publik" SELALU BISA dikerjakan end-to-end dengan tool EC2 provisioning. JANGAN menjawab "tidak bisa" atau hanya memberi tutorial — EKSEKUSI.
@@ -2816,6 +3041,7 @@ def handle_chat(payload):
     guardrail_hit = False
     research_calls = 0
     research_nudged = False
+    tool_count = 0
     try:
         max_iter = LOOP_LIMITS.get(agent_mode, 8)
         # v3.7: provisioning EC2 end-to-end butuh iterasi banyak (riset+create+wait+
@@ -2905,6 +3131,7 @@ def handle_chat(payload):
                     tu = c["toolUse"]
                     tname, targs = tu["name"], tu.get("input", {}) or {}
                     put_trace(sid, "tool_call", f"{tname} {json.dumps(targs, ensure_ascii=False)[:800]}", model=model)
+                    p_verdict, p_reason = policy_check_tool(tname, targs)
                     if tname == "aws_delete_resource" and targs.get("resource_type") in DESTRUCTIVE_TYPES:
                         token = uuid.uuid4().hex
                         challenge = (f"KONFIRMASI-{short_type(targs.get('resource_type'))}-"
@@ -2928,6 +3155,42 @@ def handle_chat(payload):
                                 "status": "confirmation_required", "confirmToken": token,
                                 "challenge": challenge,
                                 "note": "Tunggu pengguna menyelesaikan konfirmasi ganda di UI."}}]}})
+                    elif p_verdict == "deny":
+                        # v3.8: policy engine menolak panggilan ini (AgentCore Policy pattern)
+                        put_trace(sid, "policy", f"DENY {tname}: {p_reason}", model=model)
+                        tool_results.append({"toolResult": {
+                            "toolUseId": tu["toolUseId"], "status": "error",
+                            "content": [{"json": {
+                                "status": "policy_denied", "reason": p_reason,
+                                "note": "JANGAN ulangi panggilan yang sama. Jelaskan keterbatasan policy "
+                                        "ke pengguna dan tawarkan alternatif yang sesuai."}}]}})
+                    elif p_verdict == "confirm" and tname == "aws_api":
+                        # v3.8: aws_api destruktif dipaksa konfirmasi ganda (same flow aws_delete_resource)
+                        token = uuid.uuid4().hex
+                        svc_s = str(targs.get("service", "svc")).upper().replace("/", "-")[:20]
+                        op_s = str(targs.get("operation", "op")).upper().replace("/", "-")[:30]
+                        challenge = f"KONFIRMASI-AWSAPI-{svc_s}-{op_s}-{uuid.uuid4().hex[:6].upper()}"
+                        get_client("dynamodb").put_item(TableName=CONF_TABLE, Item={
+                            "confirmToken": {"S": token},
+                            "sessionId": {"S": sid},
+                            "userId": {"S": user_id},
+                            "operation": {"S": json.dumps({"tool": tname, "input": targs})},
+                            "challenge": {"S": challenge},
+                            "status": {"S": "pending"},
+                            "createdAt": {"N": str(now_ms())},
+                            "expiresAt": {"N": str(now_ms() // 1000 + 300)},
+                        })
+                        put_trace(sid, "confirm_required",
+                                  f"Policy: aws_api {targs.get('service')}.{targs.get('operation')} "
+                                  f"destruktif — menunggu konfirmasi ganda pengguna")
+                        tool_results.append({"toolResult": {
+                            "toolUseId": tu["toolUseId"], "status": "success",
+                            "content": [{"json": {
+                                "status": "confirmation_required", "confirmToken": token,
+                                "challenge": challenge, "reason": p_reason,
+                                "note": "Operasi destruktif via aws_api dikunci policy — layar konfirmasi "
+                                        "ganda tampil di UI pengguna. JANGAN ulangi panggilan; beritahu "
+                                        "pengguna bahwa konfirmasi menunggu."}}]}})
                     else:
                         try:
                             t0 = time.time()
@@ -2954,6 +3217,7 @@ def handle_chat(payload):
                                 continue  # lanjut toolUse berikutnya di batch yang sama (jangan pecah pasangan)
                             result = exec_tool(tname, targs, sid=sid, attachments=attachments,
                                                user_id=user_id, username=username)
+                            tool_count += 1
                             # v3.6.5: anggaran riset — setelah 6x, sisipkan perintah eksekusi
                             # di dalam hasil tool (aman utk semua model, tanpa pesan ekstra)
                             if (tname in GATEWAY_TOOLS or is_ci_research) and research_calls >= 6 and not research_nudged:
@@ -3161,6 +3425,11 @@ def handle_chat(payload):
                 title=title or message,
                 extra={"createdAt": rec["createdAt"]["S"] if rec else str(now_ms()),
                        "autoRoute": auto_route})
+    # v3.8: auto-evaluation (AgentCore Evaluations) + episodic memory utk tugas berat
+    if tool_count >= 6:
+        threading.Thread(target=_auto_evaluate,
+                         args=(sid, user_id, message, final_text, tool_count),
+                         daemon=True).start()
     if _LAST_TODOS.get(sid):
         _todos_save(sid, _LAST_TODOS[sid])  # session_put menimpa item -> simpan ulang todos
 
@@ -3238,7 +3507,7 @@ def handle_confirm(payload):
     tname, targs = op["tool"], op["input"]
     put_trace(sid, "thinking", f"Konfirmasi ganda OK - mengeksekusi {tname} {targs}")
     try:
-        result = exec_tool(tname, targs, sid=sid)
+        result = exec_tool(tname, targs, sid=sid, confirmed=True)
     except Exception as e:
         result = {"status": "error", "message": str(e)[:300]}
     get_client("dynamodb").update_item(TableName=CONF_TABLE, Key={"confirmToken": {"S": token}},
