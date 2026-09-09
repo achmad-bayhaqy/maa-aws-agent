@@ -395,6 +395,12 @@ exec_policy = {
                     "cloudformation:CreateChangeSet", "cloudformation:ExecuteChangeSet"],
          "Resource": "*"},
         {"Sid": "StsSelf", "Effect": "Allow", "Action": ["sts:GetCallerIdentity"], "Resource": "*"},
+        # ---- Bedrock + AgentCore discovery (read-only inventory: "apa saja resource yang saya pakai?")
+        {"Sid": "BedrockDiscovery", "Effect": "Allow",
+         "Action": ["bedrock:List*", "bedrock:Get*",
+                    "bedrock-agent:List*", "bedrock-agent:Get*",
+                    "bedrock-agentcore:List*", "bedrock-agentcore:Get*"],
+         "Resource": "*"},
         # ---- Zero-trust explicit denies (PRD: the agent must not be able to escalate privileges)
         {"Sid": "NoIamTouch", "Effect": "Deny",
          "Action": ["iam:*", "organizations:*", "account:*", "cognito-idp:*", "cognito-identity:*",

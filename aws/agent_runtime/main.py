@@ -500,9 +500,13 @@ def _ts(name, desc, props, required):
 
 TOOLS = [
     _ts("aws_list_resources",
-        "Daftar resource AWS: ec2, vpc, subnet, s3, rds, lambda, dynamodb, elasticache, route53, volume. Selalu panggil ini dulu sebelum aksi lain.",
+        "Inventaris resource AWS AKUN INI dari API live (bukan web): ec2, vpc, subnet, s3, rds, lambda, "
+        "dynamodb, elasticache, route53, volume, bedrock (knowledge base/agent/guardrail/custom model/"
+        "inference profile), agentcore (runtime/gateway/memory/code interpreter/browser). WAJIB dipakai "
+        "untuk pertanyaan 'apa resource yang saya punya/gunakan di akun' — selalu panggil dulu sebelum aksi lain.",
         {"service": {"type": "string", "enum": ["ec2", "vpc", "subnet", "s3", "rds", "lambda",
-                                               "dynamodb", "elasticache", "route53", "volume"]}},
+                                               "dynamodb", "elasticache", "route53", "volume",
+                                               "bedrock", "agentcore"]}},
         ["service"]),
     _ts("aws_get_metrics",
         "Metrik CloudWatch instance EC2 (CPUUtilization, NetworkIn, NetworkOut, StatusCheckFailed) N menit terakhir.",
@@ -639,7 +643,7 @@ TOOLS = [
         {"stack_name": {"type": "string"}, "template_key": {"type": "string"}},
         ["stack_name", "template_key"]),
     _ts("web_search",
-        "Cari informasi TERBARU di internet (berita, harga, rilis, praktik terbaru AWS 2026). Pakai saat butuh info melebihi pengetahuan internal.",
+        "Cari informasi TERBARU di internet (berita, harga, rilis, praktik terbaru AWS 2026). Pakai saat butuh info melebihi pengetahuan internal. JANGAN dipakai untuk kondisi/state AKUN AWS sendiri (resource, kuota, biaya, apa yang saya gunakan) — itu WAJIB aws_list_resources / aws_api / aws_cost_analysis.",
         {"query": {"type": "string"}, "max_results": {"type": "integer"}}, ["query"]),
     _ts("web_fetch",
         "Ambil isi lengkap sebuah URL. Otomatis pakai AgentCore Browser untuk halaman ber-JS. Pakai setelah web_search untuk membaca halaman.",
@@ -654,8 +658,10 @@ TOOLS = [
         {"code": {"type": "string"}}, ["code"]),
     _ts("aws_api",
         "SUPER TOOL v3.8 — panggil API AWS APA SAJA dari ratusan service via boto3: "
-        "{service: 'ec2'|'cloudwatch'|'route53'|'ses'|'s3'|'eks'|'wafv2'|..., operation: nama metode "
-        "boto3 camelCase (mis. describe_instances), params: dict argumen keyword}. Policy engine "
+        "{service: 'ec2'|'cloudwatch'|'route53'|'ses'|'s3'|'eks'|'wafv2'|'bedrock'|"
+        "'bedrock-agentcore-control'|..., operation: nama metode boto3 camelCase (mis. describe_instances, "
+        "list_knowledge_bases, list_agent_runtimes), params: dict argumen keyword}. Untuk inventaris "
+        "Bedrock/AgentCore akun bisa juga pakai aws_list_resources(service='bedrock'|'agentcore'). Policy engine "
         "menilai tiap panggilan: read-only (get/list/describe/search) langsung jalan; write umum "
         "langsung; destruktif (delete/terminate/detach/...) OTOMATIS dipaksa konfirmasi ganda "
         "pengguna; IAM/Organizations/Account/Billing hanya read-only. Gunakan untuk kebutuhan AWS "
@@ -1880,6 +1886,51 @@ def exec_tool(name, args, sid=None, attachments=None, user_id=None, username=Non
         elif svc == "elasticache":
             out = [{"id": c["CacheClusterId"], "engine": c["Engine"], "status": c["CacheClusterStatus"]}
                    for c in ec.describe_cache_clusters().get("CacheClusters", [])]
+        elif svc in ("bedrock", "agentcore"):
+            # v3.8.1: inventaris Bedrock + AgentCore dari API live (bukan web search).
+            items, errs = [], []
+
+            def _rows(resp):
+                for v in resp.values():
+                    if isinstance(v, list):
+                        return [r for r in v if isinstance(r, dict)]
+                return []
+
+            def _pick(r):
+                rid = (r.get("knowledgeBaseId") or r.get("agentId") or r.get("guardrailId")
+                       or r.get("agentRuntimeId") or r.get("gatewayId") or r.get("memoryId")
+                       or r.get("codeInterpreterId") or r.get("browserId") or r.get("modelId")
+                       or r.get("inferenceProfileId") or r.get("modelName") or r.get("id") or "")
+                return {"id": rid,
+                        "nama": r.get("name") or r.get("agentName") or r.get("inferenceProfileName") or "",
+                        "status": r.get("status") or ""}
+
+            def _try(cname, op, jenis):
+                try:
+                    c = sess.client(cname)
+                    if not hasattr(c, op):
+                        raise AttributeError(f"method {op} tidak tersedia")
+                    for r in _rows(getattr(c, op)()):
+                        row = _pick(r)
+                        row["jenis"] = jenis
+                        items.append(row)
+                except Exception as e:
+                    errs.append(f"{op}: {type(e).__name__}: {str(e)[:80]}")
+
+            if svc == "bedrock":
+                _try("bedrock-agent", "list_knowledge_bases", "knowledge-base")
+                _try("bedrock-agent", "list_agents", "bedrock-agent")
+                _try("bedrock", "list_guardrails", "guardrail")
+                _try("bedrock", "list_custom_models", "custom-model")
+                _try("bedrock", "list_inference_profiles", "inference-profile")
+            else:
+                _try("bedrock-agentcore-control", "list_agent_runtimes", "agentcore-runtime")
+                _try("bedrock-agentcore-control", "list_gateways", "gateway")
+                _try("bedrock-agentcore-control", "list_memories", "memory")
+                _try("bedrock-agentcore-control", "list_code_interpreters", "code-interpreter")
+                _try("bedrock-agentcore-control", "list_browsers", "browser")
+            return {"status": "ok", "count": len(items), "resources": items[:40],
+                    "catatan": errs}
         else:
             return {"status": "error", "message": f"service {svc} tidak dikenal"}
         return {"status": "ok", "count": len(out), "resources": out[:40]}
@@ -2573,6 +2624,7 @@ MANAJEMEN KNOWLEDGE BASE (via perintah chat)
 - Contoh: "buka dokumen runbook-ec2", "update KB: ganti versi di dokumen X", "hapus dokumen lama tentang Y" — kerjakan langsung dengan tool di atas, lalu laporkan hasilnya.
 
 DISIPLIN TOOL
+- Pertanyaan tentang resource/state AKUN AWS milik pengguna (\"apa saja yang saya gunakan/punya\", inventaris, status): WAJIB pakai aws_list_resources (service bedrock & agentcore tersedia) atau aws_api (list_/describe_) — data NYATA dari API. JANGAN web_search untuk ini; web_search HANYA untuk info publik internet (berita/dokumentasi/harga pasar).
 - Status/monitoring/list: aws_list_resources atau aws_get_metrics — jangan menebak.
 - Prosedur internal/kebijakan korporat/best practice engineering: kb_search DULU.
 - Informasi TERBARU dari internet (rilis, harga, berita, praktik 2026): web_search, lalu web_fetch untuk membaca halaman.
